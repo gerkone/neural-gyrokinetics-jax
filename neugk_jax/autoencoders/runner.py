@@ -227,17 +227,23 @@ class AERunner(BaseRunner):
         if self.dist.is_rank0:
             print(f"[ae] median per-step: data_wait={m_data:.1f}ms step={m_step:.1f}ms "
                   f"(first step={t_step_ms[0]:.1f}ms incl. jit)")
-        return {"loss": sum(losses) / max(len(losses), 1),
-                "data_ms": m_data, "step_ms": m_step,
-                "first_step_ms": t_step_ms[0] if t_step_ms else 0.0}
+        loss_logs = {
+            "df_mse": sum(losses) / max(len(losses), 1),
+            "total_mse": sum(losses) / max(len(losses), 1),
+        }
+        info = {
+            "data_ms": m_data, "step_ms": m_step,
+            "first_step_ms": t_step_ms[0] if t_step_ms else 0.0,
+        }
+        return loss_logs, info
 
-    def evaluate(self, epoch: int) -> dict:
+    def evaluate(self, epoch: int):
         from neugk_jax.evaluate import AEEvaluator
         ev = AEEvaluator(self.cfg, val_ds=self.val_ds, is_rank0=self.dist.is_rank0)
-        metrics, _ = ev(
+        metrics, plots = ev(
             self.model,
             epoch=epoch,
             batch_size=self.cfg.training.batch_size,
             eval_integrals=self.cfg.validation.get("eval_integrals", False),
         )
-        return metrics
+        return metrics, plots

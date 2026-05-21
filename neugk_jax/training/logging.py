@@ -27,11 +27,11 @@ class Logger:
             config=cfg,
         )
 
-    def log(self, data: dict[str, Any], step: int | None = None) -> None:
+    def log(self, data: dict[str, Any], step: int | None = None, commit: bool = True) -> None:
         if not self.is_rank0:
             return
         if self.run is not None:
-            self.run.log(data, step=step)
+            self.run.log(data, step=step, commit=commit)
         else:
             kv = " ".join(f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v}"
                           for k, v in data.items())

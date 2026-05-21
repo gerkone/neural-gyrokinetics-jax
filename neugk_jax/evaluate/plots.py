@@ -1,11 +1,8 @@
 """Validation plot helpers.
 
-Ports ``generate_val_plots`` and ``avg_flux_confidence`` from
+Ports ``generate_val_plots`` and ``avg_flux_confidence`` from upstream
 ``neugk/plot_utils.py`` so the JAX evaluators produce the same wandb
-figures as the upstream torch pipeline.
-
-The actual N-D slicing logic re-uses upstream's ``plot_nd`` (matplotlib +
-numpy, framework-agnostic) — we just feed it numpy arrays.
+figures as the torch pipeline.
 """
 
 from __future__ import annotations
@@ -14,21 +11,53 @@ import io
 from typing import Optional, Sequence
 
 import matplotlib
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 
 from neugk_jax.utils import recombine_zf as _recombine_zf
 
 
-def _plot_nd():
-    """Lazy import of upstream's ``plot_nd`` so envs without torch can still
-    import this module (e.g. the gyaradax_env on the cluster)."""
-    import sys
-    _REPO_ROOT = "/system/user/publicwork/galletti/git/neural-gyrokinetics-gitlab"
-    if _REPO_ROOT not in sys.path:
-        sys.path.insert(0, _REPO_ROOT)
-    from neugk.plot_utils import plot_nd
-    return plot_nd
+def _plot_nd_local(x: np.ndarray, y: np.ndarray, *, cmap: str = "RdBu_r"):
+    """N-D cross-section grid plot — self-contained port of upstream ``plot_nd``.
+
+    Both inputs are ``(C, *spatial)``. We average over the non-displayed
+    spatial axes and lay out a grid of pairwise (pred, gt) heatmaps so the
+    spatial coverage stays comparable across runs.
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if x.ndim < 3 or y.ndim < 3:
+        # fallback: 1D line plot
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(np.asarray(x).ravel(), label="pred")
+        ax.plot(np.asarray(y).ravel(), label="gt", linestyle="--")
+        ax.legend(); ax.set_title("recon vs gt")
+        return fig
+    # collapse to (C, H, W) by averaging the leading non-display axes
+    spatial = x.shape[1:]
+    if len(spatial) > 2:
+        agg_axes = tuple(range(1, len(spatial) - 1))
+        x = np.mean(x, axis=tuple(a + 1 for a in agg_axes)) if False else np.mean(
+            x, axis=tuple(1 + a for a in range(len(spatial) - 2))
+        )
+        y = np.mean(y, axis=tuple(1 + a for a in range(len(spatial) - 2)))
+    C = x.shape[0]
+    fig, axes = plt.subplots(C, 3, figsize=(11, 3 * C), constrained_layout=True)
+    if C == 1:
+        axes = axes[None, :]
+    for c in range(C):
+        vmax = float(max(np.abs(x[c]).max(), np.abs(y[c]).max(), 1e-30))
+        vmin = -vmax if cmap == "RdBu_r" else 0.0
+        axes[c, 0].imshow(y[c], cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+        axes[c, 0].set_title(f"channel {c} — gt")
+        axes[c, 1].imshow(x[c], cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+        axes[c, 1].set_title(f"channel {c} — pred")
+        diff = x[c] - y[c]
+        d = float(np.abs(diff).max() + 1e-30)
+        axes[c, 2].imshow(diff, cmap="RdBu_r", vmin=-d, vmax=d, aspect="auto")
+        axes[c, 2].set_title(f"channel {c} — pred − gt")
+    return fig
 
 
 def _plt_to_wandb_image(fig):
@@ -82,7 +111,7 @@ def generate_val_plots(
             x = x[0]
         x = np.squeeze(x)
         y = np.squeeze(y)
-        fig = _plot_nd()(x, y, to_wandb=False, cmap=cfg["cmap"])
+        fig = _plot_nd_local(x, y, cmap=cfg["cmap"])
         plots[cfg["name"]] = _plt_to_wandb_image(fig) if to_wandb else fig
     return plots
 

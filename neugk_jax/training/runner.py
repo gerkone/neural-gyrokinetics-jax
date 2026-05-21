@@ -87,30 +87,56 @@ class BaseRunner(ABC):
             ),
         )
 
+    def _current_lr(self, step: int) -> float | None:
+        sched = getattr(self, "schedule", None)
+        if sched is None:
+            return None
+        try:
+            return float(sched(step))
+        except Exception:
+            return None
+
     def __call__(self) -> None:
         key = jax.random.PRNGKey(getattr(self.cfg, "seed", 0))
         for epoch in range(self.start_epoch + 1, self.cfg.training.n_epochs + 1):
             key, train_key = jax.random.split(key)
             t0 = time.perf_counter()
-            train_logs = self.train_epoch(epoch, train_key)
+            # train_epoch returns either ``loss_logs`` (back-compat) or
+            # ``(loss_logs, info_dict)`` — torch's split between core losses
+            # and per-step timing
+            train_out = self.train_epoch(epoch, train_key)
+            if isinstance(train_out, tuple) and len(train_out) == 2:
+                loss_logs, info_dict = train_out
+            else:
+                loss_logs, info_dict = train_out, {}
             t_train = time.perf_counter() - t0
 
-            val_logs = {}
+            val_logs, val_plots = {}, {}
             if epoch % getattr(self.cfg.validation, "validate_every_n_epochs", 1) == 0:
-                val_logs = self.evaluate(epoch)
+                val_out = self.evaluate(epoch)
+                if isinstance(val_out, tuple) and len(val_out) == 2:
+                    val_logs, val_plots = val_out
+                else:
+                    val_logs = val_out
 
-            logs = {**{f"train/{k}": v for k, v in train_logs.items()},
-                    **{f"val/{k}": v for k, v in val_logs.items()},
-                    "epoch": epoch, "epoch_time_s": t_train}
-            self.logger.log(logs, step=epoch)
+            # build wandb-style log dict: train/* (losses + lr) | info/* (timing) | val_traj/*
+            lr = self._current_lr(epoch * getattr(self, "steps_per_epoch", 1))
+            train_ns = {f"train/{k}": v for k, v in loss_logs.items()}
+            if lr is not None:
+                train_ns["train/lr"] = lr
+            info_ns = {f"info/{k}": v for k, v in info_dict.items()}
+            val_ns = {f"val_traj/{k}": v for k, v in val_logs.items()}
+            logs = {**train_ns, **info_ns, **val_ns, "epoch": epoch, "epoch_time_s": t_train}
+            self.logger.log(logs, step=epoch, commit=not val_plots)
+            if val_plots:
+                self.logger.log(val_plots, step=epoch, commit=True)
             if self.dist.is_rank0:
-                print(
-                    f"epoch {epoch:04d}  "
-                    + " ".join(f"{k}={v:.4e}" for k, v in train_logs.items() if isinstance(v, (int, float)))
-                    + f"  ({t_train:.1f}s)"
+                core = " ".join(
+                    f"{k}={v:.4e}" for k, v in loss_logs.items() if isinstance(v, (int, float))
                 )
+                print(f"epoch {epoch:04d}  {core}  ({t_train:.1f}s)")
 
-            val = val_logs.get("df", train_logs.get("loss", math.inf))
+            val = val_logs.get("df", val_logs.get("df_mse", loss_logs.get("loss", math.inf)))
             if val < self.best_val:
                 self.best_val = val
                 self.save_checkpoint(epoch, val, "best.eqx")
