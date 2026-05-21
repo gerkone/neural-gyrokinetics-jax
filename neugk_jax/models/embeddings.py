@@ -17,9 +17,12 @@ def _sincos_1d(length: int, dim: int, base: float = 10000.0) -> jnp.ndarray:
     """Standard sinusoidal embedding of shape (length, dim). dim must be even."""
     assert dim % 2 == 0, "sincos dim must be even"
     pos = jnp.arange(length, dtype=jnp.float32)
-    freqs = jnp.exp(-math.log(base) * jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
+    # force f32: with x64 enabled (gyaradax import) ``math.log(base)`` is a
+    # Python float which promotes freqs/angles to f64; the resulting buffer
+    # then contaminates every downstream call (DiT output → scan dtype mismatch)
+    freqs = jnp.exp(-math.log(base) * jnp.arange(0, dim, 2, dtype=jnp.float32) / dim).astype(jnp.float32)
     angles = pos[:, None] * freqs[None, :]
-    return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
+    return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1).astype(jnp.float32)
 
 
 def _sincos_nd(grid_size: Sequence[int], dim: int) -> jnp.ndarray:
@@ -127,10 +130,12 @@ class ContinuousConditionEmbed(eqx.Module):
         self.padding = padding
         self.cond_per_wave = cond_per_wave
 
+        # force f32: with x64 enabled (gyaradax import), Python float
+        # ``max_wavelength`` would promote omega to f64 and contaminate the DiT output.
         omega = 1.0 / (max_wavelength ** (
             jnp.arange(0, cond_per_wave, 2, dtype=jnp.float32) / cond_per_wave
         ))
-        self.omega = jax.lax.stop_gradient(omega)
+        self.omega = jax.lax.stop_gradient(omega.astype(jnp.float32))
 
         self.cond_dim = 4 * dim
         self.mlp = [Linear(dim, self.cond_dim, key=key)]
