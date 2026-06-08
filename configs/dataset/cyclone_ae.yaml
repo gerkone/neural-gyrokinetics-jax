@@ -15,6 +15,9 @@ normalization:
   df:
     type: zscore
     agg_axes: [0, 1, 3, 4, 5]
+  phi:
+    type: zscore
+    agg_axes: [0, 1, 2]
 normalization_scope: dataset
 normalization_stats: /local00/bioinf/galletti/preprocessed_kvikio/df_flux_phi_offset80_mu_57f5caf2_stats.pkl
 # trajectory filters — drop stable/non-turbulent runs (mean flux below 1.0 over first/last 80 steps).

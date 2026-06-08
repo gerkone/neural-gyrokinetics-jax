@@ -39,6 +39,13 @@ class AERunner(BaseRunner):
 
     def setup_data(self) -> None:
         cfg = self.cfg
+        # conditioning is gyroswin-specific; AE must stay unconditional
+        if cfg.model.get("conditioning") not in (None, [], ()):
+            raise ValueError(
+                "`model.conditioning` is set but the AE workflow does not accept "
+                "scalar conditioning. Drop it from the config or switch to "
+                "workflow=gyroswin."
+            )
         # training.amp.enable=True → train reads bf16 shards (or fp32 with on-the-fly
         # quantize when the shard is missing). validation always reads fp32.
         amp = cfg.training.get("amp", {}) or {}

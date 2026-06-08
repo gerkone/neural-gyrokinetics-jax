@@ -383,7 +383,8 @@ class SwinLayer(eqx.Module):
     def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False, **_) -> jnp.ndarray:
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
-            x = blk(x, key=k, inference=inference)
+            call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
+            x = call(x, key=k, inference=inference)
         return x
 
 
@@ -446,5 +447,6 @@ class DiTSwinLayer(eqx.Module):
     def __call__(self, x, condition, *, key=None, inference=False, **_):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
-            x = blk(x, condition, key=k, inference=inference)
+            call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
+            x = call(x, condition, key=k, inference=inference)
         return x

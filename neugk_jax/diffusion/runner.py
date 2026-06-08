@@ -33,6 +33,13 @@ class FlowMatchingRunner(BaseRunner):
 
     def setup_data(self) -> None:
         cfg = self.cfg
+        # conditioning is gyroswin-specific; latent diffusion stays unconditional
+        if cfg.model.get("conditioning") not in (None, [], ()):
+            raise ValueError(
+                "`model.conditioning` is set but the diffusion workflow does not accept "
+                "scalar conditioning at the model level. Drop it from the config or "
+                "switch to workflow=gyroswin."
+            )
         ae_path = cfg.ae_checkpoint
         if ae_path is None:
             raise ValueError("diffusion workflow requires ae_checkpoint")

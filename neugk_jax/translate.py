@@ -117,6 +117,23 @@ def _dit_name_map(jax_name: str) -> list[str]:
     return cand
 
 
+def _gyroswin_name_map(jax_name: str) -> list[str]:
+    """GyroSwin JAX-name → candidate torch state_dict keys.
+
+    Reuses the AE renames inside each U-Net subtree, plus the cross-attention
+    layer name mappings that are unique to gyroswin (``MixingBlock``,
+    ``VSpaceReduce`` — the ``.kv.`` / ``.proj.`` / ``integral_token`` fields
+    already align with torch names).
+    """
+    base = jax_name.replace(".inner.", ".")
+    # the .swin. → .swin_att. rename only applies inside the U-Net subtrees
+    base = base.replace(".swin.", ".swin_att.")
+    base = base.replace(".downsample.proj.", ".downsample.reduction.")
+    base = base.replace(".gate.proj.", ".gate.gate.1.")
+    base = _LAYERS_RE.sub(lambda m: f".mlp.{int(m.group(1)) * 3}", base)
+    return [jax_name, base]
+
+
 def _apply_replacements(model, replacements):
     new_model = copy.deepcopy(model)
     for dotted, value in replacements.items():
@@ -163,6 +180,11 @@ def translate_ae(model, torch_state, *, strict: bool = False):
 def translate_dit(model, torch_state, *, strict: bool = False):
     """Translate an upstream torch DiT state_dict onto an Equinox ``DiT``."""
     return _translate(model, torch_state, _dit_name_map, strict=strict)
+
+
+def translate_gyroswin(model, torch_state, *, strict: bool = False):
+    """Translate an upstream torch GyroSwinMultitask state_dict onto our equinox port."""
+    return _translate(model, torch_state, _gyroswin_name_map, strict=strict)
 
 
 def build_ae_from_config(
@@ -238,11 +260,17 @@ def load_or_translate(template, ckpt_path: str):
     """``.eqx`` → load; ``.pth`` → on-the-fly translate. Returns the model."""
     from neugk_jax.training.checkpoint import load_model_only
     from neugk_jax.diffusion.dit import DiT
+    from neugk_jax.gyroswin.models.gyroswin import GyroSwinMultitask
 
     if ckpt_path.endswith(".eqx"):
         return load_model_only(ckpt_path, template)
     state = load_torch_state(ckpt_path)
-    fn = translate_dit if isinstance(template, DiT) else translate_ae
+    if isinstance(template, GyroSwinMultitask):
+        fn = translate_gyroswin
+    elif isinstance(template, DiT):
+        fn = translate_dit
+    else:
+        fn = translate_ae
     model, missing, unused = fn(template, state)
     print(f"  translated torch -> jax: {len(missing)} missing, {len(unused)} unused")
     return model

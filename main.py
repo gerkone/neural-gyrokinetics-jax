@@ -35,6 +35,9 @@ def dispatch_runner(cfg: DictConfig) -> None:
     elif base == "diffusion":
         from neugk_jax.diffusion.runner import FlowMatchingRunner
         FlowMatchingRunner(cfg, output_path=cfg.output_path)()
+    elif base == "gyroswin":
+        from neugk_jax.gyroswin import GyroSwinRunner
+        GyroSwinRunner(cfg, output_path=cfg.output_path)()
     else:
         raise NotImplementedError(f"unknown workflow: {workflow}")
 

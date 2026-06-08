@@ -176,3 +176,59 @@ class MultiHeadSelfAttention(eqx.Module):
             out = self.gate(out, q)
         out = out.reshape(n, dim)
         return self.proj(out)
+
+
+class MultiHeadCrossAttention(eqx.Module):
+    """Cross-attention: queries from ``left``, keys/values from ``right``.
+
+    Used by the GyroSwin mixing layers — ``left`` attends to ``right``,
+    output dim matches ``left``. Both inputs are tokenised ``(n, dim)``;
+    the caller flattens spatial axes before the call.
+    """
+
+    q: Linear
+    kv: Linear
+    proj: Linear
+    num_heads: int = eqx.field(static=True)
+    head_dim: int = eqx.field(static=True)
+    scale: float = eqx.field(static=True)
+    backend: str = eqx.field(static=True)
+
+    def __init__(
+        self,
+        q_dim: int,
+        kv_dim: int,
+        num_heads: int,
+        *,
+        key,
+        out_dim: Optional[int] = None,
+        qkv_bias: bool = False,
+        backend: Optional[str] = None,
+    ):
+        assert q_dim % num_heads == 0, f"q_dim={q_dim} not divisible by num_heads={num_heads}"
+        self.num_heads = num_heads
+        self.head_dim = q_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        kq, kkv, kp = jr.split(key, 3)
+        out_dim = out_dim or q_dim
+        self.q = Linear(q_dim, q_dim, key=kq, use_bias=qkv_bias)
+        self.kv = Linear(kv_dim, 2 * q_dim, key=kkv, use_bias=qkv_bias)
+        self.proj = Linear(q_dim, out_dim, key=kp, use_bias=True)
+        chosen = backend or get_default_attention_backend()
+        if chosen == "flash" and not _has_flash():
+            chosen = "einsum"
+        self.backend = chosen
+
+    def __call__(self, left: jnp.ndarray, right: jnp.ndarray) -> jnp.ndarray:
+        n_q, _ = left.shape
+        n_kv, _ = right.shape
+        q = self.q(left).reshape(n_q, self.num_heads, self.head_dim)
+        kv = self.kv(right).reshape(n_kv, 2, self.num_heads, self.head_dim)
+        k = kv[:, 0]
+        v = kv[:, 1]
+        if self.backend == "flash":
+            out = _flash_attention(q, k, v, self.scale, None)
+        else:
+            out = _einsum_attention(q, k, v, self.scale, None)
+        out = out.reshape(n_q, -1)
+        return self.proj(out)

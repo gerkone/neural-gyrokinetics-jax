@@ -30,13 +30,18 @@ def _as_seq(x, n):
 
 
 class SwinBlockDown(eqx.Module):
-    """Encoder stage: optional APE → SwinLayer → PatchMerge."""
+    """Encoder stage: optional APE → SwinLayer (or DiTSwinLayer) → PatchMerge.
+
+    Pass ``cond_dim>0`` at construction to swap the inner ``SwinLayer`` for a
+    DiT-conditioned variant; the ``__call__`` then accepts a ``condition`` arg.
+    """
 
     pos_embed: Optional[APE]
-    swin: SwinLayer
+    swin: object  # SwinLayer or DiTSwinLayer
     downsample: PatchMerge
     resampled_grid_size: tuple[int, ...] = eqx.field(static=True)
     out_dim: int = eqx.field(static=True)
+    use_cond: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -60,41 +65,57 @@ class SwinBlockDown(eqx.Module):
         gated_attention: bool = False,
         norm_affine: bool = False,
         rms_norm: bool = False,
+        cond_dim: Optional[int] = None,
     ):
-        k1, k2, k3 = jr.split(key, 3)
+        k1, k2, _ = jr.split(key, 3)
         self.pos_embed = APE(dim, grid_size, init="sincos") if use_abs_pe else None
-        self.swin = SwinLayer(
-            space, dim, depth=depth, num_heads=num_heads,
-            grid_size=grid_size, window_size=window_size,
-            key=k1, mlp_ratio=mlp_ratio, drop_path=drop_path,
-            act_fn=act_fn, use_checkpoint=use_checkpoint,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention,
-            norm_affine=norm_affine, rms_norm=rms_norm,
-        )
+        self.use_cond = cond_dim is not None and cond_dim > 0
+        if self.use_cond:
+            from neugk_jax.models.swin import DiTSwinLayer
+            self.swin = DiTSwinLayer(
+                space, dim, depth=depth, num_heads=num_heads,
+                grid_size=grid_size, window_size=window_size,
+                cond_dim=cond_dim,
+                key=k1, mlp_ratio=mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+            )
+        else:
+            self.swin = SwinLayer(
+                space, dim, depth=depth, num_heads=num_heads,
+                grid_size=grid_size, window_size=window_size,
+                key=k1, mlp_ratio=mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                use_rpb=use_rpb, gated_attention=gated_attention,
+                norm_affine=norm_affine, rms_norm=rms_norm,
+            )
         self.downsample = PatchMerge(
             dim, grid_size, key=k2, c_multiplier=c_multiplier, rms_norm=rms_norm,
         )
         self.resampled_grid_size = self.downsample.target_grid_size
         self.out_dim = self.downsample.out_dim
 
-    def __call__(self, x, *, key=None, inference=True, return_skip: bool = True):
+    def __call__(self, x, condition=None, *, key=None, inference=True, return_skip: bool = True):
         if self.pos_embed is not None:
             x = self.pos_embed(x)
-        x = self.swin(x, key=key, inference=inference)
+        if self.use_cond:
+            x = self.swin(x, condition, key=key, inference=inference)
+        else:
+            x = self.swin(x, key=key, inference=inference)
         merged = self.downsample(x)
         return (merged, x) if return_skip else merged
 
 
 class SwinBlockUp(eqx.Module):
-    """Decoder stage: optional skip-concat → SwinLayer → PatchExpand (or none)."""
+    """Decoder stage: optional skip-concat → SwinLayer (or DiTSwinLayer) → PatchExpand."""
 
     proj_concat: Optional[Linear]
     pos_embed: Optional[APE]
-    swin: SwinLayer
+    swin: object  # SwinLayer or DiTSwinLayer
     upsample: Optional[PatchExpand]
     resampled_grid_size: tuple[int, ...] = eqx.field(static=True)
     mode: LayerModes = eqx.field(static=True)
+    use_cond: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -121,6 +142,7 @@ class SwinBlockUp(eqx.Module):
         gated_attention: bool = False,
         norm_affine: bool = False,
         rms_norm: bool = False,
+        cond_dim: Optional[int] = None,
     ):
         k1, k2, k3 = jr.split(key, 3)
         if use_skip:
@@ -128,15 +150,26 @@ class SwinBlockUp(eqx.Module):
         else:
             self.proj_concat = None
         self.pos_embed = APE(dim, grid_size, init="sincos") if use_abs_pe else None
-        self.swin = SwinLayer(
-            space, dim, depth=depth, num_heads=num_heads,
-            grid_size=grid_size, window_size=window_size,
-            key=k2, mlp_ratio=mlp_ratio, drop_path=drop_path,
-            act_fn=act_fn, use_checkpoint=use_checkpoint,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention,
-            norm_affine=norm_affine, rms_norm=rms_norm,
-        )
+        self.use_cond = cond_dim is not None and cond_dim > 0
+        if self.use_cond:
+            from neugk_jax.models.swin import DiTSwinLayer
+            self.swin = DiTSwinLayer(
+                space, dim, depth=depth, num_heads=num_heads,
+                grid_size=grid_size, window_size=window_size,
+                cond_dim=cond_dim,
+                key=k2, mlp_ratio=mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+            )
+        else:
+            self.swin = SwinLayer(
+                space, dim, depth=depth, num_heads=num_heads,
+                grid_size=grid_size, window_size=window_size,
+                key=k2, mlp_ratio=mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                use_rpb=use_rpb, gated_attention=gated_attention,
+                norm_affine=norm_affine, rms_norm=rms_norm,
+            )
         if mode == LayerModes.UPSAMPLE:
             self.upsample = PatchExpand(
                 dim, grid_size, key=k3,
@@ -152,13 +185,16 @@ class SwinBlockUp(eqx.Module):
             self.resampled_grid_size = tuple(grid_size)
         self.mode = mode
 
-    def __call__(self, x, s=None, *, key=None, inference=True):
+    def __call__(self, x, s=None, condition=None, *, key=None, inference=True):
         if self.proj_concat is not None and s is not None:
             x = self.proj_concat(jnp.concatenate([x, s], axis=-1))
             x = jax.nn.gelu(x)
         if self.pos_embed is not None:
             x = self.pos_embed(x)
-        x = self.swin(x, key=key, inference=inference)
+        if self.use_cond:
+            x = self.swin(x, condition, key=key, inference=inference)
+        else:
+            x = self.swin(x, key=key, inference=inference)
         if self.upsample is not None:
             x = self.upsample(x)
         return x
@@ -224,6 +260,7 @@ class SwinNDUnet(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         up_use_skip: bool = True,
+        cond_dim: Optional[int] = None,
         key,
     ):
         patch_size = _as_seq(patch_size, space)
@@ -261,6 +298,7 @@ class SwinNDUnet(eqx.Module):
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=rms_norm,
+                cond_dim=cond_dim,
             )
             ki += 1
             down_blocks.append(blk)
@@ -298,7 +336,7 @@ class SwinNDUnet(eqx.Module):
             qkv_bias=qkv_bias, qk_norm=qk_norm,
             use_rpb=use_rpb, gated_attention=gated_attention,
             norm_affine=norm_affine, use_skip=up_use_skip,
-            rms_norm=rms_norm,
+            rms_norm=rms_norm, cond_dim=cond_dim,
         )
         for i in range(num_layers - 1):
             up_blocks.append(
