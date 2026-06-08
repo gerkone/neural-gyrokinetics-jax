@@ -1,0 +1,33 @@
+{
+  // Use basedpyright (not the bundled pyright) + ruff for Python.
+  "languages": {
+    "Python": {
+      "language_servers": ["basedpyright", "ruff", "!pyright"]
+    }
+  },
+  "lsp": {
+    "basedpyright": {
+      "settings": {
+        "basedpyright.analysis": {
+          // only surface diagnostics for files you have open (less project-wide noise)
+          "diagnosticMode": "openFilesOnly",
+          // rule on/off lives in pyproject.toml [tool.basedpyright]; this just
+          // sets the base strictness the editor starts from
+          "typeCheckingMode": "standard"
+        },
+        // resolve jax/equinox/torch/numpy from the mhd conda env so imports
+        // and types are found (otherwise everything is "unknown")
+        "python": {
+          "pythonPath": "/system/apps/userenv/galletti/mhd/bin/python"
+        }
+      }
+    },
+    "ruff": {
+      "initialization_options": {
+        "settings": {
+          "lineLength": 100
+        }
+      }
+    }
+  }
+}

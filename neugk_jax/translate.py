@@ -130,6 +130,9 @@ def _gyroswin_name_map(jax_name: str) -> list[str]:
     base = base.replace(".swin.", ".swin_att.")
     base = base.replace(".downsample.proj.", ".downsample.reduction.")
     base = base.replace(".gate.proj.", ".gate.gate.1.")
+    # SwinBlockUp / PatchExpand keep proj_concat as a single Linear; torch wraps it
+    # in an nn.Sequential, so the param sits at ``proj_concat.0.*``.
+    base = base.replace(".proj_concat.", ".proj_concat.0.")
     base = _LAYERS_RE.sub(lambda m: f".mlp.{int(m.group(1)) * 3}", base)
     return [jax_name, base]
 
@@ -163,6 +166,16 @@ def _translate(model, torch_state, name_map, *, strict: bool = False):
                 if (tw.ndim == leaf.ndim + 1 and tw.shape[0] == 1
                         and tuple(tw.shape[1:]) == tuple(leaf.shape)):
                     replacements[name] = np.asarray(tw).squeeze(0)
+                    used.add(cand); matched = True; break
+                # ConvTranspose weight: torch (in, out, *k) vs equinox (out, in, *k)
+                if (tw.ndim == leaf.ndim and tw.ndim >= 3
+                        and tuple(tw.shape) == (leaf.shape[1], leaf.shape[0], *leaf.shape[2:])):
+                    replacements[name] = np.swapaxes(np.asarray(tw), 0, 1)
+                    used.add(cand); matched = True; break
+                # ConvTranspose bias: torch (out,) vs equinox (out, 1, 1, ...)
+                if (tw.ndim == 1 and leaf.ndim > 1 and tw.shape[0] == leaf.shape[0]
+                        and int(np.prod(leaf.shape[1:])) == 1):
+                    replacements[name] = np.asarray(tw).reshape(leaf.shape)
                     used.add(cand); matched = True; break
         if not matched and not _is_non_persistent(name) and not _is_dead_leaf(name):
             missing.append((name, tuple(leaf.shape)))

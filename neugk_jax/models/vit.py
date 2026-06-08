@@ -12,7 +12,7 @@ import jax.random as jr
 
 from neugk_jax.models.attention import MultiHeadSelfAttention
 from neugk_jax.models.utils import MLP, LayerNorm, RMSNorm, DiTModulation, gelu
-from neugk_jax.models.swin import _DropPath
+from neugk_jax.models.swin import Film, _DropPath
 
 
 class LayerModes(enum.Enum):
@@ -232,4 +232,64 @@ class DiTLayer(eqx.Module):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
             x = blk(x, condition, key=k, inference=inference)
+        return x.reshape(*spatial, dim)
+
+
+class FilmViTLayer(eqx.Module):
+    """``depth`` standard ViT blocks, each preceded by a per-block FiLM modulation.
+
+    Mirrors torch ``FilmSwinLayer`` applied at the bottleneck ViT: ``conditioning``
+    is one ``Film`` per block, applied to the block input. Blocks are ordinary
+    (unconditioned) ViTBlocks so they reuse the parity-verified attention/MLP path.
+    """
+
+    blocks: list[ViTBlock]
+    conditioning: list[Film]
+    grid_size: tuple[int, ...] = eqx.field(static=True)
+    dim: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        space: int,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        grid_size: Sequence[int],
+        *,
+        key,
+        cond_dim: int,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        act_fn: Callable = gelu,
+        use_checkpoint: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        gated_attention: bool = False,
+        norm_affine: bool = False,
+        rms_norm: bool = False,
+        **_unused,
+    ):
+        bkeys = jr.split(key, depth)
+        fkeys = jr.split(jr.fold_in(key, 1), depth)
+        self.blocks = [
+            ViTBlock(
+                dim, num_heads, key=bkeys[i],
+                mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
+                qkv_bias=qkv_bias, qk_norm=qk_norm, gated_attention=gated_attention,
+                norm_affine=norm_affine, rms_norm=rms_norm,
+            )
+            for i in range(depth)
+        ]
+        self.conditioning = [Film(cond_dim, dim, key=fkeys[i]) for i in range(depth)]
+        self.grid_size = tuple(grid_size)
+        self.dim = dim
+
+    def __call__(self, x: jnp.ndarray, condition, *, key=None, inference=False, **_):
+        spatial = x.shape[:-1]
+        dim = x.shape[-1]
+        x = x.reshape(-1, dim)
+        keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
+        for blk, film, k in zip(self.blocks, self.conditioning, keys):
+            x = film(x, condition)
+            x = blk(x, key=k, inference=inference)
         return x.reshape(*spatial, dim)

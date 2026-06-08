@@ -62,9 +62,11 @@ class MixingBlock(eqx.Module):
         l_shape = left.shape
         l_tok = left.reshape(-1, l_shape[-1])
         r_tok = right.reshape(-1, right.shape[-1])
+        # torch MixingBlock (x_layers.py:90-94): post-norm on attn output, but
+        # PRE-norm on the MLP branch — x = x + drop_path(mlp(norm2(x))).
         x = self.drop_path(self.norm1(self.attn(l_tok, r_tok)), key=key, inference=inference)
         x = l_tok + x
-        x = x + self.drop_path(self.norm2(jax.vmap(self.mlp)(x)), key=key, inference=inference)
+        x = x + self.drop_path(jax.vmap(self.mlp)(self.norm2(x)), key=key, inference=inference)
         return x.reshape(l_shape)
 
 
@@ -129,6 +131,56 @@ class VSpaceReduce(eqx.Module):
         out = out.reshape(n_groups, self.num_heads * self.head_dim)
         out = self.proj(out)
         return out.reshape(ns, nx, ny, self.out_dim)
+
+
+class LatentMixingTransformer(eqx.Module):
+    """A stack of ``depth`` cross-attention ``MixingBlock``s (one FluxDecoder stage)."""
+
+    blocks: list
+
+    def __init__(self, left_dim: int, right_dim: int, num_heads: int, depth: int, *, key):
+        keys = jr.split(key, depth)
+        self.blocks = [
+            MixingBlock(left_dim, right_dim, num_heads, key=k, mlp_ratio=2.0, qkv_bias=True)
+            for k in keys
+        ]
+
+    def __call__(self, left: jnp.ndarray, right: jnp.ndarray) -> jnp.ndarray:
+        x = left
+        for blk in self.blocks:
+            x = blk(x, right)
+        return x
+
+
+class FluxDecoder(eqx.Module):
+    """Predict a scalar flux from the per-scale (phi, df) latents.
+
+    Port of ``neugk/gyroswin/models/x_layers.py:FluxDecoder`` with reduction="max".
+    One ``LatentMixingTransformer`` stage per scale: stage ``i`` cross-attends the
+    phi latent (query) to the df latent (kv), global-max-pools over space to a
+    vector of ``left_dims[i]``, and the per-scale vectors are concatenated and fed
+    to ``flux_mlp`` (sum(left_dims) -> half -> 1).
+    """
+
+    blocks: list
+    flux_mlp: MLP
+
+    def __init__(self, left_dims, right_dims, num_heads: int, depth: int, *, key):
+        ks = jr.split(key, len(left_dims) + 1)
+        self.blocks = [
+            LatentMixingTransformer(left_dims[i], right_dims[i], num_heads, depth, key=ks[i])
+            for i in range(len(left_dims))
+        ]
+        flux_latent = int(sum(left_dims))
+        self.flux_mlp = MLP([flux_latent, flux_latent // 2, 1], act_fn=gelu, key=ks[-1])
+
+    def mix(self, i: int, left: jnp.ndarray, right: jnp.ndarray) -> jnp.ndarray:
+        """Stage ``i``: cross-mix then global max-pool over all spatial axes -> (dim,)."""
+        x = self.blocks[i](left, right)
+        return jnp.max(x.reshape(-1, x.shape[-1]), axis=0)
+
+    def __call__(self, flux_lats) -> jnp.ndarray:
+        return self.flux_mlp(jnp.concatenate(flux_lats, axis=-1))
 
 
 class RSpaceReduce(eqx.Module):

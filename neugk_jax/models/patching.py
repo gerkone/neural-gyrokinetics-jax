@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from neugk_jax.models.utils import RMSNorm
-from neugk_jax.models.utils import MLP, LayerNorm, Linear, leaky_relu
+from neugk_jax.models.utils import MLP, LayerNorm, Linear, gelu, leaky_relu
 
 
 def _norm(dim: int, *, rms: bool, affine: bool = True):
@@ -142,6 +142,7 @@ class PatchEmbed(eqx.Module):
         mlp_ratio: float = 8.0,
         norm: bool = False,
         rms_norm: bool = False,
+        act_fn=leaky_relu,
     ):
         ps = _normalize_patch(patch_size)
         self.patch_size = ps
@@ -152,8 +153,8 @@ class PatchEmbed(eqx.Module):
         # hidden = embed_dim * mlp_ratio, no max-clamp (matches torch)
         hidden = int(embed_dim * mlp_ratio)
         dims = [patch_elems] + [hidden] * (mlp_depth - 1) + [embed_dim]
-        # upstream PatchEmbed uses LeakyReLU + bias=False
-        self.patch = MLP(dims, key=key, act_fn=leaky_relu, use_bias=False)
+        # PatchEmbed MLP uses the model act_fn (config: GELU); bias=False
+        self.patch = MLP(dims, key=key, act_fn=act_fn, use_bias=False)
         self.norm = _norm(embed_dim, rms=rms_norm) if norm else None
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -217,6 +218,42 @@ class PatchMerge(eqx.Module):
 
 
 
+class StridedConvTranspose(eqx.Module):
+    """ConvTranspose with stride == kernel (non-overlapping) == the patch-expand op.
+
+    Stores the weight in **torch ConvTranspose layout** ``(in, out, *kernel)`` so the
+    checkpoint loads with a direct copy. Output channel placement matches torch:
+    ``out[*(g_i*k_i), oc] = sum_ic x[*g, ic] * W[ic, oc, *k]`` (kernel block per grid
+    cell), implemented as einsum + interleave-reshape (same layout as ``unfold_patches``).
+    """
+
+    weight: jax.Array  # (in, out, *kernel)
+    bias: jax.Array    # (out,)
+    expand_by: tuple[int, ...] = eqx.field(static=True)
+
+    def __init__(self, in_ch: int, out_ch: int, expand_by: Sequence[int], *, key):
+        eb = tuple(expand_by)
+        self.expand_by = eb
+        self.weight = jr.normal(key, (in_ch, out_ch, *eb)) * 0.02
+        self.bias = jnp.zeros((out_ch,))
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # x: (*grid, in) -> (*grid*expand, out)
+        s = len(self.expand_by)
+        gnd = x.ndim - 1
+        kl = "".join(chr(ord("p") + i) for i in range(s))
+        y = jnp.einsum(f"...i,io{kl}->...o{kl}", x, self.weight)  # (*grid, out, *k)
+        # interleave grid axis i with kernel axis i, channel (out) last
+        perm = []
+        for i in range(gnd):
+            perm += [i, gnd + 1 + i]
+        perm.append(gnd)  # out channel
+        y = jnp.transpose(y, perm)  # (g0, k0, g1, k1, ..., out)
+        new_shape = [x.shape[i] * self.expand_by[i] for i in range(gnd)] + [y.shape[-1]]
+        y = y.reshape(new_shape)
+        return y + self.bias
+
+
 class PatchExpand(eqx.Module):
     """MLP channel mixer + unfold + optional crop.
 
@@ -226,7 +263,9 @@ class PatchExpand(eqx.Module):
     (``unpatch.expansion.mlp.0.weight`` etc.).
     """
 
-    expansion: MLP
+    expansion: object  # MLP (mlp patch) or eqx.nn.ConvTranspose (conv patch)
+    proj_concat: Optional[Linear]
+    modulation: Optional[object]  # Film, when cond_dim given (unpatch)
     norm: Optional[object]
     grid_size: tuple[int, ...] = eqx.field(static=True)
     target_grid_size: tuple[int, ...] = eqx.field(static=True)
@@ -234,6 +273,7 @@ class PatchExpand(eqx.Module):
     in_dim: int = eqx.field(static=True)
     out_dim: int = eqx.field(static=True)
     out_channels: int | None = eqx.field(static=True)
+    use_conv: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -249,6 +289,9 @@ class PatchExpand(eqx.Module):
         mlp_ratio: float = 8.0,
         norm: bool = True,
         rms_norm: bool = False,
+        use_conv: bool = False,
+        patch_skip: bool = False,
+        cond_dim: Optional[int] = None,
     ):
         gs = tuple(grid_size)
         if isinstance(expand_by, int):
@@ -278,17 +321,38 @@ class PatchExpand(eqx.Module):
             inner = max(1, (dim * _prod(eb)) // c_multiplier)
             self.out_dim = max(1, dim // c_multiplier)
 
-        # hidden = prod(expand_by) * mlp_ratio, not dim * mlp_ratio (matches torch)
-        hidden = int(_prod(eb) * mlp_ratio)
-        dims = [dim] + [hidden] * (mlp_depth - 1) + [inner]
-        # upstream PatchExpand uses LeakyReLU + bias=True
-        self.expansion = MLP(dims, key=key, act_fn=leaky_relu, use_bias=True)
+        self.use_conv = use_conv
+        kexp, kpc, kmod = jr.split(key, 3)
+        if use_conv:
+            # stride==kernel ConvTranspose, torch layout (in, out, *kernel) -> direct copy
+            self.expansion = StridedConvTranspose(dim, self.out_dim, eb, key=kexp)
+        else:
+            # hidden = prod(expand_by) * mlp_ratio, not dim * mlp_ratio (matches torch)
+            hidden = int(_prod(eb) * mlp_ratio)
+            dims = [dim] + [hidden] * (mlp_depth - 1) + [inner]
+            # upstream PatchExpand uses LeakyReLU + bias=True
+            self.expansion = MLP(dims, key=kexp, act_fn=leaky_relu, use_bias=True)
+        # patch-skip residual projection (Linear(2*dim->dim) + LeakyReLU) and FiLM
+        self.proj_concat = Linear(2 * dim, dim, key=kpc) if patch_skip else None
+        if cond_dim:
+            from neugk_jax.models.swin import Film
+            self.modulation = Film(cond_dim, dim, key=kmod)
+        else:
+            self.modulation = None
         # norm runs over out_dim channels after unfold, matching torch PatchExpand.forward
         self.norm = _norm(self.out_dim, rms=rms_norm) if norm else None
 
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = self.expansion(x)
-        x = unfold_patches(x, self.expand_by, out_channels=self.out_dim)
+    def __call__(self, x: jnp.ndarray, cond: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+        # torch order: proj_concat (skip residual) -> FiLM -> expansion -> crop -> norm
+        if self.proj_concat is not None:
+            x = leaky_relu(self.proj_concat(x))
+        if self.modulation is not None:
+            x = self.modulation(x, cond)
+        if self.use_conv:
+            x = self.expansion(x)           # (*grid, c) -> (*expanded, out)
+        else:
+            x = self.expansion(x)
+            x = unfold_patches(x, self.expand_by, out_channels=self.out_dim)
         # crop any overshoot from ceiling the expand factor
         slices = [slice(0, t) for t in self.target_grid_size] + [slice(None)]
         x = x[tuple(slices)]

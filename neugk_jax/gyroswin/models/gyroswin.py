@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from einops import rearrange
 
-from neugk_jax.gyroswin.models.x_layers import MixingBlock, VSpaceReduce
+from neugk_jax.gyroswin.models.x_layers import FluxDecoder, MixingBlock, VSpaceReduce
 from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet, SwinNDUnet
 
@@ -48,6 +48,8 @@ class GyroSwinMultitask(eqx.Module):
     phi_mix_up: list
     df_mix_unpatch: MixingBlock
     phi_mix_unpatch: MixingBlock
+    flux_head: Optional[FluxDecoder]
+    use_flux: bool = eqx.field(static=True)
     use_phi: bool = eqx.field(static=True)
     patch_skip: bool = eqx.field(static=True)
     latent_dim: int = eqx.field(static=True)
@@ -77,12 +79,16 @@ class GyroSwinMultitask(eqx.Module):
         outputs: Sequence[str] = ("df", "phi"),
         n_cond: int = 0,
         cond_embed_dim: int = 128,
+        cond_mode: str = "film",
+        flux_num_heads: int = 4,
+        flux_depth: int = 1,
         use_checkpoint: bool = False,
         key,
     ):
         self.latent_dim = dim
         self.patch_skip = patch_skip
         self.use_phi = "phi" in outputs
+        self.use_flux = ("flux" in outputs) or ("fluxavg" in outputs)
         self.n_cond = n_cond
 
         phi_base_resolution = tuple(df_base_resolution[2:])  # (s, x, y)
@@ -90,14 +96,11 @@ class GyroSwinMultitask(eqx.Module):
         phi_window_size = tuple(df_window_size[2:])
 
         keys = jr.split(key, 18)
-        if n_cond > 0:
-            self.cond_embed = ContinuousConditionEmbed(
-                dim=cond_embed_dim, n_cond=n_cond, key=keys[16],
-            )
-            cond_dim_out = self.cond_embed.cond_dim  # 4 * cond_embed_dim
-        else:
-            self.cond_embed = None
-            cond_dim_out = None
+        # conditioning embeds live INSIDE each U-Net (torch parity: df_unet.cond_embed,
+        # phi_unet.cond_embed), not at the top level.
+        self.cond_embed = None
+        cond_kw = dict(n_cond=n_cond, cond_embed_dim=cond_embed_dim, cond_mode=cond_mode,
+                       middle_swin=True, unpatch_patch_skip=patch_skip)
 
         self.df_unet = Swin5DUnet(
             space=5,
@@ -118,9 +121,9 @@ class GyroSwinMultitask(eqx.Module):
             qk_norm=qk_norm,
             use_rpb=use_rpb,
             gated_attention=gated_attention,
-            cond_dim=cond_dim_out,
             use_checkpoint=use_checkpoint,
             key=keys[0],
+            **cond_kw,
         )
         # phi unet is 3D — we only use the up path; down blocks are placeholders
         self.phi_unet = SwinNDUnet(
@@ -140,23 +143,34 @@ class GyroSwinMultitask(eqx.Module):
             qk_norm=qk_norm,
             use_rpb=use_rpb,
             gated_attention=gated_attention,
-            cond_dim=cond_dim_out,
             use_checkpoint=use_checkpoint,
             key=keys[1],
+            conv_patch=True,  # phi uses ConvTranspose patch ops (torch conv_patch=True)
+            **cond_kw,
+        )
+        # torch deletes phi_unet.patch_embed + down_blocks (phi is produced from df via
+        # velocity-space reduction, never encoded). Null them so they don't count as
+        # unmatched params; the gyroswin forward never calls the phi encoder path.
+        self.phi_unet = eqx.tree_at(
+            lambda u: (u.patch_embed, u.down_blocks),
+            self.phi_unet, (None, []),
+            is_leaf=lambda x: x is None,
         )
 
-        # SwinNDUnet exposes ``down_dims`` (per-stage hidden dim before each downsample).
+        # SwinNDUnet exposes ``down_dims`` (input dim of each stage; len = num_layers+1).
         df_down_dims = list(self.df_unet.down_dims)
         phi_down_dims = list(self.phi_unet.down_dims)
-        # Match torch convention: vspace_attn_down[i].out_dim = phi_up_blocks[::-1][i].dim
-        phi_up_dims_rev = phi_down_dims[::-1]
+        # torch builds ONE VSpaceReduce per actual df down block (num_layers), with
+        # out_dim = the matching phi up block dim (zip(df_down_blocks, phi_up_blocks[::-1])).
+        df_in_dims = df_down_dims[:-1]                  # input dim per down block
+        phi_up_blk_dims = phi_down_dims[::-1][1:][::-1]  # phi up-block dims, zip order
         self.vspace_attn_down = [
             VSpaceReduce(
-                dim=df_down_dims[i],
-                out_dim=phi_up_dims_rev[i] if i < len(phi_up_dims_rev) else df_down_dims[i],
+                dim=df_in_dims[i],
+                out_dim=phi_up_blk_dims[i] if i < len(phi_up_blk_dims) else df_in_dims[i],
                 num_heads=8, decouple_mu=decouple_mu, key=keys[2 + i],
             )
-            for i in range(len(df_down_dims))
+            for i in range(len(df_in_dims))
         ]
         bottleneck_dim = df_down_dims[-1] if df_down_dims else dim
         self.vspace_attn_middle = VSpaceReduce(
@@ -192,9 +206,21 @@ class GyroSwinMultitask(eqx.Module):
                         num_heads=8, key=k)
             for i, k in enumerate(jr.split(keys[13], n_up))
         ]
-        # patch-space mixing
-        self.df_mix_unpatch = MixingBlock(left_dim=dim, right_dim=dim, num_heads=8, key=keys[14])
-        self.phi_mix_unpatch = MixingBlock(left_dim=dim, right_dim=dim, num_heads=8, key=keys[15])
+        # patch-space mixing — operates AFTER the patch-skip concat, so the dim is
+        # doubled when patch_skip (torch df_mix_unpatch.attn.q is (128,128) for dim=64).
+        unpatch_dim = dim * (2 if patch_skip else 1)
+        self.df_mix_unpatch = MixingBlock(left_dim=unpatch_dim, right_dim=unpatch_dim, num_heads=8, key=keys[14])
+        self.phi_mix_unpatch = MixingBlock(left_dim=unpatch_dim, right_dim=unpatch_dim, num_heads=8, key=keys[15])
+
+        # flux head: one cross-attn stage per scale (phi=query, df=kv), max-pooled
+        # then concatenated -> scalar. dims = reversed down_dims (deepest first).
+        if self.use_flux:
+            self.flux_head = FluxDecoder(
+                left_dims=phi_down_dims[::-1], right_dims=df_down_dims[::-1],
+                num_heads=flux_num_heads, depth=flux_depth, key=keys[16],
+            )
+        else:
+            self.flux_head = None
 
     def __call__(self, df: jnp.ndarray, cond: Optional[jnp.ndarray] = None,
                  *, key=None, inference: bool = True) -> dict:
@@ -202,15 +228,24 @@ class GyroSwinMultitask(eqx.Module):
 
         df: ``(C, vp, mu, s, x, y)``; cond: ``(n_cond,)`` scalars (raw).
         """
-        c_emb = self.cond_embed(cond) if (self.cond_embed is not None and cond is not None) else None
+        # per-U-Net conditioning embeddings (torch parity: df/phi have separate embeds)
+        c_df = self.df_unet.condition(cond)
+        c_phi = self.phi_unet.condition(cond)
 
         zdf, df_pad_axes = self.df_unet.patch_encode(df)
-        # down path
-        df_skips = []
-        for blk in self.df_unet.down_blocks:
-            zdf, sk = blk(zdf, c_emb, inference=inference, return_skip=True)
+        # patch-skip residuals: df0 (full patch grid) and its velocity-reduced phi0
+        df0 = zdf
+        phi0 = self.vspace_attn_patch_skip(df0) if (self.patch_skip and self.vspace_attn_patch_skip is not None) else None
+        # down path. The pre-downsample df skip feeds the df up block, and (via
+        # vspace_attn_down[i]) the phi up block skip — torch passes phi_features[i]
+        # to phi_up_blocks[i] as a KEYWORD s=..., so it is NOT dead.
+        df_skips, phi_skips = [], []
+        for i, blk in enumerate(self.df_unet.down_blocks):
+            zdf, sk = blk(zdf, c_df, inference=inference, return_skip=True)
             df_skips.append(sk)
-        # bottleneck — vspace-reduce df → phi, then cross-mix, then middle ViTs
+            if self.use_phi and i < len(self.vspace_attn_down):
+                phi_skips.append(self.vspace_attn_down[i](sk))
+        # bottleneck — vspace-reduce df → phi, then cross-mix, then middle swin/ViT
         if self.df_unet.middle_pe is not None:
             zdf = self.df_unet.middle_pe(zdf)
         zphi = self.vspace_attn_middle(zdf)
@@ -219,26 +254,41 @@ class GyroSwinMultitask(eqx.Module):
         zdf_new = self.df_mix_middle(zdf, zphi)
         zphi_new = self.phi_mix_middle(zphi, zdf)
         zdf, zphi = zdf_new, zphi_new
-        zdf = self.df_unet.middle(zdf, inference=inference)
-        zphi = self.phi_unet.middle(zphi, inference=inference)
+        zdf = self.df_unet.middle(zdf, c_df, inference=inference)
+        zphi = self.phi_unet.middle(zphi, c_phi, inference=inference)
+        # flux stage 0: bottleneck latents (phi=query, df=kv)
+        flux_lats = []
+        if self.use_flux and self.flux_head is not None:
+            flux_lats.append(self.flux_head.mix(0, zphi, zdf))
         zdf = self.df_unet.middle_upscale(zdf)
         zphi = self.phi_unet.middle_upscale(zphi)
-        # up path with per-scale cross-mix
+        # up path with per-scale cross-mix. torch updates df FIRST then mixes phi against
+        # the UPDATED df (sequential, unlike the parallel middle mix above).
         for i, (df_blk, phi_blk) in enumerate(zip(self.df_unet.up_blocks, self.phi_unet.up_blocks)):
-            zdf_new = self.df_mix_up[i](zdf, zphi)
-            zphi_new = self.phi_mix_up[i](zphi, zdf)
-            zdf, zphi = zdf_new, zphi_new
-            zdf = df_blk(zdf, df_skips[-(i + 1)], c_emb, inference=inference)
-            zphi = phi_blk(zphi, None, c_emb, inference=inference)  # phi up has no skip
-        # final patch-space mixing
+            zdf = self.df_mix_up[i](zdf, zphi)
+            zphi = self.phi_mix_up[i](zphi, zdf)   # uses the just-updated zdf
+            zdf = df_blk(zdf, df_skips[-(i + 1)], c_df, inference=inference)
+            phi_sk = phi_skips[i] if (self.use_phi and i < len(phi_skips)) else None
+            zphi = phi_blk(zphi, phi_sk, c_phi, inference=inference)
+            # flux stage i+1: per-scale up-block latents (phi=query, df=kv)
+            if self.use_flux and self.flux_head is not None:
+                flux_lats.append(self.flux_head.mix(i + 1, zphi, zdf))
+        # patch-skip concat (-> dim 2*latent), then final patch-space mixing at that dim
+        if self.patch_skip:
+            zdf = jnp.concatenate([zdf, df0], axis=-1)
+            zphi = jnp.concatenate([zphi, phi0], axis=-1)
         zdf = self.df_mix_unpatch(zdf, zphi)
         zphi = self.phi_mix_unpatch(zphi, zdf)
-        df_out = self.df_unet.patch_decode(zdf, df_pad_axes)
+        # unpatch reduces the concatenated dim back via its proj_concat + FiLM modulation
+        df_out = self.df_unet.patch_decode(zdf, df_pad_axes, condition=c_df)
         # phi_unet output: (1, s, x, y) → rearrange to (x, s, y) to match the dataset's phi layout
-        phi_out = self.phi_unet.patch_decode(zphi, df_pad_axes[2:])
+        phi_out = self.phi_unet.patch_decode(zphi, df_pad_axes[2:], condition=c_phi)
         phi_out = jnp.squeeze(phi_out, axis=0)            # (s, x, y)
         phi_out = jnp.transpose(phi_out, (1, 0, 2))       # (x, s, y)
-        return {"df": df_out, "phi": phi_out}
+        out = {"df": df_out, "phi": phi_out}
+        if self.use_flux and self.flux_head is not None:
+            out["flux"] = self.flux_head(flux_lats)       # scalar
+        return out
 
 
 def build_gyroswin_from_config(cfg_path: str, *, key,
@@ -272,8 +322,12 @@ def build_gyroswin_from_config(cfg_path: str, *, key,
         patch_skip=swin.get("patch_skip", True),
         swin_bottleneck=swin.get("swin_bottleneck", True),
         use_rpb=swin.get("use_rpb", True),
-        qk_norm=swin.get("qk_norm", True),
-        gated_attention=swin.get("gated_attention", True),
+        # torch gyroswin swin blocks have no qk_norm / gated-attention (unlike the AE)
+        qk_norm=swin.get("qk_norm", False),
+        gated_attention=swin.get("gated_attention", False),
+        cond_mode=swin.get("modulation", "film"),
+        flux_num_heads=swin.get("flux_num_heads", 4),
+        flux_depth=swin.get("flux_depth", 1),
         outputs=outputs or ["df", "phi"],
         n_cond=n_cond,
         use_checkpoint=bool(swin.get("gradient_checkpoint", False)),

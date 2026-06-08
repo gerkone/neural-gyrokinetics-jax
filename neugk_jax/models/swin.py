@@ -11,7 +11,7 @@ import jax.random as jr
 import numpy as np
 
 from neugk_jax.models.attention import MultiHeadSelfAttention
-from neugk_jax.models.utils import MLP, LayerNorm, RMSNorm, DiTModulation, gelu
+from neugk_jax.models.utils import MLP, LayerNorm, Linear, RMSNorm, DiTModulation, gelu
 from neugk_jax.models.patching import pad_to_blocks, unpad
 
 
@@ -449,4 +449,88 @@ class DiTSwinLayer(eqx.Module):
         for blk, k in zip(self.blocks, keys):
             call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
             x = call(x, condition, key=k, inference=inference)
+        return x
+
+
+class Film(eqx.Module):
+    """FiLM modulation: ``x * (scale + 1) + shift`` from a conditioning vector.
+
+    Port of ``neugk/models/layers.py:Film``. A single ``Linear(cond_dim -> 2*dim)``
+    produces (scale, shift); broadcast over all spatial/token axes. Applied to a
+    block's input *before* the block runs (see ``FilmSwinLayer``).
+    """
+
+    modulation: Linear
+
+    def __init__(self, cond_dim: int, dim: int, *, key):
+        self.modulation = Linear(cond_dim, 2 * dim, key=key)
+
+    def __call__(self, x: jnp.ndarray, cond: jnp.ndarray) -> jnp.ndarray:
+        mod = self.modulation(cond)  # (2*dim,)
+        scale, shift = jnp.split(mod, 2, axis=-1)
+        # broadcast over leading spatial/token axes of x (..., dim)
+        for _ in range(x.ndim - 1):
+            scale = scale[None, ...]
+            shift = shift[None, ...]
+        return x * (scale + 1.0) + shift
+
+
+class FilmSwinLayer(eqx.Module):
+    """``depth`` standard SwinBlocks, each preceded by a per-block FiLM modulation.
+
+    Mirrors torch ``FilmSwinLayer``: ``conditioning`` is one ``Film`` per block,
+    applied to the block input; the blocks are ordinary (unconditioned) SwinBlocks
+    so they reuse the AE-parity-verified attention/MLP path.
+    """
+
+    blocks: list[SwinBlock]
+    conditioning: list[Film]
+    dim: int = eqx.field(static=True)
+    use_checkpoint: bool = eqx.field(static=True)
+
+    def __init__(
+        self,
+        space: int,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        grid_size: Sequence[int],
+        window_size: Sequence[int],
+        *,
+        key,
+        cond_dim: int,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        act_fn: Callable = gelu,
+        use_checkpoint: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        use_rpb: bool = False,
+        gated_attention: bool = False,
+        norm_affine: bool = False,
+        rms_norm: bool = False,
+        **_unused,
+    ):
+        bkeys = jr.split(key, depth)
+        fkeys = jr.split(jr.fold_in(key, 1), depth)
+        self.blocks = [
+            SwinBlock(
+                dim, num_heads, grid_size, window_size, key=bkeys[i],
+                shift=bool(i % 2), mlp_ratio=mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, qkv_bias=qkv_bias, qk_norm=qk_norm,
+                use_rpb=use_rpb, gated_attention=gated_attention,
+                norm_affine=norm_affine, rms_norm=rms_norm,
+            )
+            for i in range(depth)
+        ]
+        self.conditioning = [Film(cond_dim, dim, key=fkeys[i]) for i in range(depth)]
+        self.dim = dim
+        self.use_checkpoint = use_checkpoint
+
+    def __call__(self, x, condition, *, key=None, inference=False, **_):
+        keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
+        for blk, film, k in zip(self.blocks, self.conditioning, keys):
+            x = film(x, condition)
+            call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
+            x = call(x, key=k, inference=inference)
         return x

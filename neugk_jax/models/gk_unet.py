@@ -66,11 +66,23 @@ class SwinBlockDown(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         cond_dim: Optional[int] = None,
+        cond_mode: str = "dit",
     ):
         k1, k2, _ = jr.split(key, 3)
         self.pos_embed = APE(dim, grid_size, init="sincos") if use_abs_pe else None
         self.use_cond = cond_dim is not None and cond_dim > 0
-        if self.use_cond:
+        if self.use_cond and cond_mode == "film":
+            from neugk_jax.models.swin import FilmSwinLayer
+            self.swin = FilmSwinLayer(
+                space, dim, depth=depth, num_heads=num_heads,
+                grid_size=grid_size, window_size=window_size, cond_dim=cond_dim,
+                key=k1, mlp_ratio=mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                use_rpb=use_rpb, gated_attention=gated_attention,
+                norm_affine=norm_affine, rms_norm=rms_norm,
+            )
+        elif self.use_cond:
             from neugk_jax.models.swin import DiTSwinLayer
             self.swin = DiTSwinLayer(
                 space, dim, depth=depth, num_heads=num_heads,
@@ -143,6 +155,7 @@ class SwinBlockUp(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         cond_dim: Optional[int] = None,
+        cond_mode: str = "dit",
     ):
         k1, k2, k3 = jr.split(key, 3)
         if use_skip:
@@ -151,7 +164,18 @@ class SwinBlockUp(eqx.Module):
             self.proj_concat = None
         self.pos_embed = APE(dim, grid_size, init="sincos") if use_abs_pe else None
         self.use_cond = cond_dim is not None and cond_dim > 0
-        if self.use_cond:
+        if self.use_cond and cond_mode == "film":
+            from neugk_jax.models.swin import FilmSwinLayer
+            self.swin = FilmSwinLayer(
+                space, dim, depth=depth, num_heads=num_heads,
+                grid_size=grid_size, window_size=window_size, cond_dim=cond_dim,
+                key=k2, mlp_ratio=mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                use_rpb=use_rpb, gated_attention=gated_attention,
+                norm_affine=norm_affine, rms_norm=rms_norm,
+            )
+        elif self.use_cond:
             from neugk_jax.models.swin import DiTSwinLayer
             self.swin = DiTSwinLayer(
                 space, dim, depth=depth, num_heads=num_heads,
@@ -208,8 +232,9 @@ class SwinNDUnet(eqx.Module):
     """
 
     patch_embed: PatchEmbed
+    cond_embed: Optional[object]
     down_blocks: list[SwinBlockDown]
-    middle: ViTLayer
+    middle: object  # ViTLayer (AE) or FilmSwinLayer (gyroswin windowed+RPB middle)
     middle_pe: Optional[APE]
     middle_upscale: PatchExpand
     up_blocks: list[SwinBlockUp]
@@ -261,6 +286,12 @@ class SwinNDUnet(eqx.Module):
         rms_norm: bool = False,
         up_use_skip: bool = True,
         cond_dim: Optional[int] = None,
+        cond_mode: str = "dit",
+        n_cond: int = 0,
+        cond_embed_dim: int = 128,
+        middle_swin: bool = False,
+        conv_patch: bool = False,
+        unpatch_patch_skip: bool = False,
         key,
     ):
         patch_size = _as_seq(patch_size, space)
@@ -282,9 +313,19 @@ class SwinNDUnet(eqx.Module):
         self.patch_embed = PatchEmbed(
             padded_base, patch_size, in_channels=in_channels, embed_dim=dim,
             key=keys[ki], mlp_depth=merging_depth, mlp_ratio=merging_hidden_ratio,
-            rms_norm=rms_norm,
+            rms_norm=rms_norm, act_fn=act_fn,
         )
         ki += 1
+        # per-U-Net conditioning embed (gyroswin): raw scalars -> 4*cond_embed_dim.
+        # When present it drives cond_dim for all FiLM/DiT blocks below.
+        if n_cond > 0:
+            from neugk_jax.models.embeddings import ContinuousConditionEmbed
+            self.cond_embed = ContinuousConditionEmbed(
+                dim=cond_embed_dim, n_cond=n_cond, key=jr.fold_in(key, 999),
+            )
+            cond_dim = self.cond_embed.cond_dim
+        else:
+            self.cond_embed = None
         grid_sizes = [self.patch_embed.grid_size]
         down_dims = [dim]
         down_blocks = []
@@ -298,7 +339,7 @@ class SwinNDUnet(eqx.Module):
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=rms_norm,
-                cond_dim=cond_dim,
+                cond_dim=cond_dim, cond_mode=cond_mode,
             )
             ki += 1
             down_blocks.append(blk)
@@ -309,22 +350,35 @@ class SwinNDUnet(eqx.Module):
         self.grid_sizes = tuple(grid_sizes)
         self.down_dims = tuple(down_dims)
 
-        # middle: global ViT attention at the deepest grid
-        self.middle = ViTLayer(
-            space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
-            grid_size=grid_sizes[-1], key=keys[ki],
-            mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
-            act_fn=act_fn, use_checkpoint=use_checkpoint,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            gated_attention=gated_attention, norm_affine=norm_affine,
-        )
+        # middle: global attention at the deepest grid. The AE uses a plain ViT
+        # (dead in translation); gyroswin uses a windowed SwinLayer with RPB whose
+        # window == the bottleneck grid (so it is global) + per-block FiLM.
+        if middle_swin:
+            from neugk_jax.models.swin import FilmSwinLayer
+            self.middle = FilmSwinLayer(
+                space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
+                grid_size=grid_sizes[-1], window_size=grid_sizes[-1], cond_dim=cond_dim,
+                key=keys[ki], mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm, use_rpb=use_rpb,
+                gated_attention=gated_attention, norm_affine=norm_affine, rms_norm=rms_norm,
+            )
+        else:
+            self.middle = ViTLayer(
+                space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
+                grid_size=grid_sizes[-1], key=keys[ki],
+                mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                gated_attention=gated_attention, norm_affine=norm_affine,
+            )
         ki += 1
         self.middle_pe = APE(down_dims[-1], grid_sizes[-1], init="sincos") if use_abs_pe else None
         # upstream middle_upscale uses LayerNorm (unlike PatchMerge which uses RMSNorm)
         self.middle_upscale = PatchExpand(
             down_dims[-1], grid_sizes[-1], key=keys[ki],
             target_grid_size=grid_sizes[-2], c_multiplier=c_multiplier,
-            mlp_depth=1, rms_norm=False,
+            mlp_depth=1, rms_norm=False, use_conv=conv_patch,
         )
         ki += 1
 
@@ -336,7 +390,7 @@ class SwinNDUnet(eqx.Module):
             qkv_bias=qkv_bias, qk_norm=qk_norm,
             use_rpb=use_rpb, gated_attention=gated_attention,
             norm_affine=norm_affine, use_skip=up_use_skip,
-            rms_norm=rms_norm, cond_dim=cond_dim,
+            rms_norm=rms_norm, cond_dim=cond_dim, cond_mode=cond_mode,
         )
         for i in range(num_layers - 1):
             up_blocks.append(
@@ -374,7 +428,8 @@ class SwinNDUnet(eqx.Module):
             expand_by=tuple(p if p > 0 else 1 for p in patch_size),
             out_channels=out_channels,
             mlp_depth=unmerging_depth, mlp_ratio=unmerging_hidden_ratio,
-            norm=False,
+            norm=False, use_conv=conv_patch, patch_skip=unpatch_patch_skip,
+            cond_dim=(cond_dim if self.cond_embed is not None else None),
         )
         # assign static fields
         self.space = space
@@ -388,6 +443,12 @@ class SwinNDUnet(eqx.Module):
 
     # forward path
 
+    def condition(self, cond):
+        """Embed raw conditioning scalars to the block cond_dim (or None)."""
+        if self.cond_embed is None or cond is None:
+            return None
+        return self.cond_embed(cond)
+
     def patch_encode(self, x: jnp.ndarray):
         # x: (C, *spatial) → (*spatial, C) → pad → patch_embed
         x = jnp.moveaxis(x, 0, -1)
@@ -395,8 +456,8 @@ class SwinNDUnet(eqx.Module):
         x = self.patch_embed(x)
         return x, pad_axes
 
-    def patch_decode(self, z: jnp.ndarray, pad_axes) -> jnp.ndarray:
-        x = self.unpatch(z)
+    def patch_decode(self, z: jnp.ndarray, pad_axes, condition=None) -> jnp.ndarray:
+        x = self.unpatch(z, condition)
         x = unpad(x, pad_axes, self.base_resolution)
         return jnp.moveaxis(x, -1, 0)
 
@@ -496,8 +557,8 @@ class Swin5DUnet(SwinNDUnet):
         df = self.patch_embed(df)
         return df, pad_axes
 
-    def patch_decode(self, z: jnp.ndarray, pad_axes) -> jnp.ndarray:
-        df = self.unpatch(z)
+    def patch_decode(self, z: jnp.ndarray, pad_axes, condition=None) -> jnp.ndarray:
+        df = self.unpatch(z, condition)
         df = unpad(df, pad_axes, self.base_resolution)
         if self.decouple_mu:
             # reshape (vp, s, x, y, C*mu) back to (C, vp, mu, s, x, y)
