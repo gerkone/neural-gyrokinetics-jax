@@ -194,14 +194,24 @@ class CycloneDataset:
             ))
         self.metadata: dict[int, dict] = {}
         kept_files = []
+        # metadata keys _build_sample hard-requires, plus any non-alias conditioning field
+        required = {"ion_temp_grad", "density_grad", "s_hat", "q", "flux", "timesteps"}
+        required |= {c for c in self.conditions if c not in ("itg", "dg", "s_hat", "q")}
         for fp, meta in zip(self.files, metas):
-            if self._passes_cond_filter(meta):
-                fid = len(kept_files)
-                kept_files.append(fp)
-                # OOD trajectories use "fluxes" key instead of "flux" — normalise here
-                if "flux" not in meta and "fluxes" in meta:
-                    meta["flux"] = meta["fluxes"]
-                self.metadata[fid] = meta
+            if not self._passes_cond_filter(meta):
+                continue
+            # OOD trajectories use "fluxes" key instead of "flux" — normalise here
+            if "flux" not in meta and "fluxes" in meta:
+                meta["flux"] = meta["fluxes"]
+            missing = sorted(k for k in required if k not in meta)
+            if missing:
+                # traj missing a conditioning/metadata field -> exclude it rather than crash
+                if self.rank == 0:
+                    warnings.warn(f"{fp}: missing metadata {missing}; excluding trajectory")
+                continue
+            fid = len(kept_files)
+            kept_files.append(fp)
+            self.metadata[fid] = meta
         self.files = kept_files
 
         self.flat_index_to_file_and_tstep: dict[int, tuple[int, int]] = {}
@@ -437,6 +447,11 @@ class CycloneDataset:
 
     def get_avg_flux(self, fid: int) -> float:
         return float(np.mean(self.metadata[fid]["flux"][-80:]))
+
+    def get_ds(self, fid: int) -> float | None:
+        # parallel (s) grid spacing; None when the trajectory metadata doesn't carry it
+        ds = self.metadata[fid].get("ds")
+        return None if ds is None else float(ds)
 
     def get_batch_geometry(self, file_indices: np.ndarray) -> dict[str, np.ndarray]:
         """Stack per-file geometry into a batched dict."""

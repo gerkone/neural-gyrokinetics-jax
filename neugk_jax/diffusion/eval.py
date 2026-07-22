@@ -61,6 +61,7 @@ class DiffusionEvaluator(BaseEvaluator):
         n_steps: int = 50,
         n_samples_per_traj: int = 1,
         eval_integrals: bool = True,
+        eval_spectra: bool = False,
         max_batches: Optional[int] = None,
         val_subsample: int = 1,
         **kwargs,
@@ -90,6 +91,8 @@ class DiffusionEvaluator(BaseEvaluator):
         n_acc = 0.0
         per_traj_pred = defaultdict(list)
         per_traj_tgt: dict[str, float] = {}
+        # per-trajectory spectral diagnostics (zonal flow + ky/Q spectra)
+        spectra_store: dict[int, tuple] = {}
         val_plots: dict[str, Any] = {}
         key = jr.PRNGKey(epoch)
 
@@ -161,6 +164,22 @@ class DiffusionEvaluator(BaseEvaluator):
                                 continue
                             per_traj_pred[tid].append(float(eflux[b]))
                             per_traj_tgt[tid] = float(tgt_avg_flux[b])
+                        # spectral diagnostics on the denormalized pred/tgt df
+                        if eval_spectra:
+                            from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
+                            df_tgt_np = np.asarray(df_tgt)
+                            if ds.normalization is not None and hasattr(ds, "denormalize"):
+                                df_tgt_np = np.stack([
+                                    np.asarray(ds.denormalize(int(file_idx[b]),
+                                                              df=df_tgt_np[b]))
+                                    for b in range(batch_size)
+                                ])
+                            if not accumulate_spectral_diagnostics(
+                                spectra_store, df_pred_np, df_tgt_np, file_idx, ds,
+                            ):
+                                if self.is_rank0:
+                                    print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
+                                eval_spectra = False
                     except Exception as e:
                         if batch_idx == 0:
                             print(f"[evaluate] gyaradax flux-integral failed: {e}")
@@ -195,6 +214,11 @@ class DiffusionEvaluator(BaseEvaluator):
 
         running, n_acc = self._sync(running, n_acc)
         metrics = self._finalize(running, n_acc)
+
+        # time-averaged spectral metrics, mean over trajectories
+        if spectra_store:
+            from neugk_jax.evaluate.metrics import merged_spectral_metrics
+            metrics.update(merged_spectral_metrics(spectra_store))
 
         # per-trajectory flux RMSE + UQ scatter
         if per_traj_pred and self.is_rank0:

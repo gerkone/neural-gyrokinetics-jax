@@ -28,6 +28,7 @@ class AEEvaluator(BaseEvaluator):
         epoch: int,
         batch_size: int = 1,
         eval_integrals: bool = False,
+        eval_spectra: bool = False,
         **kwargs,
     ) -> tuple[dict[str, float], dict[str, Any]]:
         ds = self.val_ds
@@ -49,6 +50,8 @@ class AEEvaluator(BaseEvaluator):
         # plot collection — one cross-section panel per epoch (first batch)
         val_plots: dict[str, Any] = {}
         plot_drawn = False
+        # per-trajectory spectral diagnostics (zonal flow + ky/Q spectra)
+        spectra_store: dict[int, tuple] = {}
 
         for start in range(0, n - batch_size + 1, batch_size):
             samples = [ds[i] for i in range(start, start + batch_size)]
@@ -56,10 +59,10 @@ class AEEvaluator(BaseEvaluator):
             if data_shard is not None:
                 df = jax.device_put(df, data_shard)
             pred = fwd(model, df)
+            fid = np.asarray([int(s.file_index) for s in samples])
 
             geometry = None
             if eval_integrals and hasattr(ds, "get_batch_geometry"):
-                fid = np.asarray([int(s.file_index) for s in samples])
                 geom = ds.get_batch_geometry(fid)
                 geometry = {k: jnp.asarray(v) for k, v in geom.items()}
 
@@ -70,6 +73,30 @@ class AEEvaluator(BaseEvaluator):
                 geometry=geometry,
             )
             running, n_acc = self._accumulate(running, metrics, n_acc, n_new=batch_size)
+
+            if eval_spectra and hasattr(ds, "get_batch_geometry"):
+                try:
+                    from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
+                    # spectra are physical quantities — denormalize pred/tgt first
+                    if getattr(ds, "normalization", None) is not None:
+                        pred_d = np.stack([
+                            np.asarray(ds.denormalize(int(fid[b]), df=np.asarray(pred[b])))
+                            for b in range(batch_size)
+                        ])
+                        tgt_d = np.stack([
+                            np.asarray(ds.denormalize(int(fid[b]), df=np.asarray(df[b])))
+                            for b in range(batch_size)
+                        ])
+                    else:
+                        pred_d, tgt_d = np.asarray(pred), np.asarray(df)
+                    if not accumulate_spectral_diagnostics(spectra_store, pred_d, tgt_d, fid, ds):
+                        if self.is_rank0:
+                            print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
+                        eval_spectra = False
+                except Exception as e:
+                    if self.is_rank0:
+                        print(f"[evaluate] spectral diagnostics failed: {e}")
+                    eval_spectra = False
 
             # one cross-section panel per epoch (first eval batch only): df + integrated phi
             if not plot_drawn and self.is_rank0:
@@ -106,5 +133,9 @@ class AEEvaluator(BaseEvaluator):
             "flux_target_mse" if k == "flux" else k: v
             for k, v in finalized.items()
         }
+        # time-averaged spectral metrics, mean over trajectories
+        if spectra_store:
+            from neugk_jax.evaluate.metrics import merged_spectral_metrics
+            renamed.update(merged_spectral_metrics(spectra_store))
         return renamed, val_plots
 

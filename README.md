@@ -16,10 +16,11 @@ pip install -e ".[cuda,gyro,dev]"
 
 ## Layout
 
-- `neugk_jax/models/` — equinox modules (MLP, embeddings, patching, attention, Swin/ViT, gk_unet, DiT)
+- `neugk_jax/models/` — equinox modules (MLP, embeddings, patching, attention, Swin/ViT, gk_unet, DiT, Transolver)
 - `neugk_jax/autoencoders/` — Swin5DAE
 - `neugk_jax/diffusion/` — flow matching
-- `neugk_jax/dataset/` — unified CycloneDataset (ae / diff modes)
+- `neugk_jax/dataset/` — unified CycloneDataset (ae / diff modes) + GyrosplatDataset
+- `neugk_jax/gyrosplats/` — splat flow matching (renderer, pairing, GyrosplatDiT, runner, evaluator)
 - `neugk_jax/training/` — runner, schedulers, distributed setup, checkpoint, logging
 - `neugk_jax/evaluate/` — base evaluator, AE/diffusion evaluators, gyaradax integrals adapter
 - `configs/` — Hydra configs (mirror upstream layout)

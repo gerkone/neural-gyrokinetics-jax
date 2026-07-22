@@ -1,0 +1,21 @@
+name: gyrosplat_fm
+model_type: gyrosplat_fm
+n_hidden: 256
+n_layers: 8
+n_head: 8
+mlp_ratio: 2
+type_dim: 16                 # carrier-bin embedding (flat tokens carry no bin identity otherwise)
+mu_fourier_bands: 4          # sincos featurization of the mu channels
+win_embed_dim: 16            # v7 windows: per-window learned identity embedding
+dct: false                   # v7 windows: DCT-II basis over the 7 carrier bins (reversible)
+rope: false                  # v7 windows: rotary attention keyed by token mu coordinates
+tie_groups: false            # flat per-atom diffusion (trivial-first)
+t_tail_frac: 0.3             # fraction of training t drawn uniform from [t_tail_lo, 1]
+t_tail_lo: 0.9
+time_warp: 3.0               # sampling: t = 1-(1-u)^p, concentrates euler steps near t=1
+pairing: sinkhorn            # sinkhorn | morton | sliced | hungarian | independent (within carrier groups)
+ot_fraction: 0.8             # coupling strength; blend=perturb uses beta = 1 - ot_fraction
+pairing_blend: perturb       # perturb (nsot noise perturbation) | mix (bernoulli coupling mix)
+morton_bits: 6
+sinkhorn_eps: 0.05
+sinkhorn_iters: 100

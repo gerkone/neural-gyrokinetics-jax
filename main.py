@@ -38,6 +38,19 @@ def dispatch_runner(cfg: DictConfig) -> None:
     elif base == "gyroswin":
         from neugk_jax.gyroswin import GyroSwinRunner
         GyroSwinRunner(cfg, output_path=cfg.output_path)()
+    elif base == "gyrosplat":
+        from neugk_jax.gyrosplats.runner import GyrosplatFMRunner
+        GyrosplatFMRunner(cfg, output_path=cfg.output_path)()
+    elif base == "gyrowave":
+        if workflow == "gyrowave_fixed":            # Approach A: fixed shared support S*
+            from neugk_jax.gyrowave.runner_fixed import GyrowaveFixedSupportRunner
+            GyrowaveFixedSupportRunner(cfg, output_path=cfg.output_path)()
+        elif workflow == "gyrowave_coordgen":       # Approach B: coord+value generation
+            from neugk_jax.gyrowave.runner_coordgen import GyrowaveCoordGenRunner
+            GyrowaveCoordGenRunner(cfg, output_path=cfg.output_path)()
+        else:
+            from neugk_jax.gyrowave.runner import GyrowaveFMRunner
+            GyrowaveFMRunner(cfg, output_path=cfg.output_path)()
     else:
         raise NotImplementedError(f"unknown workflow: {workflow}")
 

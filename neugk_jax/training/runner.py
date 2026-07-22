@@ -140,6 +140,9 @@ class BaseRunner(ABC):
             if val < self.best_val:
                 self.best_val = val
                 self.save_checkpoint(epoch, val, "best.eqx")
-            self.save_checkpoint(epoch, val, "ckp.eqx")
+            # serialization dominates short epochs — throttle the rolling checkpoint
+            save_every = getattr(self.cfg.training, "save_every_n_epochs", 1)
+            if epoch % save_every == 0 or epoch == self.cfg.training.n_epochs:
+                self.save_checkpoint(epoch, val, "ckp.eqx")
 
         self.logger.finish()

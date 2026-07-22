@@ -1,0 +1,6 @@
+validate_every_n_epochs: 500   # distribution-level flux eval is expensive; run sparsely
+n_eval_steps: 1
+eval_integrals: false          # gyrowave evaluate() runs its own JAX recon+flux decode
+eval_spectra: false
+eval_sampling: false
+eval_sample_steps: 50

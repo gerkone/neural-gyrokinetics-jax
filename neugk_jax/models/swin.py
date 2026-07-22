@@ -186,20 +186,20 @@ class SwinBlock(eqx.Module):
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
 
     def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
-        """SwinV2 post-norm forward with upstream's doubled residual.
+        """SwinV2 post-norm forward (single residual, upstream fix e79b021).
 
-        Mirrors ``neugk/models/nd_vit/swin_layers.py:SwinTransformerBlock.forward``:
+        Mirrors ``neugk/models/nd_vit/swin_layers.py:SwinTransformerBlock.forward``
+        at HEAD:
 
         * ``forward_part1`` runs attention on the un-normed input and
           applies ``norm1`` to the result (post-norm).
-        * ``forward_part2`` runs ``mlp`` then drop_path then ``norm2``.
-        * The combine pattern is::
+        * ``forward_part2`` runs ``mlp`` then drop_path then ``norm2``;
+          combined as ``x_res1 + norm2(dp(mlp(x_res1)))``.
 
-              x_res1 = shortcut + dp(norm1(attn_part(x)))
-              out    = x_res1 + (x_res1 + norm2(dp(mlp(x_res1))))
-                     = 2 * x_res1 + norm2(dp(mlp(x_res1)))
-
-          — i.e. the residual_1 input is accumulated *twice*.
+        NOTE: torch checkpoints trained before e79b021 (all neurips26 ones)
+        used a doubled residual (``2·x_res1 + mlp_out``) — deliberately not
+        supported anymore; translated legacy checkpoints will not reproduce
+        their training-time outputs (see PARITY.md).
         """
         spatial = x.shape[:-1]
         shortcut = x  # upstream self.skip is Identity (dim_out == dim)
@@ -226,7 +226,7 @@ class SwinBlock(eqx.Module):
 
         mlp_out = self.norm2(self.drop_path(self.mlp(x_res1), key=key2, inference=inference))
 
-        return x_res1 + x_res1 + mlp_out
+        return x_res1 + mlp_out
 
 
 class DiTSwinBlock(eqx.Module):
@@ -256,6 +256,11 @@ class DiTSwinBlock(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        use_rpb: bool = False,
+        gated_attention: bool = False,
+        rms_norm: bool = False,
     ):
         eff_w, _ = _build_partition_grid(grid_size, window_size)
         # same upstream-faithful shift rule as SwinBlock above
@@ -267,10 +272,16 @@ class DiTSwinBlock(eqx.Module):
         self.window_size = eff_w
         self.shift_size = shift_size
 
-        self.norm1 = LayerNorm(dim, elementwise_affine=False)
-        self.norm2 = LayerNorm(dim, elementwise_affine=False)
+        # DiT modulation provides scale/shift, so the norm is non-affine; the norm
+        # *type* follows the model (cold/warm use RMSNorm; torch confirms RMSNorm here).
+        _Norm = RMSNorm if rms_norm else LayerNorm
+        self.norm1 = _Norm(dim, elementwise_affine=False)
+        self.norm2 = _Norm(dim, elementwise_affine=False)
         katt, kmlp, kmod = jr.split(key, 3)
-        self.attn = MultiHeadSelfAttention(dim, num_heads, key=katt)
+        self.attn = MultiHeadSelfAttention(
+            dim, num_heads, key=katt, qkv_bias=qkv_bias, qk_norm=qk_norm,
+            use_rpb=use_rpb, gated_attention=gated_attention, window_size=eff_w,
+        )
         hidden = max(int(dim * mlp_ratio), dim)
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
@@ -417,6 +428,11 @@ class DiTSwinLayer(eqx.Module):
         act_fn: Callable = gelu,
         norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        use_rpb: bool = False,
+        gated_attention: bool = False,
+        rms_norm: bool = False,
         **_unused,
     ):
         keys = jr.split(key, depth)
@@ -432,6 +448,11 @@ class DiTSwinLayer(eqx.Module):
                 mlp_ratio=mlp_ratio,
                 drop_path=drop_path,
                 act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                rms_norm=rms_norm,
             )
             for i in range(depth)
         ]

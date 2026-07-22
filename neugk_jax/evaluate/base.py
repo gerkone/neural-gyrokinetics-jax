@@ -40,27 +40,31 @@ def validation_metrics(
 
     integrated = None
     if eval_integrals and geometry is not None and "df" in preds:
-        # handles separate_zf recombine + FFT + batch vmap; batched_integrals is too naive
-        from neugk_jax.evaluate.integrals import gyaradax_flux_integrals
-        phi_p, eflux_p = gyaradax_flux_integrals(preds["df"], geometry)
-        # always integrate the target df too — gives us a baseline phi/eflux
-        # against which to score the prediction's integrals even if the dataset
-        # doesn't carry a ``flux``/``phi`` field
-        phi_t, eflux_t = gyaradax_flux_integrals(tgts["df"], geometry)
-        integrated = {"phi": phi_p, "eflux": eflux_p,
-                      "phi_tgt": phi_t, "eflux_tgt": eflux_t}
-        # spatially integrated flux per sample (sum over the s,x,y grid)
-        eflux_int_p = np.asarray(eflux_p).reshape(eflux_p.shape[0], -1).sum(axis=-1).real
-        eflux_int_t = np.asarray(eflux_t).reshape(eflux_t.shape[0], -1).sum(axis=-1).real
-        metrics["flux_int"] = float(np.mean((eflux_int_p - eflux_int_t) ** 2))
-        # phi is the spectral-space potential (complex-valued); use the magnitude
-        # of the complex difference so the MSE is a real, well-defined quantity
-        phi_diff = np.asarray(phi_p) - np.asarray(phi_t)
-        metrics["phi_int"] = float(np.mean(np.abs(phi_diff) ** 2))
-        # if the dataset also ships a ``flux`` target (the long-time average), score against that too
-        if "flux" in tgts:
-            tgt_flux = np.asarray(tgts["flux"]).reshape(-1)
-            metrics["flux"] = float(np.mean((eflux_int_p - tgt_flux) ** 2))
+        # incomplete/synthetic geometry must not kill the eval loop — skip with a note
+        try:
+            # handles separate_zf recombine + FFT + batch vmap; batched_integrals is too naive
+            from neugk_jax.evaluate.integrals import gyaradax_flux_integrals
+            phi_p, eflux_p = gyaradax_flux_integrals(preds["df"], geometry)
+            # always integrate the target df too — gives us a baseline phi/eflux
+            # against which to score the prediction's integrals even if the dataset
+            # doesn't carry a ``flux``/``phi`` field
+            phi_t, eflux_t = gyaradax_flux_integrals(tgts["df"], geometry)
+            integrated = {"phi": phi_p, "eflux": eflux_p,
+                          "phi_tgt": phi_t, "eflux_tgt": eflux_t}
+            # spatially integrated flux per sample (sum over the s,x,y grid)
+            eflux_int_p = np.asarray(eflux_p).reshape(eflux_p.shape[0], -1).sum(axis=-1).real
+            eflux_int_t = np.asarray(eflux_t).reshape(eflux_t.shape[0], -1).sum(axis=-1).real
+            metrics["flux_int"] = float(np.mean((eflux_int_p - eflux_int_t) ** 2))
+            # phi is the spectral-space potential (complex-valued); use the magnitude
+            # of the complex difference so the MSE is a real, well-defined quantity
+            phi_diff = np.asarray(phi_p) - np.asarray(phi_t)
+            metrics["phi_int"] = float(np.mean(np.abs(phi_diff) ** 2))
+            # if the dataset also ships a ``flux`` target (the long-time average), score against that too
+            if "flux" in tgts:
+                tgt_flux = np.asarray(tgts["flux"]).reshape(-1)
+                metrics["flux"] = float(np.mean((eflux_int_p - tgt_flux) ** 2))
+        except Exception as e:
+            print(f"[evaluate] flux integrals skipped: {e}")
     return metrics, integrated
 
 

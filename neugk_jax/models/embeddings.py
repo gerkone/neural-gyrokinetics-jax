@@ -9,6 +9,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as _np
 
 from neugk_jax.models.utils import MLP, Linear, relu, silu
 
@@ -182,7 +183,6 @@ def _build_rpb_table(window_size: Sequence[int]) -> jnp.ndarray:
 
 def _build_rpb_idx(window_size: Sequence[int]) -> jnp.ndarray:
     """Integer index ``(sl, sl)`` gathering per-pair biases from the flat table."""
-    import numpy as _np
     space = len(window_size)
     grids = _np.stack(
         _np.meshgrid(*[_np.arange(w) for w in window_size], indexing="ij")

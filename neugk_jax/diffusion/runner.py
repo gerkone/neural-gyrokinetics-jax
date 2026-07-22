@@ -207,6 +207,7 @@ class FlowMatchingRunner(BaseRunner):
                 n_steps=cfg.validation.get("eval_sample_steps", 50),
                 n_samples_per_traj=cfg.validation.get("eval_n_samples", 1),
                 eval_integrals=cfg.validation.get("eval_integrals", True),
+                eval_spectra=cfg.validation.get("eval_spectra", False),
                 max_batches=cfg.validation.get("eval_max_batches", None),
             )
             out.update(metrics)

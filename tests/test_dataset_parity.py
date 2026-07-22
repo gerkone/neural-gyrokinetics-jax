@@ -19,7 +19,8 @@ import pytest
 from neugk_jax.dataset import CycloneDataset, NumpyBackend
 
 
-def _make_synthetic_traj(root: Path, name: str, *, n_t: int, resolution):
+def _make_synthetic_traj(root: Path, name: str, *, n_t: int, resolution,
+                         drop_keys=(), extra_meta=None):
     """Write a fake trajectory directory: metadata.pkl + N data/.bin files."""
     traj = root / f"{name}_ifft_realpotens"
     data = traj / "data"
@@ -52,6 +53,9 @@ def _make_synthetic_traj(root: Path, name: str, *, n_t: int, resolution):
         "df_min": np.full(1, -3.0, dtype=np.float32),
         "df_max": np.full(1, 3.0, dtype=np.float32),
     }
+    for k in drop_keys:
+        meta.pop(k, None)
+    meta.update(extra_meta or {})
     with open(traj / "metadata.pkl", "wb") as f:
         pickle.dump(meta, f)
     return traj
@@ -165,6 +169,92 @@ def test_get_batch_geometry(synthetic_dir):
         assert v.shape[0] == 3, f"{k} not batched"
 
 
+
+
+def _assert_meta_equal(a: dict, b: dict):
+    assert set(a) == set(b)
+    for k in a:
+        if k == "geometry":
+            assert set(a[k]) == set(b[k])
+            for gk in a[k]:
+                assert np.array_equal(np.asarray(a[k][gk]), np.asarray(b[k][gk])), gk
+        else:
+            assert np.array_equal(np.asarray(a[k]), np.asarray(b[k])), k
+
+
+def test_npz_metadata_matches_pkl(tmp_path):
+    from neugk_jax.dataset.backend import load_meta, save_meta
+
+    res = (2, 2, 2, 4, 2)
+    traj = _make_synthetic_traj(tmp_path, "iteration_001", n_t=4, resolution=res)
+    backend = NumpyBackend()
+    meta_pkl = backend.read_metadata(str(traj))
+
+    # convert the trajectory to npz-only metadata and read again
+    base = str(traj / "metadata")
+    save_meta(base, load_meta(base), ".npz")
+    os.remove(traj / "metadata.pkl")
+    meta_npz = backend.read_metadata(str(traj))
+
+    _assert_meta_equal(meta_pkl, meta_npz)
+    # geometry defaults filled on both routes
+    for k in ("adiabatic", "de", "beta", "nlapar", "nlbpar", "ffun"):
+        assert k in meta_npz["geometry"]
+    # resolution special-cased back to a tuple of ints
+    assert tuple(meta_npz["resolution"]) == res
+
+
+def test_backend_exists(tmp_path):
+    from neugk_jax.dataset.backend import load_meta, save_meta
+
+    res = (2, 2, 2, 4, 2)
+    backend = NumpyBackend()
+
+    pkl_traj = _make_synthetic_traj(tmp_path, "iteration_001", n_t=2, resolution=res)
+    assert backend.exists(str(pkl_traj))
+
+    npz_traj = _make_synthetic_traj(tmp_path, "iteration_002", n_t=2, resolution=res)
+    base = str(npz_traj / "metadata")
+    save_meta(base, load_meta(base), ".npz")
+    os.remove(npz_traj / "metadata.pkl")
+    assert backend.exists(str(npz_traj))
+
+    empty = tmp_path / "iteration_003_ifft_realpotens"
+    empty.mkdir()
+    assert not backend.exists(str(empty))
+
+
+def test_missing_required_field_excludes_trajectory(tmp_path):
+    res = (2, 2, 2, 4, 2)
+    _make_synthetic_traj(tmp_path, "iteration_001", n_t=8, resolution=res)
+    _make_synthetic_traj(tmp_path, "iteration_002", n_t=8, resolution=res,
+                         drop_keys=("s_hat",))
+    with pytest.warns(UserWarning, match="s_hat"):
+        ds = CycloneDataset(
+            path=str(tmp_path), split="train",
+            trajectories=["iteration_001", "iteration_002"],
+            backend=NumpyBackend(),
+        )
+    assert len(ds.files) == 1
+    assert "iteration_001" in ds.files[0]
+    # remaining trajectory still indexes and serves samples
+    assert ds[0].df is not None
+
+
+def test_missing_cond_filter_field_excludes_trajectory(tmp_path):
+    res = (2, 2, 2, 4, 2)
+    _make_synthetic_traj(tmp_path, "iteration_001", n_t=8, resolution=res,
+                         extra_meta={"beta": np.array([0.5], dtype=np.float32)})
+    _make_synthetic_traj(tmp_path, "iteration_002", n_t=8, resolution=res)
+    ds = CycloneDataset(
+        path=str(tmp_path), split="train",
+        trajectories=["iteration_001", "iteration_002"],
+        cond_filters={"beta": (0.0, 1.0)},
+        backend=NumpyBackend(),
+    )
+    # iteration_002 lacks the filter field -> excluded rather than crash
+    assert len(ds.files) == 1
+    assert "iteration_001" in ds.files[0]
 
 
 @pytest.mark.skipif(

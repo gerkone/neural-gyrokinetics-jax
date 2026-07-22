@@ -252,5 +252,6 @@ class AERunner(BaseRunner):
             epoch=epoch,
             batch_size=self.cfg.training.batch_size,
             eval_integrals=self.cfg.validation.get("eval_integrals", False),
+            eval_spectra=self.cfg.validation.get("eval_spectra", False),
         )
         return metrics, plots

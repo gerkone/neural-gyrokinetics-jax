@@ -16,10 +16,10 @@ import jax.numpy as jnp
 import jax.random as jr
 from einops import rearrange
 
-from neugk_jax.models.embeddings import APE
+from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
 from neugk_jax.models.utils import LayerNorm, Linear, gelu
 from neugk_jax.models.patching import PatchEmbed, PatchExpand, PatchMerge, pad_to_blocks, unpad
-from neugk_jax.models.swin import SwinLayer
+from neugk_jax.models.swin import DiTSwinLayer, FilmSwinLayer, SwinLayer
 from neugk_jax.models.vit import LayerModes, ViTLayer
 
 
@@ -72,7 +72,6 @@ class SwinBlockDown(eqx.Module):
         self.pos_embed = APE(dim, grid_size, init="sincos") if use_abs_pe else None
         self.use_cond = cond_dim is not None and cond_dim > 0
         if self.use_cond and cond_mode == "film":
-            from neugk_jax.models.swin import FilmSwinLayer
             self.swin = FilmSwinLayer(
                 space, dim, depth=depth, num_heads=num_heads,
                 grid_size=grid_size, window_size=window_size, cond_dim=cond_dim,
@@ -83,13 +82,14 @@ class SwinBlockDown(eqx.Module):
                 norm_affine=norm_affine, rms_norm=rms_norm,
             )
         elif self.use_cond:
-            from neugk_jax.models.swin import DiTSwinLayer
             self.swin = DiTSwinLayer(
                 space, dim, depth=depth, num_heads=num_heads,
                 grid_size=grid_size, window_size=window_size,
                 cond_dim=cond_dim,
                 key=k1, mlp_ratio=mlp_ratio, drop_path=drop_path,
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=rms_norm,
             )
         else:
             self.swin = SwinLayer(
@@ -164,8 +164,16 @@ class SwinBlockUp(eqx.Module):
             self.proj_concat = None
         self.pos_embed = APE(dim, grid_size, init="sincos") if use_abs_pe else None
         self.use_cond = cond_dim is not None and cond_dim > 0
+        # UPSTREAM QUIRK (load-bearing): torch's SwinBlockUp constructs its
+        # ``swin_att`` WITHOUT forwarding ``norm_layer`` (gk_unet.py:203-214),
+        # so decoder swin blocks always use the default nn.LayerNorm even when
+        # the model's norm_fn is RMSNorm (which SwinBlockDown / middle DO get).
+        # The norms are elementwise_affine=False (no params), so translation
+        # can't catch this — but the math differs. Mirror it: the up-block
+        # swin layer is always LayerNorm; ``rms_norm`` still applies to the
+        # PatchExpand upsample (torch passes norm_layer there).
+        up_rms_norm = False
         if self.use_cond and cond_mode == "film":
-            from neugk_jax.models.swin import FilmSwinLayer
             self.swin = FilmSwinLayer(
                 space, dim, depth=depth, num_heads=num_heads,
                 grid_size=grid_size, window_size=window_size, cond_dim=cond_dim,
@@ -173,16 +181,17 @@ class SwinBlockUp(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                norm_affine=norm_affine, rms_norm=up_rms_norm,
             )
         elif self.use_cond:
-            from neugk_jax.models.swin import DiTSwinLayer
             self.swin = DiTSwinLayer(
                 space, dim, depth=depth, num_heads=num_heads,
                 grid_size=grid_size, window_size=window_size,
                 cond_dim=cond_dim,
                 key=k2, mlp_ratio=mlp_ratio, drop_path=drop_path,
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=up_rms_norm,
             )
         else:
             self.swin = SwinLayer(
@@ -192,7 +201,7 @@ class SwinBlockUp(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                norm_affine=norm_affine, rms_norm=up_rms_norm,
             )
         if mode == LayerModes.UPSAMPLE:
             self.upsample = PatchExpand(
@@ -319,7 +328,6 @@ class SwinNDUnet(eqx.Module):
         # per-U-Net conditioning embed (gyroswin): raw scalars -> 4*cond_embed_dim.
         # When present it drives cond_dim for all FiLM/DiT blocks below.
         if n_cond > 0:
-            from neugk_jax.models.embeddings import ContinuousConditionEmbed
             self.cond_embed = ContinuousConditionEmbed(
                 dim=cond_embed_dim, n_cond=n_cond, key=jr.fold_in(key, 999),
             )
@@ -353,8 +361,16 @@ class SwinNDUnet(eqx.Module):
         # middle: global attention at the deepest grid. The AE uses a plain ViT
         # (dead in translation); gyroswin uses a windowed SwinLayer with RPB whose
         # window == the bottleneck grid (so it is global) + per-block FiLM.
-        if middle_swin:
-            from neugk_jax.models.swin import FilmSwinLayer
+        if middle_swin and cond_mode == "dit":
+            self.middle = DiTSwinLayer(
+                space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
+                grid_size=grid_sizes[-1], window_size=grid_sizes[-1], cond_dim=cond_dim,
+                key=keys[ki], mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias, qk_norm=qk_norm, use_rpb=use_rpb,
+                gated_attention=gated_attention, rms_norm=rms_norm,
+            )
+        elif middle_swin:
             self.middle = FilmSwinLayer(
                 space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
                 grid_size=grid_sizes[-1], window_size=grid_sizes[-1], cond_dim=cond_dim,

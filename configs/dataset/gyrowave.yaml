@@ -1,0 +1,19 @@
+name: gyrowave
+# CR400 wavelet-token representation (the compressed data, from gyrowave.compress.process_trajectory)
+# for iteration_13.
+tokens: /tmp/claude-5161/-system-user-publicwork-galletti-git-neural-gyrokinetics-gitlab/20b7828d-3a48-49f4-9ad2-dfa2fe3e42c4/scratchpad/fast_compress/cache/tokens_iteration_13_real.npz
+params: /local00/bioinf/galletti/gyrosplats_deform/iteration_13/params.npy
+geometry_path: /local00/bioinf/galletti/preprocessed_kvikio   # per-trajectory metadata.pkl (geometry for flux/phi)
+traj: iteration_13
+version: real              # real | semispectral (transform variant baked into the representation)
+
+# --- multi-trajectory training (pooled snapshots + per-sample conditioning + global whitening) ---
+# Set `tokens_dir` + `trajectories` to train over many trajectories instead of the single `tokens`
+# above. Files resolve as {tokens_dir}/tokens_iteration_{it}_{version}.npz and per-traj params as
+# {params_base}/iteration_{it}/params.npy. (Alternatively give an explicit `token_files` list + either
+# `trajectories` or a matching `params` list.) `sample_trajectory` picks the representative params
+# used for sampling/eval.
+# tokens_dir: /local00/bioinf/galletti/gyrowave_tokens
+# trajectories: [23, 30, 46, 54, 55]
+# params_base: /local00/bioinf/galletti/gyrosplats_deform
+# sample_trajectory: 0

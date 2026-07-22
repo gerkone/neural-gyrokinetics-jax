@@ -22,7 +22,9 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from neugk_jax.models.utils import Linear
+from neugk_jax.models.embeddings import RPB
+from neugk_jax.models.rope import apply_rope
+from neugk_jax.models.utils import Gate, Linear, RMSNorm
 
 
 _DEFAULT_BACKEND = "einsum"
@@ -127,9 +129,6 @@ class MultiHeadSelfAttention(eqx.Module):
         window_size: Optional[tuple[int, ...]] = None,
         backend: Optional[str] = None,
     ):
-        from neugk_jax.models.utils import RMSNorm, Gate
-        from neugk_jax.models.embeddings import RPB
-
         assert dim % num_heads == 0, f"dim={dim} not divisible by num_heads={num_heads}"
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -154,6 +153,7 @@ class MultiHeadSelfAttention(eqx.Module):
         self,
         x: jnp.ndarray,
         attn_bias: Optional[jnp.ndarray] = None,
+        rope: Optional[tuple[jnp.ndarray, jnp.ndarray]] = None,
     ) -> jnp.ndarray:
         n, dim = x.shape
         qkv = self.qkv(x).reshape(n, 3, self.num_heads, self.head_dim)
@@ -163,6 +163,13 @@ class MultiHeadSelfAttention(eqx.Module):
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        # optional rotary embedding on q/k; ``rope`` is a precomputed (cos, sin) pair,
+        # each (n, head_dim), broadcast over the heads axis. rope=None leaves q/k
+        # untouched so the no-rope path stays bit-identical to before.
+        if rope is not None:
+            cos, sin = rope
+            q = apply_rope(q, cos[:, None, :], sin[:, None, :])
+            k = apply_rope(k, cos[:, None, :], sin[:, None, :])
         # fold RPB bias into the attention bias slot
         if self.rpb is not None:
             rpb_bias = self.rpb()  # shape: (heads, sl, sl)

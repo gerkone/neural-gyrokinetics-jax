@@ -130,6 +130,8 @@ def _gyroswin_name_map(jax_name: str) -> list[str]:
     base = base.replace(".swin.", ".swin_att.")
     base = base.replace(".downsample.proj.", ".downsample.reduction.")
     base = base.replace(".gate.proj.", ".gate.gate.1.")
+    # DiT modulation (cold/warm): jax DiTModulation.proj -> torch dit.modulation
+    base = base.replace(".mod.proj.", ".dit.modulation.")
     # SwinBlockUp / PatchExpand keep proj_concat as a single Linear; torch wraps it
     # in an nn.Sequential, so the param sits at ``proj_concat.0.*``.
     base = base.replace(".proj_concat.", ".proj_concat.0.")

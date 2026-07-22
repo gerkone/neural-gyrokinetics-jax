@@ -146,6 +146,90 @@ def gyaradax_flux_integrals(
     return np.asarray(phi), np.asarray(eflux)
 
 
+def gyaradax_spectral_fields(
+    df_batch: jnp.ndarray,
+    geometry_one: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Spectral potential + per-mode heat-flux field via gyaradax.
+
+    Same pipeline as ``gyaradax_flux_integrals`` (recombine zf → complex df →
+    forward FFT with the ifftshift-on-x convention) but keeps the per-mode
+    fields instead of reducing to scalars:
+
+    Returns ``(phi_spec, eflux_field)`` as host numpy arrays with shapes
+    ``(B, s, kx, ky)`` (complex) and ``(B, kx, ky)``.
+
+    Inputs:
+        df_batch:     ``(B, 4, vp, mu, s, x, y)`` spatial df (separate-zf
+                      channel-of-4 layout; a plain 2-channel df also works).
+        geometry_one: single-trajectory geometry dict (no batch axis).
+
+    Applies the same corrected-parseval override as
+    ``gyaradax_flux_integrals`` (see the comment there).
+    """
+    import gyaradax  # noqa: F401 — enables jax x64 before any array conversion
+    df_batch = jnp.asarray(df_batch)
+    # recombine_zf only applies to the separate-zf channel-of-4 layout
+    df_rec = df_batch[:, :2] + df_batch[:, 2:] if df_batch.shape[1] == 4 else df_batch
+    df_cplx = (df_rec[:, 0] + 1j * df_rec[:, 1]).astype(jnp.complex128)
+
+    geom = {k: jnp.asarray(v) for k, v in geometry_one.items()}
+    geom["parseval"] = jnp.where(
+        jnp.abs(jnp.asarray(geom["krho"])) < 1e-12, 1.0, 2.0,
+    ).astype(jnp.float64)
+    phi, eflux = _gyaradax_spectral_batched(df_cplx, geom)
+    return np.asarray(phi), np.asarray(eflux)
+
+
+@jax.jit
+def _gyaradax_spectral_one(df_one, geom):
+    """Per-sample (spatial complex df, geom) → (phi_spec, eflux_field).
+
+    Same FFT convention as ``_gyaradax_integ_one`` but goes through the
+    gyaradax internals directly so ``calculate_fluxes`` can keep the
+    per-(kx, ky) flux field (``reduce=False``)."""
+    from gyaradax.integrals import _phi_adiabatic, calculate_fluxes, geom_tensors
+    spec = jnp.fft.fftn(df_one, axes=(-2, -1), norm="forward")
+    spec = jnp.fft.ifftshift(spec, axes=-2)
+    gt = geom_tensors(geom)
+    phi = _phi_adiabatic(gt, spec)  # (s, kx, ky) complex
+    phi = _torch_zonal_quirk(gt, geom, spec, phi)
+    _pflux, eflux, _vflux = calculate_fluxes(gt, spec, phi, reduce=False)
+    return phi, eflux
+
+
+def _torch_zonal_quirk(gt, geom, spec, phi):
+    """Replicate upstream torch's zonal-correction quirk on one phi mode.
+
+    ``neugk/physics/integrals.py:solve_fields`` special-cases kx INDEX 0 on
+    the zonal (ky index 0) column (``poisson_diag[..., 0, 0] = 0``,
+    ``maty[..., 0, :] = 1``) instead of the kx=0 mode. gyaradax applies the
+    same treatment at ``ixzero = argmin|kxrh|`` — at that mode the two
+    formulations coincide analytically (gamma=1 there), so torch and
+    gyaradax phi differ ONLY at (kx_idx=0, ky_idx=0). The mode is the
+    zonal-profile diagnostic's, so we inherit the torch value for metric
+    parity; fluxes are untouched (eflux ∝ krho = 0 on the zonal column).
+    torch there reduces to ``phi = phi_raw + Σ_s matz·phi_raw``.
+    """
+    de, signz, tmp = gt["de"], gt["signz"], gt["tmp"]
+    intvp, intmu, bn = gt["intvp"], gt["intmu"], gt["bn"]
+    bessel, gamma = gt["bessel"], gt["gamma"]
+    # phi_raw = Σ_{v,mu} poisson_int · df at the quirk mode (kx=0-index, ky=0-index)
+    poisson_int = signz * de * intmu * intvp * bessel * bn
+    phi_raw = jnp.sum(poisson_int * spec, axis=(1, 2))[0, :, 0, 0]  # (s,)
+    ints_s = jnp.asarray(geom["ints"], dtype=jnp.float64)
+    gamma00 = gamma[0, 0, 0, :, 0, 0]  # (s,) — gamma is v/mu-independent
+    sz, d, t = signz.ravel()[0], de.ravel()[0], tmp.ravel()[0]
+    diagz = sz * (gamma00 - 1.0) / t
+    matz = -ints_s / (sz * d * (diagz - 1.0 / t))
+    phi_new = phi_raw + jnp.sum(matz * phi_raw)
+    return phi.at[:, 0, 0].set(phi_new)
+
+
+# vmap with shared geom — evaluators integrate one trajectory at a time
+_gyaradax_spectral_batched = jax.jit(jax.vmap(_gyaradax_spectral_one, in_axes=(0, None)))
+
+
 @jax.jit
 def _gyaradax_integ_one(df_one, geom):
     """Per-sample (spectral df, geom) → (phi, eflux). FFT inside so the

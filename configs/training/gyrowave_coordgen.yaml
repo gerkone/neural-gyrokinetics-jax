@@ -1,0 +1,17 @@
+batch_size: 4
+n_epochs: 1500
+learning_rate: 3.0e-4
+final_learning_rate: 3.0e-6
+weight_decay: 1.0e-4
+clip_grad: true
+clip_to: 1.0
+exclude_from_wd: []
+save_every_n_epochs: 500
+# --- coord+value generation (Approach B) ---
+pairing: sliced            # sliced (default, jittable) | independent | sinkhorn_sub
+ot_fraction: 1.0           # <1 -> per-sample mix of paired/unpaired x0 (NSOT-style)
+coord_loss_w: 1.0          # velocity MSE weight on the 5 coord channels
+value_loss_w: 1.0          # velocity MSE weight on the 2 value channels
+sinkhorn_sub_m: 2048       # subsample size for pairing=sinkhorn_sub (dense N is infeasible)
+sinkhorn_eps: 0.05
+sinkhorn_iters: 100

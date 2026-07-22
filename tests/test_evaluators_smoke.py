@@ -28,6 +28,30 @@ from neugk_jax.evaluate import (
 )
 
 
+def _make_geometry(resolution):
+    """Shape-consistent single-species geometry for gyaradax on a tiny grid."""
+    vp, mu, s, x, y = resolution
+    return {
+        "krho": np.arange(y, dtype=np.float64) * 0.5,          # ky=0 zonal mode at index 0
+        "kxrh": (np.arange(x, dtype=np.float64) - x // 2) * 0.4,
+        "ints": np.full(s, 1.0 / s, dtype=np.float64),
+        "intmu": np.linspace(0.1, 0.4, mu, dtype=np.float64),
+        "intvp": np.full(vp, 0.5, dtype=np.float64),
+        "vpgr": np.linspace(-1.5, 1.5, vp, dtype=np.float64),
+        "mugr": np.linspace(0.1, 1.6, mu, dtype=np.float64),
+        "bn": np.ones(s, dtype=np.float64),
+        "ffun": np.ones(s, dtype=np.float64),
+        "efun": np.ones(s, dtype=np.float64),
+        "rfun": np.ones(s, dtype=np.float64),
+        "bt_frac": np.ones(s, dtype=np.float64),
+        "parseval": np.where(np.arange(y) == 0, 1.0, 2.0).astype(np.float64),
+        "little_g": np.tile(np.array([1.0, 0.0, 1.0]), (s, 1)),
+        **{k: np.ones((1,), dtype=np.float64) for k in (
+            "mas", "tmp", "de", "d2X", "signz", "signB", "vthrat",
+        )},
+    }
+
+
 def _make_traj(root: Path, name: str, *, n_t: int, resolution):
     traj = root / f"{name}_ifft_realpotens"
     data = traj / "data"
@@ -45,11 +69,8 @@ def _make_traj(root: Path, name: str, *, n_t: int, resolution):
         "s_hat": np.array([0.8], dtype=np.float32),
         "q": np.array([1.4], dtype=np.float32),
         "resolution": np.array(resolution),
-        "geometry": {k: np.ones((1,), dtype=np.float64) for k in (
-            "krho", "ints", "intmu", "intvp", "vpgr", "mugr",
-            "bn", "efun", "rfun", "bt_frac", "parseval",
-            "mas", "tmp", "d2X", "signz", "signB", "kxrh", "little_g",
-        )},
+        "ds": np.float64(0.0625),
+        "geometry": _make_geometry(resolution),
     }
     with open(traj / "metadata.pkl", "wb") as f:
         pickle.dump(meta, f)
@@ -102,19 +123,33 @@ def test_ae_evaluator_runs(tiny_setup):
     cfg = OmegaConf.create({"validation": {"eval_integrals": False}})
     ev = AEEvaluator(cfg, val_ds=ds, is_rank0=True)
     metrics, _ = ev(ae, epoch=1, batch_size=1, eval_integrals=False)
-    assert "df" in metrics
-    assert jnp.isfinite(metrics["df"])
+    assert "df_mse" in metrics
+    assert jnp.isfinite(metrics["df_mse"])
 
 
 def test_ae_evaluator_with_integrals_optional(tiny_setup):
-    """When eval_integrals=True but geometry is incomplete, evaluator
-    should still finish and just skip the integrals."""
+    """When eval_integrals=True but the df layout doesn't fit the flux
+    integral (plain 2-channel df), the evaluator should still finish and
+    just skip the integrals."""
     ds, ae = tiny_setup
     cfg = OmegaConf.create({"validation": {"eval_integrals": True}})
     ev = AEEvaluator(cfg, val_ds=ds, is_rank0=True)
     metrics, _ = ev(ae, epoch=1, batch_size=1, eval_integrals=True)
-    assert "df" in metrics
-    assert jnp.isfinite(metrics["df"])
+    assert "df_mse" in metrics
+    assert jnp.isfinite(metrics["df_mse"])
+
+
+def test_ae_evaluator_spectral_metrics(tiny_setup):
+    """eval_spectra=True produces finite time-averaged zonal-flow and
+    spectral metrics (needs the 'ds' metadata entry)."""
+    ds, ae = tiny_setup
+    assert ds.get_ds(0) == 0.0625
+    cfg = OmegaConf.create({"validation": {"eval_spectra": True}})
+    ev = AEEvaluator(cfg, val_ds=ds, is_rank0=True)
+    metrics, _ = ev(ae, epoch=1, batch_size=1, eval_spectra=True)
+    for key in ("zfphi_rl2", "zf_energy_err", "kyspec_rl2", "qspec_rl1"):
+        assert key in metrics, f"missing spectral metric {key}"
+        assert np.isfinite(metrics[key]), f"{key} not finite: {metrics[key]}"
 
 
 def test_diffusion_evaluator_constructs(tiny_setup):

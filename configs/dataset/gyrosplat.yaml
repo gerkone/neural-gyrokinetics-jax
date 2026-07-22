@@ -1,0 +1,13 @@
+name: gyrosplat
+path: /local00/bioinf/galletti/gyrosplats/data   # local mirror (scripts/sync_gyrosplat_data.sh)
+cache_path: /local00/bioinf/galletti/gyrosplats_cache
+geometry_path: /local00/bioinf/galletti/preprocessed_kvikio
+training_trajectories: iteration_{13,131}
+validation_trajectories: iteration_{235}
+conditions: [itg, dg, s_hat, q]
+offset: 80                   # first fitted timestep (fixed by the fitting run)
+stats_token: false           # zf stats live OUTSIDE the generative state
+layout: atoms                # atoms (flat 1597 bank) | windows (v7: 871 tokens, frozen carrier scaffold)
+ky_mode: delta               # delta | frozen (carrier bin is never diffused)
+asinh_channels: []           # e.g. [8, 9, 10, 14, 15] to tame off-diag/amp tails
+asinh_scale: 3.0

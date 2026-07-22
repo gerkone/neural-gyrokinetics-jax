@@ -27,6 +27,60 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 
+def _flatten_meta(meta):
+    # npz stores flat string-keyed arrays; nest the geometry dict under "geometry/<key>"
+    flat = {}
+    for k, v in meta.items():
+        if k == "geometry" and isinstance(v, dict):
+            for gk, gv in v.items():
+                flat[f"geometry/{gk}"] = np.asarray(gv)
+        else:
+            flat[k] = np.asarray(v)
+    return flat
+
+
+def _unflatten_meta(z):
+    meta, geom = {}, {}
+    for k in z.files:
+        v = z[k]
+        if k.startswith("geometry/"):
+            geom[k[len("geometry/"):]] = v
+        elif k == "resolution":
+            meta["resolution"] = tuple(int(x) for x in np.atleast_1d(v))
+        else:
+            meta[k] = v
+    if geom:
+        meta["geometry"] = geom
+    return meta
+
+
+def _meta_ext(base):
+    if os.path.exists(base + ".npz"):
+        return ".npz"
+    if os.path.exists(base + ".pkl"):
+        return ".pkl"
+    return None
+
+
+def load_meta(base):
+    ext = _meta_ext(base)
+    if ext == ".npz":
+        with np.load(base + ".npz", allow_pickle=False) as z:
+            return _unflatten_meta(z)
+    if ext == ".pkl":
+        with open(base + ".pkl", "rb") as f:
+            return pickle.load(f)
+    return None
+
+
+def save_meta(base, meta, ext):
+    if ext == ".npz":
+        np.savez(base + ".npz", **_flatten_meta(meta))
+    else:
+        with open(base + ".pkl", "wb") as f:
+            pickle.dump(meta, f)
+
+
 def read_bin(file: str, shape: tuple, dtype=np.float32) -> np.ndarray:
     """Read a flat binary into a contiguous ``np.ndarray`` of given shape."""
     arr = np.fromfile(file, dtype=dtype)
@@ -87,6 +141,9 @@ def _resolve_dtyped_path(fp32_path: str, prefer_dtype: str | None) -> tuple[str,
 class DataBackend(ABC):
     @abstractmethod
     def is_valid(self, path: str) -> bool: ...
+
+    @abstractmethod
+    def exists(self, path: str) -> bool: ...
 
     @abstractmethod
     def format_path(
@@ -155,6 +212,12 @@ class NumpyBackend(DataBackend):
     def is_valid(self, path: str) -> bool:
         return os.path.isdir(self._strip_h5(path))
 
+    def exists(self, path: str) -> bool:
+        path = self._strip_h5(path)
+        # a trajectory is present if it has full or lightweight metadata, in either npz or pkl
+        return any(_meta_ext(os.path.join(path, n)) is not None
+                   for n in ("metadata", "metadata_light"))
+
     def format_path(
         self, path: str, spatial_ifft: bool,
         split_into_bands: Optional[int] = None,
@@ -175,18 +238,23 @@ class NumpyBackend(DataBackend):
         lightweight: bool = False,
     ) -> dict:
         path = self._strip_h5(path)
-        light_path = os.path.join(path, "metadata_light.pkl")
-        full_path = os.path.join(path, "metadata.pkl")
-        if lightweight and os.path.exists(light_path):
-            with open(light_path, "rb") as f:
-                meta = pickle.load(f)
+        # metadata is stored as npz (safe, no pickle) or pkl; prefer npz, and fall back to the
+        # lightweight file when the full one is absent (published datasets ship only the light one)
+        light_base = os.path.join(path, "metadata_light")
+        full_base = os.path.join(path, "metadata")
+        if (lightweight or _meta_ext(full_base) is None) and _meta_ext(light_base) is not None:
+            meta = load_meta(light_base)
         else:
-            with open(full_path, "rb") as f:
-                meta = pickle.load(f)
+            meta = load_meta(full_base)
             if lightweight:
                 drop = {"df_min", "df_max", "df_var", "df_mean", "df_std",
                         "phi_min", "phi_max", "phi_var"}
                 meta = {k: v for k, v in meta.items() if k not in drop}
+                # opportunistically cache the light variant next to the full one
+                try:
+                    save_meta(light_base, meta, _meta_ext(full_base))
+                except OSError:
+                    pass
         # fill in missing geometry scalars with safe defaults
         if "geometry" in meta:
             g = meta["geometry"]

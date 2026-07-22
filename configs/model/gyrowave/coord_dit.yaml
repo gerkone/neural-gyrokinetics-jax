@@ -1,0 +1,9 @@
+name: gyrowave_coorddit
+model_type: gyrowave_coordgen
+attn_kind: phys            # coord is DIFFUSED (dynamic) -> no static RoPE; slice attention only
+slice_num: 512             # Transolver slices for the ~28k-token sets
+n_hidden: 256
+n_layers: 8
+n_head: 8
+mlp_ratio: 2
+bands: 6                   # sincos featurization bands for the (diffused) coord channels

@@ -7,28 +7,26 @@ import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
+from neugk_jax.autoencoders import Swin5DAE
+from neugk_jax.diffusion.dit import DiT
 from neugk_jax.models import (
     APE,
+    MLP,
     ContinuousConditionEmbed,
-    DiT,
     DiTLayer,
     DiTSwinLayer,
     Film,
     LayerNorm,
     Linear,
-    MLP,
     PatchEmbed,
     PatchExpand,
     PatchMerge,
-    SwinLayer,
     Swin5DUnet,
+    SwinLayer,
     ViTLayer,
     pad_to_blocks,
     unpad,
 )
-from neugk_jax.autoencoders import Swin5DAE
-
-
 
 
 def test_linear_shapes():
@@ -75,9 +73,11 @@ def test_ape_3d():
 
 
 def test_continuous_condition_embed():
-    emb = ContinuousConditionEmbed(32, n_cond=4, key=jr.PRNGKey(0), cond_dim=64)
+    # faithful to upstream: output dim is always 4*dim (no override)
+    emb = ContinuousConditionEmbed(32, n_cond=4, key=jr.PRNGKey(0))
     out = emb(jnp.array([0.1, 0.5, -0.3, 1.0]))
-    assert out.shape == (64,)
+    assert out.shape == (emb.cond_dim,)
+    assert emb.cond_dim == 4 * 32
 
 
 

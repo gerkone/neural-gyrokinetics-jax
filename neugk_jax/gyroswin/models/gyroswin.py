@@ -82,6 +82,7 @@ class GyroSwinMultitask(eqx.Module):
         cond_mode: str = "film",
         flux_num_heads: int = 4,
         flux_depth: int = 1,
+        rms_norm: bool = False,
         use_checkpoint: bool = False,
         key,
     ):
@@ -100,7 +101,7 @@ class GyroSwinMultitask(eqx.Module):
         # phi_unet.cond_embed), not at the top level.
         self.cond_embed = None
         cond_kw = dict(n_cond=n_cond, cond_embed_dim=cond_embed_dim, cond_mode=cond_mode,
-                       middle_swin=True, unpatch_patch_skip=patch_skip)
+                       middle_swin=True, unpatch_patch_skip=patch_skip, rms_norm=rms_norm)
 
         self.df_unet = Swin5DUnet(
             space=5,
@@ -326,6 +327,7 @@ def build_gyroswin_from_config(cfg_path: str, *, key,
         qk_norm=swin.get("qk_norm", False),
         gated_attention=swin.get("gated_attention", False),
         cond_mode=swin.get("modulation", "film"),
+        rms_norm=(swin.get("norm_fn") == "RMSNorm"),
         flux_num_heads=swin.get("flux_num_heads", 4),
         flux_depth=swin.get("flux_depth", 1),
         outputs=outputs or ["df", "phi"],

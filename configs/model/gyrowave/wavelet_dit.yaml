@@ -1,0 +1,9 @@
+name: gyrowave_waveletdit
+model_type: gyrowave_fm
+attn_kind: phys            # phys (Transolver slice attention, O(N*slices)) | full (O(N^2) RoPE)
+slice_num: 512             # Transolver slices for the ~28k-token sets
+n_hidden: 256
+n_layers: 8
+n_head: 8
+mlp_ratio: 2
+bands: 6                   # sincos featurization bands for the static coord channels
