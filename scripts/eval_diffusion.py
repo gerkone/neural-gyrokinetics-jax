@@ -41,6 +41,11 @@ def main():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--subsample", type=int, default=1,
                    help="stride over val samples (upstream val_subsample; the paper uses 10)")
+    p.add_argument("--latent-scale", type=float, default=None,
+                   help="latent_scale the DiT was TRAINED with (the runner prints it). "
+                        "Omitted → estimated from this split, which mis-scales the sampler.")
+    p.add_argument("--n-samples", type=int, default=1,
+                   help="stochastic samples per condition (ensemble size for the flux UQ)")
     args = p.parse_args()
 
     # heavy imports after argparse so --help stays instant
@@ -50,21 +55,29 @@ def main():
     import numpy as np
     import yaml
 
-    from neugk_jax.dataset import CycloneDataset, NumpyBackend
+    from neugk_jax.dataset import CycloneDataset, LinearCondCycloneDataset, NumpyBackend
     from neugk_jax.diffusion.flow_matching import euler_sample
     from neugk_jax.evaluate import DiffusionEvaluator
-    from neugk_jax.translate import build_ae_from_config, build_dit_from_config, load_or_translate
+    from neugk_jax.translate import (
+        build_ae_from_config,
+        build_dit_from_config,
+        build_lincond_dit_from_config,
+        load_or_translate,
+    )
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
     dcfg = cfg.get("dataset", {}) or {}
+    # linear-field conditioning swaps both the dataset and the DiT flavour
+    lincond = (cfg.get("model", {}) or {}).get("model_type") == "lincond_dit"
 
     # AE config lives next to the AE checkpoint — same convention as FlowMatchingRunner
     ae_cfg = os.path.join(os.path.dirname(args.ae_ckpt), "config.yaml")
     ae = load_or_translate(build_ae_from_config(ae_cfg, key=jr.PRNGKey(0)), args.ae_ckpt)
-    dit = load_or_translate(build_dit_from_config(args.config, ae, key=jr.PRNGKey(0)), args.dit_ckpt)
+    build_dit = build_lincond_dit_from_config if lincond else build_dit_from_config
+    dit = load_or_translate(build_dit(args.config, ae, key=jr.PRNGKey(0)), args.dit_ckpt)
     latent_shape = tuple(dit.latent_shape)
-    print(f"loaded AE + DiT: latent_shape={latent_shape}")
+    print(f"loaded AE + {'LinearCond' if lincond else ''}DiT: latent_shape={latent_shape}")
 
     common = dict(
         path=args.data_path,
@@ -78,7 +91,29 @@ def main():
         normalization_scope=dcfg.get("normalization_scope", "dataset"),
         normalization_stats=dcfg.get("normalization_stats"),
         offset=dcfg.get("offset", 0),
+        lightweight_metadata=dcfg.get("lightweight_metadata", False),
+        cond_filters=dcfg.get("eval_cond_filters"),
     )
+    if lincond:
+        common.update(
+            raw_root=dcfg.get("raw_root", "/restricteddata/ukaea/gyrokinetics/raw"),
+            linear_roots=dcfg.get("linear_roots"),
+            linear_to_real=dcfg.get("linear_to_real", True),
+            linear_separate_zf=dcfg.get("linear_separate_zf"),
+            linear_normalize=dcfg.get("linear_normalize", "rms"),
+            linear_rescale_per_traj=dcfg.get("linear_rescale_per_traj", False),
+        )
+        # eval splits must use the TRAINING profile, not one from their own few trajectories
+        if dcfg.get("linear_normalize") in ("ky", "cky", "kxky", "ckxky"):
+            train_ds = LinearCondCycloneDataset(
+                trajectories=dcfg["training_trajectories"], linear_preload=False,
+                **{**common, "split": "train",
+                   "cond_filters": dcfg.get("training_cond_filters")},
+            )
+            common["linear_profile"] = train_ds.linear_profile
+            print(f"inherited training linear profile {train_ds.linear_profile.shape} "
+                  f"from {len(train_ds.files)} trajectories")
+            del train_ds
 
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
     unknown = [s for s in splits if s not in SPLIT_TRAJECTORIES]
@@ -87,21 +122,29 @@ def main():
 
     latent_scale = None
     for split in splits:
-        ds = CycloneDataset(trajectories=SPLIT_TRAJECTORIES[split], **common)
+        ds_cls = LinearCondCycloneDataset if lincond else CycloneDataset
+        ds = ds_cls(trajectories=SPLIT_TRAJECTORIES[split], **common)
         print(f"[{split}] {len(ds.files)} trajectories, {len(ds)} samples")
 
         if latent_scale is None:
-            # 1 / std of the AE latents — mirrors the runner's latent_scale, estimated
-            # from a handful of encoded samples spread over the first split
-            idx = np.linspace(0, len(ds) - 1, num=min(8, len(ds)), dtype=int)
-            z = jax.vmap(lambda x: ae.encode(x)[0])(
-                jnp.stack([jnp.asarray(ds[int(i)].df) for i in idx])
-            )
-            latent_scale = float(1.0 / np.sqrt(max(float(np.var(np.asarray(z))), 1e-12)))
-            print(f"latent_scale = {latent_scale:.4f}")
+            if args.latent_scale is not None:
+                latent_scale = float(args.latent_scale)
+                print(f"latent_scale = {latent_scale:.4f} (from --latent-scale, as trained)")
+            else:
+                # 1 / std of the AE latents, estimated from a few samples of this split
+                idx = np.linspace(0, len(ds) - 1, num=min(8, len(ds)), dtype=int)
+                z = jax.vmap(lambda x: ae.encode(x)[0])(
+                    jnp.stack([jnp.asarray(ds[int(i)].df) for i in idx])
+                )
+                latent_scale = float(1.0 / np.sqrt(max(float(np.var(np.asarray(z))), 1e-12)))
+                print(f"latent_scale = {latent_scale:.4f} (ESTIMATED from this split — pass "
+                      "--latent-scale to match training)")
 
         def sample_fn(*, key, batch, cond=None, steps=50):
             # euler-integrate the DiT velocity field, then decode — FlowMatchingRunner.sample
+            if lincond and cond is not None and cond.ndim > 2:
+                # encode the field once; the code is constant along the path
+                cond = jax.vmap(dit.encode_cond)(cond)
             latents = euler_sample(
                 lambda x, t, c: dit(x, t, c),
                 key=key, shape=(batch, *latent_shape),
@@ -111,11 +154,13 @@ def main():
 
         evaluator = DiffusionEvaluator(
             cfg, val_ds=ds, autoencoder=ae, sample_fn=sample_fn, is_rank0=True,
+            cond_field="linear" if lincond else "conditioning",
         )
         metrics, plots = evaluator(
             dit, epoch=0,
             batch_size=args.batch_size,
             n_steps=args.steps,
+            n_samples_per_traj=args.n_samples,
             val_subsample=args.subsample,
         )
 

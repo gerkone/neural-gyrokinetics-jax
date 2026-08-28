@@ -1,0 +1,54 @@
+name: cyclone_lincond
+path: /local00/bioinf/galletti/preprocessed_kvikio
+backend: kvikio  # gpu-direct reads; falls back to numpy transparently
+training_trajectories: iteration_{0-3}
+validation_trajectories: iteration_{4-4}
+input_fields: [df]
+# the linear field replaces the scalar conditions; keep them for logging/eval only
+conditions: [itg, dg, s_hat, q]
+separate_zf: true
+# skip the pre-saturation transient, matching the AE checkpoint's own training offset
+offset: 80
+normalization:
+  df:
+    type: zscore
+    agg_axes: [0, 1, 3, 4, 5]
+normalization_scope: dataset
+normalization_stats: /local00/bioinf/galletti/preprocessed_kvikio/diff_df_flux_phi_offset80_mu_57f5caf2_stats.pkl
+# the full metadata pickle is ~450 MB per trajectory and only carries the per-element df
+# moments, which the stats pkl above replaces
+lightweight_metadata: true
+# same filters the AE was trained with — they also fix the trajectory ordering
+training_cond_filters:
+  last_flux: [1., .inf]
+  first_flux: [1., .inf]
+eval_cond_filters:
+  last_flux: [1., .inf]
+  first_flux: [1., .inf]
+# reuse an existing latents pickle instead of encoding the split (verified + fid-remapped
+# against this dataset on load); null → encode once and cache next to the dataset
+latents_cache_train: null
+latents_cache_val: null
+# paired linear runs (iteration_N_Lin/FDS). run
+# ``python -m neugk_jax.dataset.preprocess --mode=linear`` first to record the pairing
+# in the trajectory metadata; without it the roots below are searched at load time.
+raw_root: /restricteddata/ukaea/gyrokinetics/raw
+linear_roots: null
+linear_to_real: true          # match the df layout (kx/ky inverse transform)
+linear_separate_zf: null      # null → follow separate_zf
+# global (2, nky) RMS profile pooled over the whole training split (re/im x ky), from the
+# per-trajectory moments in the metadata; the val split inherits the training profile
+linear_normalize: cky
+# optionally also divide each field by its own RMS first (the FDS amplitude spans 28x
+# across trajectories, mostly conventional); off = keep cross-trajectory amplitude
+linear_rescale_per_traj: false
+linear_preload: true          # ~89 MB fp32 per trajectory (x2 with separate_zf), one per trajectory
+linear_cache_size: null       # cap the cache (FIFO) when host RAM is tight
+linear_dtype: float32         # float16 halves the cache; the runner still feeds the model fp32
+# hold one copy of each field on the GPU (the field is constant per trajectory,
+# so a per-step host->device copy costs ~117 ms at batch 16 / group 4 for nothing)
+linear_device_cache: true
+# same for the AE latents (13 GB): a per-sample host gather is ~1 ms/sample
+latents_device_cache: true
+linear_workers: 8
+linear_required: true

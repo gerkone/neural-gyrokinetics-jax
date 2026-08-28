@@ -92,16 +92,6 @@ class AERunner(BaseRunner):
             **common,
         )
 
-    @staticmethod
-    def _omegaconf_to_dict(node):
-        if node is None:
-            return None
-        try:
-            from omegaconf import OmegaConf
-            return OmegaConf.to_container(node, resolve=True)
-        except Exception:
-            return dict(node)
-
     def setup_components(self) -> None:
         cfg = self.cfg
         key = jr.PRNGKey(getattr(cfg, "seed", 0))
@@ -139,6 +129,7 @@ class AERunner(BaseRunner):
             use_rpb=vit.get("use_rpb", True),
             gated_attention=vit.get("gated_attention", False),
             norm_affine=False,
+            legacy_double_shortcut=mcfg.get("legacy_swin_shortcut", False),
             key=key,
         )
 

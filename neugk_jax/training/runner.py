@@ -51,6 +51,17 @@ class BaseRunner(ABC):
         self.setup_components()
         self._maybe_resume()
 
+    @staticmethod
+    def _omegaconf_to_dict(node):
+        """OmegaConf node → plain python containers (dataset code indexes them directly)."""
+        if node is None:
+            return None
+        try:
+            from omegaconf import OmegaConf
+            return OmegaConf.to_container(node, resolve=True)
+        except Exception:
+            return dict(node)
+
     @abstractmethod
     def setup_data(self) -> None: ...
 

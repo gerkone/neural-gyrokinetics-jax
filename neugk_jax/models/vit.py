@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import enum
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from neugk_jax.models.attention import MultiHeadSelfAttention
+from neugk_jax.models.attention import MultiHeadCrossAttention, MultiHeadSelfAttention
 from neugk_jax.models.utils import MLP, LayerNorm, RMSNorm, DiTModulation, gelu
 from neugk_jax.models.swin import Film, _DropPath
 
@@ -232,6 +232,112 @@ class DiTLayer(eqx.Module):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
             x = blk(x, condition, key=k, inference=inference)
+        return x.reshape(*spatial, dim)
+
+
+class CrossAttnDiTBlock(eqx.Module):
+    """Self-attention → cross-attention → MLP, Stable-Diffusion block order.
+
+    The conditioning sequence enters through cross-attention (SD's
+    ``BasicTransformerBlock``); the timestep keeps the DiT scale/shift/gate
+    modulation, so switching ``cond_mode`` only changes where the *condition*
+    enters, not how time does.
+    """
+
+    norm1: LayerNorm
+    norm_cross: LayerNorm
+    norm2: LayerNorm
+    attn: MultiHeadSelfAttention
+    cross: MultiHeadCrossAttention
+    mlp: MLP
+    drop_path: _DropPath
+    mod: DiTModulation
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        cond_dim: int,
+        *,
+        key,
+        context_dim: Optional[int] = None,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        act_fn: Callable = gelu,
+        qkv_bias: bool = False,
+        norm_affine: bool = True,
+    ):
+        katt, kcross, kmlp, kmod = jr.split(key, 4)
+        self.norm1 = LayerNorm(dim, elementwise_affine=norm_affine)
+        self.norm_cross = LayerNorm(dim, elementwise_affine=norm_affine)
+        self.norm2 = LayerNorm(dim, elementwise_affine=norm_affine)
+        self.attn = MultiHeadSelfAttention(dim, num_heads, key=katt, qkv_bias=qkv_bias)
+        self.cross = MultiHeadCrossAttention(
+            dim, context_dim or dim, num_heads, key=kcross, qkv_bias=qkv_bias,
+        )
+        hidden = max(int(dim * mlp_ratio), dim)
+        self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
+        self.drop_path = _DropPath(drop_path)
+        self.mod = DiTModulation(cond_dim, dim, key=kmod)
+
+    def __call__(self, x, cond, context, *, key=None, inference=False):
+        mods = self.mod(cond)
+        scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = (
+            m[None, :] for m in mods
+        )
+        k1, k2, k3 = (None, None, None) if key is None else jr.split(key, 3)
+        h = self.attn(self.norm1(x) * (1.0 + scale_msa) + shift_msa)
+        x = x + gate_msa * self.drop_path(h, key=k1, inference=inference)
+        x = x + self.drop_path(self.cross(self.norm_cross(x), context),
+                               key=k2, inference=inference)
+        h2 = self.mlp(self.norm2(x) * (1.0 + scale_mlp) + shift_mlp)
+        return x + gate_mlp * self.drop_path(h2, key=k3, inference=inference)
+
+
+class CrossAttnDiTLayer(eqx.Module):
+    """Stack of :class:`CrossAttnDiTBlock` over flattened ``(*grid, dim)`` tokens."""
+
+    blocks: list
+    grid_size: tuple[int, ...] = eqx.field(static=True)
+    dim: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        space: int,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        grid_size: Sequence[int],
+        *,
+        key,
+        cond_dim: int,
+        context_dim: Optional[int] = None,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        act_fn: Callable = gelu,
+        qkv_bias: bool = False,
+        norm_affine: bool = True,
+        **_unused,
+    ):
+        keys = jr.split(key, depth)
+        self.blocks = [
+            CrossAttnDiTBlock(
+                dim, num_heads, cond_dim, key=keys[i], context_dim=context_dim,
+                mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
+                qkv_bias=qkv_bias, norm_affine=norm_affine,
+            )
+            for i in range(depth)
+        ]
+        self.grid_size = tuple(grid_size)
+        self.dim = dim
+
+    def __call__(self, x, condition, context, *, key=None, inference=False, **_):
+        spatial = x.shape[:-1]
+        dim = x.shape[-1]
+        x = x.reshape(-1, dim)
+        keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
+        for blk, k in zip(self.blocks, keys):
+            x = blk(x, condition, context, key=k, inference=inference)
         return x.reshape(*spatial, dim)
 
 

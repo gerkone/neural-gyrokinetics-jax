@@ -33,6 +33,16 @@ from neugk_jax.dataset.backend import DataBackend, KvikIOBackend, NumpyBackend, 
 from neugk_jax.utils import RunningMeanStd, separate_zf as separate_zf_fn
 
 
+class _StatsUnpickler(pickle.Unpickler):
+    """Reads upstream stats pickles without importing the torch-side package."""
+
+    def find_class(self, module, name):
+        # the jax twin carries the same buffers and pickle restores __dict__ directly
+        if module.startswith("neugk.") and name == "RunningMeanStd":
+            return RunningMeanStd
+        return super().find_class(module, name)
+
+
 @dataclass(frozen=True)
 class CycloneSample:
     """A single dataset item. ``df`` is the raw distribution function (mode='ae')
@@ -51,6 +61,8 @@ class CycloneSample:
     dg: np.ndarray
     s_hat: np.ndarray
     q: np.ndarray
+    # paired linear-run eigenmode field (LinearCondCycloneDataset); shared per trajectory
+    linear: np.ndarray | None = None
 
 
 def collate(batch: Sequence[CycloneSample]) -> CycloneSample:
@@ -80,6 +92,7 @@ def collate(batch: Sequence[CycloneSample]) -> CycloneSample:
         dg=stack("dg"),
         s_hat=stack("s_hat"),
         q=stack("q"),
+        linear=stack("linear"),
     )
 
 
@@ -106,6 +119,10 @@ class CycloneDataset:
         Same semantics as upstream — see ``neugk/dataset/cyclone.py``.
     separate_zf, decouple_mu
         Optional channel-axis preprocessing matching the AE config.
+    lightweight_metadata
+        Read ``metadata_light.pkl`` instead of the full pickle (~900x smaller —
+        the full one carries per-element df moments). Requires
+        ``normalization_stats``, since the per-trajectory moments are then absent.
     bundle_seq_length
         Time-bundling stride. Default ``1`` (one timestep per sample).
     offset
@@ -134,6 +151,7 @@ class CycloneDataset:
         subsample: int = 1,
         separate_zf: bool = False,
         decouple_mu: bool = False,
+        lightweight_metadata: bool = False,
         backend: Optional[DataBackend] = None,
         num_workers: int = 0,
         rank: int = 0,
@@ -158,6 +176,12 @@ class CycloneDataset:
         self.subsample = subsample
         self.separate_zf = separate_zf
         self.decouple_mu = decouple_mu
+        self.lightweight_metadata = lightweight_metadata
+        if lightweight_metadata and normalization is not None and normalization_stats is None:
+            raise ValueError(
+                "lightweight_metadata drops the per-trajectory df moments; pass "
+                "normalization_stats or disable it"
+            )
         # default to KvikIOBackend for GPU-direct reads; falls back to NumpyBackend transparently
         self.backend = backend or KvikIOBackend(rank=rank)
         self.num_workers = num_workers
@@ -189,7 +213,9 @@ class CycloneDataset:
         # metadata loads are I/O bound and tiny; cap workers at 16
         with ThreadPoolExecutor(max_workers=max(1, min(16, num_workers or 8))) as ex:
             metas = list(ex.map(
-                lambda f: self.backend.read_metadata(f, self.fields_to_load),
+                lambda f: self.backend.read_metadata(
+                    f, self.fields_to_load, lightweight=lightweight_metadata,
+                ),
                 self.files,
             ))
         self.metadata: dict[int, dict] = {}
@@ -304,7 +330,7 @@ class CycloneDataset:
         (``stats[field]['full']`` with mean / std / min / max numpy arrays).
         """
         with open(path, "rb") as f:
-            raw = pickle.load(f)
+            raw = _StatsUnpickler(f).load()
         out: dict[str, dict] = {}
         for k, rms in raw.items():
             mean = np.asarray(rms.mean, dtype=np.float64)

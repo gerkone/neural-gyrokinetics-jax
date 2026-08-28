@@ -1,0 +1,36 @@
+name: lincond_dit
+model_type: lincond_dit
+latent_dim: 512
+minibatch_ot: true
+# how the linear-field conditioning enters the DiT:
+#   adaln = pooled code -> scale/shift/gate (DiT)
+#   cross = grid tokens -> cross-attention in every block (Stable Diffusion)
+cond_mode: adaln
+vit:
+  num_heads: 8
+  depth: 4
+  mlp_ratio: 4.0
+  drop_path: 0.1
+# 5D linear field -> conditioning code: patch embed -> swin stages (each downsampling)
+# -> max pool over the remaining grid
+linear_encoder:
+  dim: 256
+  depth: [2, 2]
+  num_heads: [8, 8]
+  num_layers: 2
+  code_dim: 256
+  pool: max
+  decouple_mu: true
+  patch_size: [4, 0, 4, 5, 4]
+  window_size: [4, 0, 4, 9, 4]
+  c_multiplier: 1
+  merging_depth: 2
+  merging_hidden_ratio: 1.0
+  mlp_ratio: 2.0
+  drop_path: 0.0
+  qk_norm: true
+  use_rpb: true
+  gated_attention: true
+diffusion:
+  noise_distribution: gaussian
+  continuous_time: true

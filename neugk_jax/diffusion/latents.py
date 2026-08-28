@@ -97,7 +97,10 @@ def precompute_latents(
     _compute_latent_stats(dataset)
 
 
-def load_precomputed_latents(dataset, pickle_path: str | Path) -> None:
+def load_precomputed_latents(
+    dataset, pickle_path: str | Path, *, verify: bool = True, remap: bool = True,
+    latent_shape=None,
+) -> None:
     """Populate ``dataset.precomputed_latents`` from a pre-existing pickle.
 
     Bypasses the ``encode_fn`` path in :func:`precompute_latents` when the
@@ -106,14 +109,118 @@ def load_precomputed_latents(dataset, pickle_path: str | Path) -> None:
     dict]`` with the same per-entry schema written by
     :func:`precompute_latents` — at minimum ``x``, ``flux``, ``timestep``;
     optionally ``phi`` and the scalar conditioning fields.
+
+    ``verify`` cross-checks the cache against this dataset: every indexed
+    ``(fid, t_idx)`` must be present, and where the cache carries the scalar
+    conditions they must agree with the trajectory metadata — a foreign cache
+    whose file ordering differs would otherwise pair latents with the wrong
+    trajectory silently. ``latent_shape``, when given, is checked too. ``remap``
+    then re-keys such a cache onto this dataset's fids (see
+    :func:`remap_latent_cache`) instead of failing.
     """
     p = Path(pickle_path)
     if not p.exists():
         raise FileNotFoundError(p)
     with open(p, "rb") as f:
-        dataset.precomputed_latents = pickle.load(f)
+        cache = pickle.load(f)
+    if verify:
+        try:
+            verify_latent_cache(dataset, cache, latent_shape=latent_shape)
+        except ValueError:
+            if not remap:
+                raise
+            cache = remap_latent_cache(dataset, cache)
+            verify_latent_cache(dataset, cache, latent_shape=latent_shape)
+    dataset.precomputed_latents = cache
     dataset.mode = "diff"
     _compute_latent_stats(dataset)
+
+
+_COND_ALIASES = {"itg": "ion_temp_grad", "dg": "density_grad", "s_hat": "s_hat", "q": "q"}
+
+
+def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
+    """Re-key a cache built with a different file ordering onto this dataset's fids.
+
+    Trajectories are matched on their ``(itg, dg, s_hat, q)`` tuple, which must be
+    unique on both sides; the per-entry ``timestep`` is then checked against the
+    trajectory metadata so a wrong pairing cannot slip through.
+    """
+    def _tuple_of(get):
+        return np.array([float(np.squeeze(get(k))) for k in ("itg", "dg", "s_hat", "q")])
+
+    ours = {}
+    for fid, meta in dataset.metadata.items():
+        key = tuple(np.round(_tuple_of(lambda k: meta[_COND_ALIASES[k]]), 6))
+        if key in ours:
+            raise ValueError(f"trajectories {ours[key]} and {fid} share conditions {key}; "
+                             "cannot remap the cache by conditions")
+        ours[key] = fid
+    keys = np.array(list(ours))
+    fids = list(ours.values())
+
+    cache_fids = sorted({k[0] for k in cache})
+    steps = {f: sorted(t for cf, t in cache if cf == f) for f in cache_fids}
+    mapping: dict[int, int] = {}
+    for cfid in cache_fids:
+        entry = cache[(cfid, steps[cfid][0])]
+        if not all(k in entry for k in _COND_ALIASES):
+            raise ValueError("cache entries carry no scalar conditions; cannot remap")
+        d = np.abs(keys - _tuple_of(lambda k: entry[k])).max(axis=1)
+        j = int(np.argmin(d))
+        if d[j] > tol:
+            raise ValueError(f"cache trajectory {cfid} matches no dataset trajectory "
+                             f"(closest distance {d[j]:.3g})")
+        mapping[cfid] = fids[j]
+    if len(set(mapping.values())) != len(mapping):
+        raise ValueError("cache -> dataset trajectory matching is not bijective")
+
+    out = {}
+    for (cfid, t), entry in cache.items():
+        fid = mapping[cfid]
+        if "timestep" in entry:
+            want = float(dataset.metadata[fid]["timesteps"][t + dataset.offset])
+            if not np.isclose(float(entry["timestep"]), want, rtol=1e-4):
+                raise ValueError(
+                    f"remapped cache entry ({cfid}->{fid}, t={t}) has timestep "
+                    f"{float(entry['timestep'])} but the trajectory has {want}"
+                )
+        out[(fid, t)] = entry
+    return out
+
+
+def verify_latent_cache(dataset, cache: dict, *, latent_shape=None) -> None:
+    """Raise unless ``cache`` matches this dataset's index and file ordering."""
+    wanted = set(dataset.flat_index_to_file_and_tstep.values())
+    missing = sorted(wanted - set(cache))
+    if missing:
+        raise ValueError(
+            f"latent cache is missing {len(missing)} of {len(wanted)} (fid, t_idx) entries, "
+            f"e.g. {missing[:5]} — the trajectory selection or offset does not match "
+            "the cache (cache holds "
+            f"{len({k[0] for k in cache})} trajectories x {len({k[1] for k in cache})} steps)"
+        )
+    any_key = next(iter(wanted))
+    x = cache[any_key]["x"]
+    if latent_shape is not None and tuple(x.shape) != tuple(latent_shape):
+        raise ValueError(f"latent cache shape {tuple(x.shape)} != model latent {tuple(latent_shape)}")
+    # the scalar conditions pin the fid -> trajectory mapping
+    aliases = _COND_ALIASES
+    bad = []
+    for fid in sorted({k[0] for k in wanted}):
+        entry = cache[(fid, sorted(t for f, t in wanted if f == fid)[0])]
+        for short, meta_key in aliases.items():
+            if short not in entry:
+                continue
+            want = float(np.squeeze(dataset.metadata[fid][meta_key]))
+            got = float(np.squeeze(entry[short]))
+            if not np.isclose(want, got, rtol=1e-4, atol=1e-6):
+                bad.append((fid, short, want, got))
+    if bad:
+        raise ValueError(
+            f"latent cache conditions disagree for {len(bad)} (fid, field) pairs, e.g. "
+            f"{bad[:4]} — the cache was built with a different file ordering or filter set"
+        )
 
 
 def _compute_latent_stats(dataset) -> None:

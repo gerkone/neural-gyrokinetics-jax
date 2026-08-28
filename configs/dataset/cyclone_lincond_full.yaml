@@ -1,0 +1,60 @@
+name: cyclone_lincond_full
+path: /local00/bioinf/galletti/preprocessed_kvikio
+backend: kvikio  # gpu-direct reads; falls back to numpy transparently
+# the AE_noCond training split (holds out 8, 13, 65, 66, 100, 115, 131, 148, 200, 235, 262)
+training_trajectories: iteration_{0-7,9-12,14-64,67-99,101-114,116-130,132-147,149-199,201-234,236-261,263-299}
+validation_trajectories: [iteration_13, iteration_100, iteration_200]
+input_fields: [df]
+# the linear field replaces the scalar conditions; keep them for logging/eval only
+conditions: [itg, dg, s_hat, q]
+separate_zf: true
+# skip the pre-saturation transient, matching the AE checkpoint's own training offset
+offset: 80
+normalization:
+  df:
+    type: zscore
+    agg_axes: [0, 1, 3, 4, 5]
+normalization_scope: dataset
+normalization_stats: /local00/bioinf/galletti/preprocessed_kvikio/diff_df_flux_phi_offset80_mu_57f5caf2_stats.pkl
+# the full metadata pickle is ~450 MB per trajectory and only carries the per-element df
+# moments, which the stats pkl above replaces
+lightweight_metadata: true
+# same filters the AE was trained with — they also fix the trajectory ordering
+training_cond_filters:
+  last_flux: [1., .inf]
+  first_flux: [1., .inf]
+eval_cond_filters:
+  last_flux: [1., .inf]
+  first_flux: [1., .inf]
+# reuse an existing latents pickle instead of encoding the split (verified + fid-remapped
+# against this dataset on load); null → encode once and cache next to the dataset
+# the torch DiT baseline's own cache for this AE — verified cos 1.0000 vs a JAX encode
+# once the legacy swin residual is restored (PARITY.md); saves ~21 min of precompute
+latents_cache_train: /local00/bioinf/galletti/preprocessed_kvikio/diff_train_latents_offset80_mu_57f5caf20c1e_latents_ae327.pkl
+latents_cache_val: null
+# paired linear runs (iteration_N_Lin/FDS). run
+# ``python -m neugk_jax.dataset.preprocess --mode=linear`` first to record the pairing
+# in the trajectory metadata; without it the roots below are searched at load time.
+raw_root: /restricteddata/ukaea/gyrokinetics/raw
+linear_roots: null
+# false = feed the semispectral field as GKW wrote it: the encoder never
+# reconstructs, so the kx/ky inversion is wasted work (and spectral is the
+# project's binding requirement); reads data/linear_k.bin
+linear_to_real: false
+linear_separate_zf: false     # zf-vs-rest is a real-space split; ky=0 IS the zonal mode here
+# global (2, nky) RMS profile pooled over the whole training split (re/im x ky), from the
+# per-trajectory moments in the metadata; the val split inherits the training profile
+linear_normalize: cky
+# optionally also divide each field by its own RMS first (the FDS amplitude spans 28x
+# across trajectories, mostly conventional); off = keep cross-trajectory amplitude
+linear_rescale_per_traj: false
+linear_preload: true          # ~89 MB fp32 per trajectory (x2 with separate_zf), one per trajectory
+linear_cache_size: null       # cap the cache (FIFO) when host RAM is tight
+linear_dtype: float32         # float16 halves the cache; the runner still feeds the model fp32
+# hold one copy of each field on the GPU (the field is constant per trajectory,
+# so a per-step host->device copy costs ~117 ms at batch 16 / group 4 for nothing)
+linear_device_cache: true
+# same for the AE latents (13 GB): a per-sample host gather is ~1 ms/sample
+latents_device_cache: true
+linear_workers: 8
+linear_required: true

@@ -11,6 +11,8 @@ Usage::
 
     python main.py workflow=ae training.n_epochs=1
     python main.py workflow=diffusion ae_checkpoint=/path/to/ae.eqx
+    python main.py workflow=diffusion_lincond dataset=cyclone_lincond \\
+        model=diff/lincond_dit ae_checkpoint=/path/to/ae.pth
 """
 
 from __future__ import annotations
@@ -33,8 +35,12 @@ def dispatch_runner(cfg: DictConfig) -> None:
         from neugk_jax.autoencoders.runner import AERunner
         AERunner(cfg, output_path=cfg.output_path)()
     elif base == "diffusion":
-        from neugk_jax.diffusion.runner import FlowMatchingRunner
-        FlowMatchingRunner(cfg, output_path=cfg.output_path)()
+        if workflow == "diffusion_lincond":     # conditioning = paired linear-run field
+            from neugk_jax.diffusion.runner_lincond import LinearCondFlowMatchingRunner
+            LinearCondFlowMatchingRunner(cfg, output_path=cfg.output_path)()
+        else:
+            from neugk_jax.diffusion.runner import FlowMatchingRunner
+            FlowMatchingRunner(cfg, output_path=cfg.output_path)()
     elif base == "gyroswin":
         from neugk_jax.gyroswin import GyroSwinRunner
         GyroSwinRunner(cfg, output_path=cfg.output_path)()

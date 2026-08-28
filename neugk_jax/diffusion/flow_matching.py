@@ -39,9 +39,9 @@ def sample_time(key, batch: int, dtype=jnp.float32):
 def minibatch_ot(x0: jnp.ndarray, x1: jnp.ndarray) -> jnp.ndarray:
     """Optimal-transport coupling of ``x0`` and ``x1`` across the batch axis.
 
-    Uses scipy's Hungarian algorithm via a host callback — fine for the
-    small batch sizes flow matching typically uses (upstream torch does
-    the same scipy call).
+    Uses scipy's Hungarian algorithm via ``jax.pure_callback``, so the coupling
+    also works inside a jit'd training step — fine for the small batch sizes flow
+    matching typically uses (upstream torch does the same scipy call).
 
     Bug fix vs upstream: ``scipy.optimize.linear_sum_assignment`` returns
     ``(row_ind, col_ind)`` where ``row_ind`` is always the identity
@@ -52,15 +52,21 @@ def minibatch_ot(x0: jnp.ndarray, x1: jnp.ndarray) -> jnp.ndarray:
     returned ``x0_new[i]`` is the OT-match for the original ``x1[i]``,
     which is ``x0[argsort(col_ind)]``.
     """
-    import scipy.optimize
     bs = x0.shape[0]
     x0_flat = x0.reshape(bs, -1)
     x1_flat = x1.reshape(bs, -1)
-    cost = jnp.linalg.norm(x0_flat[:, None, :] - x1_flat[None, :, :], axis=-1)
-    cost_np = np.asarray(cost)
-    _, col = scipy.optimize.linear_sum_assignment(cost_np)
-    perm = np.argsort(col)
-    return x0[jnp.asarray(perm)]
+    # ||a-b||^2 = |a|^2 + |b|^2 - 2a.b: one gemm, no (B, B, D) intermediate
+    sq0 = jnp.sum(x0_flat ** 2, axis=-1)
+    sq1 = jnp.sum(x1_flat ** 2, axis=-1)
+    cost = jnp.sqrt(jnp.maximum(sq0[:, None] + sq1[None, :] - 2.0 * (x0_flat @ x1_flat.T), 0.0))
+
+    def _assign(cost_np):
+        import scipy.optimize
+        _, col = scipy.optimize.linear_sum_assignment(np.asarray(cost_np))
+        return np.argsort(col).astype(np.int32)
+
+    perm = jax.pure_callback(_assign, jax.ShapeDtypeStruct((bs,), jnp.int32), cost)
+    return x0[perm]
 
 
 def fm_forward_loss(
@@ -118,6 +124,39 @@ def fm_forward_loss(
     return loss
 
 
+def _euler_step(velocity, x, ti, dti):
+    return velocity(x, ti) * dti
+
+
+def _midpoint_step(velocity, x, ti, dti):
+    k1 = velocity(x, ti)
+    return velocity(x + 0.5 * dti * k1, ti + 0.5 * dti) * dti
+
+
+def _heun_step(velocity, x, ti, dti):
+    """Explicit trapezoid: exact for a velocity field that is linear along the path."""
+    k1 = velocity(x, ti)
+    k2 = velocity(x + dti * k1, ti + dti)
+    return 0.5 * dti * (k1 + k2)
+
+
+def _rk4_step(velocity, x, ti, dti):
+    k1 = velocity(x, ti)
+    k2 = velocity(x + 0.5 * dti * k1, ti + 0.5 * dti)
+    k3 = velocity(x + 0.5 * dti * k2, ti + 0.5 * dti)
+    k4 = velocity(x + dti * k3, ti + dti)
+    return (dti / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+
+_STEPPERS = {
+    "euler": _euler_step,
+    "midpoint": _midpoint_step,
+    "heun": _heun_step,
+    "rk4": _rk4_step,
+}
+NFE_PER_STEP = {"euler": 1, "midpoint": 2, "heun": 2, "rk4": 4}
+
+
 def euler_sample(
     model_fn: Callable,
     *,
@@ -129,8 +168,12 @@ def euler_sample(
     dtype=jnp.float32,
     prior_fn: Optional[Callable] = None,
     time_warp: float = 1.0,
+    method: str = "euler",
 ) -> jnp.ndarray:
-    """Integrate the velocity field over ``[0, 1]`` with Euler steps.
+    """Integrate the velocity field over ``[0, 1]``.
+
+    ``method`` selects the explicit scheme (``euler``, ``midpoint``, ``heun``, ``rk4``); compare
+    schemes at matched NFE via :data:`NFE_PER_STEP`, not at matched step count.
 
     Fused as a single ``jax.lax.scan`` so the whole sampling roll-out is
     one jit'd kernel — avoids the per-step host-device sync the previous
@@ -148,17 +191,18 @@ def euler_sample(
     ts = t_grid[:-1]
 
     if cond is not None:
-        def step(x, ti_dti):
-            ti, dti = ti_dti
-            t = jnp.full((bs,), ti, dtype=dtype)
-            v = jax.vmap(model_fn)(x, t, cond)
-            return x + v * dti, None
+        def velocity(x, ti):
+            return jax.vmap(model_fn)(x, jnp.full((bs,), ti, dtype=dtype), cond)
     else:
-        def step(x, ti_dti):
-            ti, dti = ti_dti
-            t = jnp.full((bs,), ti, dtype=dtype)
-            v = jax.vmap(model_fn)(x, t)
-            return x + v * dti, None
+        def velocity(x, ti):
+            return jax.vmap(model_fn)(x, jnp.full((bs,), ti, dtype=dtype))
+
+    increment = _STEPPERS[method]
+
+    def step(x, ti_dti):
+        ti, dti = ti_dti
+        return x + increment(velocity, x, ti, dti), None
 
     x, _ = jax.lax.scan(step, x0, (ts, dts))
     return x / latent_scale
+

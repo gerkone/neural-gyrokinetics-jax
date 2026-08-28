@@ -138,6 +138,7 @@ class SwinBlock(eqx.Module):
     window_size: tuple[int, ...] = eqx.field(static=True)
     shift_size: tuple[int, ...] = eqx.field(static=True)
     attn_mask: Optional[jax.Array]
+    legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -148,6 +149,7 @@ class SwinBlock(eqx.Module):
         *,
         key,
         shift: bool = False,
+        legacy_double_shortcut: bool = False,
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
@@ -184,6 +186,7 @@ class SwinBlock(eqx.Module):
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
+        self.legacy_double_shortcut = legacy_double_shortcut
 
     def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
         """SwinV2 post-norm forward (single residual, upstream fix e79b021).
@@ -196,10 +199,9 @@ class SwinBlock(eqx.Module):
         * ``forward_part2`` runs ``mlp`` then drop_path then ``norm2``;
           combined as ``x_res1 + norm2(dp(mlp(x_res1)))``.
 
-        NOTE: torch checkpoints trained before e79b021 (all neurips26 ones)
-        used a doubled residual (``2·x_res1 + mlp_out``) — deliberately not
-        supported anymore; translated legacy checkpoints will not reproduce
-        their training-time outputs (see PARITY.md).
+        ``legacy_double_shortcut=True`` restores the pre-e79b021 topology
+        (``2·x_res1 + mlp_out``) that every neurips26 torch checkpoint was
+        trained with — required to reproduce their training-time outputs.
         """
         spatial = x.shape[:-1]
         shortcut = x  # upstream self.skip is Identity (dim_out == dim)
@@ -226,6 +228,8 @@ class SwinBlock(eqx.Module):
 
         mlp_out = self.norm2(self.drop_path(self.mlp(x_res1), key=key2, inference=inference))
 
+        if self.legacy_double_shortcut:
+            return 2.0 * x_res1 + mlp_out
         return x_res1 + mlp_out
 
 
@@ -242,6 +246,7 @@ class DiTSwinBlock(eqx.Module):
     window_size: tuple[int, ...] = eqx.field(static=True)
     shift_size: tuple[int, ...] = eqx.field(static=True)
     attn_mask: Optional[jax.Array]
+    legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -261,6 +266,7 @@ class DiTSwinBlock(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
     ):
         eff_w, _ = _build_partition_grid(grid_size, window_size)
         # same upstream-faithful shift rule as SwinBlock above
@@ -287,6 +293,7 @@ class DiTSwinBlock(eqx.Module):
         self.drop_path = _DropPath(drop_path)
         self.mod = DiTModulation(cond_dim, dim, key=kmod)
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
+        self.legacy_double_shortcut = legacy_double_shortcut
 
     def __call__(self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=False) -> jnp.ndarray:
         spatial = x.shape[:-1]
@@ -323,8 +330,9 @@ class DiTSwinBlock(eqx.Module):
         key1, key2 = (None, None) if key is None else jr.split(key, 2)
         x = shortcut + gate_msa * self.drop_path(h, key=key1, inference=inference)
         h2 = self.mlp(self.norm2(x) * (1.0 + scale_mlp) + shift_mlp)
-        x = x + gate_mlp * self.drop_path(h2, key=key2, inference=inference)
-        return x
+        mlp_out = gate_mlp * self.drop_path(h2, key=key2, inference=inference)
+        # pre-e79b021 upstream doubled the residual here (see SwinBlock)
+        return (2.0 * x + mlp_out) if self.legacy_double_shortcut else (x + mlp_out)
 
 
 class SwinLayer(eqx.Module):
@@ -360,6 +368,8 @@ class SwinLayer(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         norm_affine: bool = False,
+        rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
         **_unused,
     ):
         keys = jr.split(key, depth)
@@ -379,6 +389,8 @@ class SwinLayer(eqx.Module):
                 use_rpb=use_rpb,
                 gated_attention=gated_attention,
                 norm_affine=norm_affine,
+                rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
         ]
@@ -433,6 +445,7 @@ class DiTSwinLayer(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
         **_unused,
     ):
         keys = jr.split(key, depth)
@@ -453,6 +466,7 @@ class DiTSwinLayer(eqx.Module):
                 use_rpb=use_rpb,
                 gated_attention=gated_attention,
                 rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
         ]
@@ -530,6 +544,7 @@ class FilmSwinLayer(eqx.Module):
         gated_attention: bool = False,
         norm_affine: bool = False,
         rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
         **_unused,
     ):
         bkeys = jr.split(key, depth)
@@ -541,6 +556,7 @@ class FilmSwinLayer(eqx.Module):
                 act_fn=act_fn, qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
         ]

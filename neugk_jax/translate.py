@@ -11,6 +11,7 @@ Public API:
 - ``load_torch_state(.pth)`` → ``dict[str, np.ndarray]``
 - ``build_ae_from_config(cfg, key)`` → ``Swin5DAE`` (f32-forced)
 - ``build_dit_from_config(cfg, ae, key)`` → ``DiT`` (f32-forced)
+- ``build_lincond_dit_from_config(cfg, ae, key)`` → ``LinearCondDiT``
 - ``translate_ae(model, state)`` and ``translate_dit(model, state)``
 - ``load_or_translate(template, ckpt_path)`` — dispatches on suffix + template type
 """
@@ -23,6 +24,7 @@ from typing import Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 import numpy as np
 import yaml
 
@@ -47,10 +49,43 @@ def force_f32(model):
     )
 
 
+def _stub_pickle_module():
+    """``pickle`` shim whose unpickler stubs classes it cannot import.
+
+    Deepspeed-saved checkpoints pickle trainer-side objects (``LossScaler``) whose
+    module only imports with a CUDA toolchain present. We read tensors, never those
+    objects, so a placeholder class is enough to get past them.
+    """
+    import pickle
+    import types
+
+    mod = types.ModuleType("neugk_jax_stub_pickle")
+    mod.__dict__.update(pickle.__dict__)
+    mod.__name__ = "neugk_jax_stub_pickle"
+
+    class _StubUnpickler(pickle.Unpickler):
+        def find_class(self, mod_name, name):
+            try:
+                return super().find_class(mod_name, name)
+            except Exception:
+                # permissive ctor: enums/scalers are rebuilt as ``Cls(value)``
+                return type(name, (), {
+                    "__init__": lambda self, *a, **k: None,
+                    "__setstate__": lambda self, state: None,
+                })
+
+    mod.Unpickler = _StubUnpickler
+    return mod
+
+
 def load_torch_state(path: str) -> dict[str, np.ndarray]:
     """Open a torch ``.pth`` on CPU and return a flat numpy dict."""
     import torch
-    blob = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        blob = torch.load(path, map_location="cpu", weights_only=False,
+                          pickle_module=_stub_pickle_module())
     sd = blob["model_state_dict"] if isinstance(blob, dict) and "model_state_dict" in blob else blob
     if any(k.startswith("module.") for k in sd):
         sd = {k.removeprefix("module."): v for k, v in sd.items()}
@@ -204,8 +239,15 @@ def translate_gyroswin(model, torch_state, *, strict: bool = False):
 
 def build_ae_from_config(
     cfg_path: str, *, key, resolution: Optional[Sequence[int]] = None,
+    legacy_double_shortcut: Optional[bool] = None,
 ):
-    """Construct a ``Swin5DAE`` from a Hydra YAML config (upstream or local)."""
+    """Construct a ``Swin5DAE`` from a Hydra YAML config (upstream or local).
+
+    ``legacy_double_shortcut`` defaults to the config's
+    ``model.legacy_swin_shortcut``, and to True when absent: every upstream torch
+    checkpoint was trained before the e79b021 swin-shortcut fix, so its weights only
+    reproduce under the doubled residual.
+    """
     from neugk_jax.autoencoders import Swin5DAE
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
@@ -216,6 +258,8 @@ def build_ae_from_config(
     depth = vit["depth"]
     n_layers = mcfg.get("num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4)
     sep_zf = dataset.get("separate_zf", False)
+    if legacy_double_shortcut is None:
+        legacy_double_shortcut = bool(mcfg.get("legacy_swin_shortcut", True))
     return force_f32(Swin5DAE(
         space=5,
         decouple_mu=mcfg.get("decouple_mu", True),
@@ -245,6 +289,7 @@ def build_ae_from_config(
         use_rpb=vit.get("use_rpb", True),
         gated_attention=vit.get("gated_attention", False),
         norm_affine=False,
+        legacy_double_shortcut=legacy_double_shortcut,
         key=key,
     ))
 
@@ -271,10 +316,69 @@ def build_dit_from_config(cfg_path: str, ae, *, key):
     ))
 
 
+def build_lincond_dit_from_config(
+    cfg_path: str, ae, *, key,
+    resolution: Optional[Sequence[int]] = None,
+    in_channels: Optional[int] = None,
+):
+    """Construct a ``LinearCondDiT`` (+ its field encoder) matching a config + AE."""
+    from neugk_jax.diffusion.lincond_dit import LinearCondDiT, LinearFieldEncoder
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f)
+    mcfg = cfg["model"]
+    vit = mcfg["vit"]
+    ecfg = mcfg.get("linear_encoder", {}) or {}
+    dataset = cfg.get("dataset", {}) or {}
+    base_resolution = resolution or dataset.get("resolution") or (32, 8, 16, 85, 32)
+    sep_zf = dataset.get("linear_separate_zf")
+    if sep_zf is None:
+        sep_zf = dataset.get("separate_zf", False)
+    channels = in_channels or 2 * (2 if sep_zf else 1)
+    k_enc, k_dit = jr.split(key, 2)
+    encoder = LinearFieldEncoder(
+        base_resolution=list(base_resolution),
+        in_channels=channels,
+        patch_size=ecfg.get("patch_size", [4, 0, 4, 5, 4]),
+        window_size=ecfg.get("window_size", [4, 0, 4, 9, 4]),
+        dim=ecfg.get("dim", 256),
+        depth=ecfg.get("depth", [2, 2]),
+        num_heads=ecfg.get("num_heads", [8, 8]),
+        code_dim=ecfg.get("code_dim", 256),
+        num_layers=ecfg.get("num_layers", 2),
+        decouple_mu=ecfg.get("decouple_mu", True),
+        c_multiplier=int(ecfg.get("c_multiplier", 1)),
+        pool=ecfg.get("pool", "max"),
+        drop_path=ecfg.get("drop_path", 0.0),
+        mlp_ratio=ecfg.get("mlp_ratio", 2.0),
+        merging_depth=ecfg.get("merging_depth", 2),
+        merging_hidden_ratio=ecfg.get("merging_hidden_ratio", 1.0),
+        qkv_bias=ecfg.get("qkv_bias", False),
+        qk_norm=ecfg.get("qk_norm", True),
+        use_rpb=ecfg.get("use_rpb", True),
+        gated_attention=ecfg.get("gated_attention", True),
+        key=k_enc,
+    )
+    grid = tuple(ae.bottleneck_grid_size)
+    return force_f32(LinearCondDiT(
+        space=len(grid),
+        z_dim=int(ae.bottleneck_dim),
+        dim=mcfg["latent_dim"],
+        grid_size=grid,
+        depth=vit["depth"],
+        num_heads=vit["num_heads"],
+        linear_encoder=encoder,
+        cond_mode=mcfg.get("cond_mode", "adaln"),
+        key=k_dit,
+        mlp_ratio=vit.get("mlp_ratio", 2.0),
+        drop_path=vit.get("drop_path", 0.1),
+    ))
+
+
 def load_or_translate(template, ckpt_path: str):
     """``.eqx`` → load; ``.pth`` → on-the-fly translate. Returns the model."""
     from neugk_jax.training.checkpoint import load_model_only
     from neugk_jax.diffusion.dit import DiT
+    from neugk_jax.diffusion.lincond_dit import LinearCondDiT
     from neugk_jax.gyroswin.models.gyroswin import GyroSwinMultitask
 
     if ckpt_path.endswith(".eqx"):
@@ -282,7 +386,7 @@ def load_or_translate(template, ckpt_path: str):
     state = load_torch_state(ckpt_path)
     if isinstance(template, GyroSwinMultitask):
         fn = translate_gyroswin
-    elif isinstance(template, DiT):
+    elif isinstance(template, (DiT, LinearCondDiT)):
         fn = translate_dit
     else:
         fn = translate_ae

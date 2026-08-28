@@ -171,6 +171,10 @@ class DataBackend(ABC):
     @abstractmethod
     def read_phi(self, f: Any, timestamp: str, shape: Sequence[int]) -> np.ndarray: ...
 
+    def read_field(self, f: Any, name: str, shape: Sequence[int]) -> np.ndarray:
+        """Read an arbitrary named ``data/<name>.bin`` shard (no timestep index)."""
+        raise NotImplementedError
+
 
 class NumpyBackend(DataBackend):
     """Plain numpy reader for the per-timestep .bin layout.
@@ -309,6 +313,10 @@ class NumpyBackend(DataBackend):
 
     def read_phi(self, f_dir: str, timestamp: str, shape: Sequence[int]) -> np.ndarray:
         fp = os.path.join(f_dir, "data", f"poten_{timestamp}.bin")
+        return self._read_dtyped(fp, tuple(shape))
+
+    def read_field(self, f_dir: str, name: str, shape: Sequence[int]) -> np.ndarray:
+        fp = name if os.path.isabs(name) else os.path.join(f_dir, "data", f"{name}.bin")
         return self._read_dtyped(fp, tuple(shape))
 
 
@@ -458,6 +466,10 @@ class KvikIOBackend(NumpyBackend):
 
     def read_phi(self, f_dir: str, timestamp: str, shape: Sequence[int]):
         fp = os.path.join(f_dir, "data", f"poten_{timestamp}.bin")
+        return self._read(fp, tuple(shape))
+
+    def read_field(self, f_dir: str, name: str, shape: Sequence[int]):
+        fp = name if os.path.isabs(name) else os.path.join(f_dir, "data", f"{name}.bin")
         return self._read(fp, tuple(shape))
 
 

@@ -10,3 +10,5 @@ defaults:
 workflow: ae
 seed: 0
 output_path: null
+# diffusion workflows load a frozen AE from here (.eqx, or an upstream torch .pth)
+ae_checkpoint: null

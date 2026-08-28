@@ -47,10 +47,13 @@ class DiffusionEvaluator(BaseEvaluator):
         autoencoder: Any,
         sample_fn: Callable,
         is_rank0: bool = True,
+        cond_field: str = "conditioning",
     ):
         super().__init__(cfg, val_ds=val_ds, is_rank0=is_rank0)
         self.autoencoder = autoencoder
         self.sample_fn = sample_fn
+        # which CycloneSample field carries the conditioning ("linear" for LinearCondDiT)
+        self.cond_field = cond_field
 
     def __call__(
         self,
@@ -105,11 +108,8 @@ class DiffusionEvaluator(BaseEvaluator):
             while len(sel) < batch_size:
                 sel.append(sel[-1])
             samples = [ds[i] for i in sel]
-            cond = (
-                jnp.stack([jnp.asarray(s.conditioning) for s in samples])
-                if samples[0].conditioning is not None
-                else None
-            )
+            cond_vals = [getattr(s, self.cond_field) for s in samples]
+            cond = jnp.stack([jnp.asarray(c) for c in cond_vals]) if cond_vals[0] is not None else None
             df_tgt = jnp.stack([jnp.asarray(s.df) for s in samples])
             tgt_avg_flux = np.asarray([float(s.avg_flux) for s in samples])
             file_idx = np.asarray([int(s.file_index) for s in samples])
@@ -229,6 +229,20 @@ class DiffusionEvaluator(BaseEvaluator):
             metrics["avg_flux_rmse"] = float(
                 np.sqrt(np.mean((pred_means - tgt_vals) ** 2))
             )
+            # the per-trajectory table used to exist only inside the PNG
+            for t, pm, ps, gt in zip(traj_ids_sorted, pred_means, pred_stds, tgt_vals):
+                metrics[f"avg_flux_pred/{t}"] = float(pm)
+                metrics[f"avg_flux_std/{t}"] = float(ps)
+                metrics[f"avg_flux_gt/{t}"] = float(gt)
+            if len(tgt_vals) > 2:
+                # a compressed conditional mean still correlates well, so report the slope
+                c = float(np.corrcoef(pred_means, tgt_vals)[0, 1])
+                var = float(np.var(pred_means))
+                metrics["avg_flux_corr"] = c
+                metrics["avg_flux_slope"] = float(
+                    np.cov(pred_means, tgt_vals)[0, 1] / var) if var > 0 else float("nan")
+                metrics["avg_flux_rel_mae"] = float(
+                    np.mean(np.abs(pred_means - tgt_vals) / np.maximum(tgt_vals, 1e-9)))
             val_plots["avg_flux_UQ"] = avg_flux_confidence(
                 pred_means, pred_stds, tgt_vals, traj_ids_sorted, to_wandb=True,
             )

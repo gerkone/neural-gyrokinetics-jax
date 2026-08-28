@@ -17,19 +17,26 @@ import numpy as np
 import optax
 
 from neugk_jax.autoencoders.swin5d_ae import Swin5DAE
-from neugk_jax.dataset import CycloneDataset, NumpyBackend, precompute_latents
+from neugk_jax.dataset import CycloneDataset, KvikIOBackend, NumpyBackend, precompute_latents
+from neugk_jax.diffusion.latents import load_precomputed_latents
 from neugk_jax.diffusion.flow_matching import (
     euler_sample,
     fm_forward_loss,
 )
 from neugk_jax.diffusion.dit import DiT
-from neugk_jax.training.checkpoint import load_model_only
 from neugk_jax.training.runner import BaseRunner
 from neugk_jax.training.schedulers import warmup_cosine
+from neugk_jax.translate import force_f32
 
 
 class FlowMatchingRunner(BaseRunner):
     """Trains a DiT to model the latent distribution via flow matching."""
+
+    dataset_cls = CycloneDataset
+
+    def _dataset_kwargs(self) -> dict:
+        """Extra kwargs for ``dataset_cls`` — subclass hook."""
+        return {}
 
     def setup_data(self) -> None:
         cfg = self.cfg
@@ -44,32 +51,45 @@ class FlowMatchingRunner(BaseRunner):
         if ae_path is None:
             raise ValueError("diffusion workflow requires ae_checkpoint")
         # build the AE template + load translated weights
-        from scripts.translate_ckpt import build_ae_from_config
+        from neugk_jax.translate import build_ae_from_config, load_or_translate
         ae_cfg = Path(ae_path).parent / "config.yaml"
         ae_template = build_ae_from_config(str(ae_cfg), key=jr.PRNGKey(0))
-        self.ae = load_model_only(ae_path, ae_template)
+        # .eqx loads directly; an upstream torch .pth is translated on the fly
+        self.ae = load_or_translate(ae_template, ae_path)
 
+        backend = (
+            KvikIOBackend(rank=self.dist.process_id)
+            if cfg.dataset.get("backend", "numpy") == "kvikio"
+            else NumpyBackend()
+        )
         common = dict(
             path=cfg.dataset.path,
             fields_to_load=tuple(cfg.dataset.get("input_fields", ("df",))),
             conditions=tuple(cfg.dataset.get("conditions", ("itg", "dg", "s_hat", "q"))),
             mode="ae",
-            backend=NumpyBackend(),
+            backend=backend,
             separate_zf=cfg.dataset.get("separate_zf", False),
             normalization=cfg.dataset.get("normalization"),
             normalization_scope=cfg.dataset.get("normalization_scope", "dataset"),
             normalization_stats=cfg.dataset.get("normalization_stats"),
             offset=cfg.dataset.get("offset", 0),
+            lightweight_metadata=cfg.dataset.get("lightweight_metadata", False),
         )
-        self.train_ds = CycloneDataset(
+        extra = self._dataset_kwargs()
+        # the cond filters fix the file list, hence the fid ordering a latent cache uses
+        self.train_ds = self.dataset_cls(
             split="train",
             trajectories=cfg.dataset.training_trajectories,
+            cond_filters=self._omegaconf_to_dict(cfg.dataset.get("training_cond_filters")),
             **common,
+            **extra,
         )
-        self.val_ds = CycloneDataset(
+        self.val_ds = self.dataset_cls(
             split="val",
             trajectories=cfg.dataset.validation_trajectories,
+            cond_filters=self._omegaconf_to_dict(cfg.dataset.get("eval_cond_filters")),
             **common,
+            **extra,
         )
 
         # encode every sample once so training is just MSE on cached latents
@@ -77,10 +97,16 @@ class FlowMatchingRunner(BaseRunner):
             return jax.vmap(lambda x: self.ae.encode(x)[0])(df_batch)
 
         ae_tag = Path(ae_path).stem
-        precompute_latents(self.train_ds, encode_fn=encode_fn, ae_tag=ae_tag,
-                           batch_size=cfg.training.get("precompute_batch", 2))
-        precompute_latents(self.val_ds, encode_fn=encode_fn, ae_tag=ae_tag,
-                           batch_size=cfg.training.get("precompute_batch", 2))
+        latent_shape = (*self.ae.bottleneck_grid_size, int(self.ae.bottleneck_dim))
+        for ds, key in ((self.train_ds, "latents_cache_train"), (self.val_ds, "latents_cache_val")):
+            path = cfg.dataset.get(key)
+            if path:
+                load_precomputed_latents(ds, path, latent_shape=latent_shape)
+                if self.dist.is_rank0:
+                    print(f"loaded {len(ds.precomputed_latents)} {ds.split} latents from {path}")
+            else:
+                precompute_latents(ds, encode_fn=encode_fn, ae_tag=ae_tag,
+                                   batch_size=cfg.training.get("precompute_batch", 2))
 
         # 1 / sqrt(mean variance) — matches the upstream latent_scale
         var = self.train_ds.latent_stats.var
@@ -107,6 +133,7 @@ class FlowMatchingRunner(BaseRunner):
             mlp_ratio=mcfg.vit.get("mlp_ratio", 4.0),
             drop_path=mcfg.vit.get("drop_path", 0.0),
         )
+        self.model = force_f32(self.model)
         steps_per_epoch = max(1, len(self.train_ds) // cfg.training.batch_size)
         total = cfg.training.n_epochs * steps_per_epoch
         self.schedule = warmup_cosine(

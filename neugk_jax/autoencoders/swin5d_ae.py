@@ -71,6 +71,7 @@ class Swin5DAE(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         norm_affine: bool = False,
+        legacy_double_shortcut: bool = False,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -100,6 +101,7 @@ class Swin5DAE(eqx.Module):
             qkv_bias=qkv_bias, qk_norm=qk_norm,
             use_rpb=use_rpb, gated_attention=gated_attention,
             norm_affine=norm_affine,
+            legacy_double_shortcut=legacy_double_shortcut,
             rms_norm=True,  # upstream config uses RMSNorm
             # AE has no encoder→decoder skips
             up_use_skip=False,

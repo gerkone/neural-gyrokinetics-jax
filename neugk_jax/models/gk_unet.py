@@ -67,6 +67,7 @@ class SwinBlockDown(eqx.Module):
         rms_norm: bool = False,
         cond_dim: Optional[int] = None,
         cond_mode: str = "dit",
+        legacy_double_shortcut: bool = False,
     ):
         k1, k2, _ = jr.split(key, 3)
         self.pos_embed = APE(dim, grid_size, init="sincos") if use_abs_pe else None
@@ -80,6 +81,7 @@ class SwinBlockDown(eqx.Module):
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
         elif self.use_cond:
             self.swin = DiTSwinLayer(
@@ -90,6 +92,7 @@ class SwinBlockDown(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
         else:
             self.swin = SwinLayer(
@@ -100,6 +103,7 @@ class SwinBlockDown(eqx.Module):
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
         self.downsample = PatchMerge(
             dim, grid_size, key=k2, c_multiplier=c_multiplier, rms_norm=rms_norm,
@@ -156,6 +160,7 @@ class SwinBlockUp(eqx.Module):
         rms_norm: bool = False,
         cond_dim: Optional[int] = None,
         cond_mode: str = "dit",
+        legacy_double_shortcut: bool = False,
     ):
         k1, k2, k3 = jr.split(key, 3)
         if use_skip:
@@ -182,6 +187,7 @@ class SwinBlockUp(eqx.Module):
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=up_rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
         elif self.use_cond:
             self.swin = DiTSwinLayer(
@@ -192,6 +198,7 @@ class SwinBlockUp(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=up_rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
         else:
             self.swin = SwinLayer(
@@ -202,6 +209,7 @@ class SwinBlockUp(eqx.Module):
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=up_rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
         if mode == LayerModes.UPSAMPLE:
             self.upsample = PatchExpand(
@@ -296,6 +304,7 @@ class SwinNDUnet(eqx.Module):
         up_use_skip: bool = True,
         cond_dim: Optional[int] = None,
         cond_mode: str = "dit",
+        legacy_double_shortcut: bool = False,
         n_cond: int = 0,
         cond_embed_dim: int = 128,
         middle_swin: bool = False,
@@ -348,6 +357,7 @@ class SwinNDUnet(eqx.Module):
                 use_rpb=use_rpb, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=rms_norm,
                 cond_dim=cond_dim, cond_mode=cond_mode,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             ki += 1
             down_blocks.append(blk)
@@ -369,6 +379,7 @@ class SwinNDUnet(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm, use_rpb=use_rpb,
                 gated_attention=gated_attention, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
         elif middle_swin:
             self.middle = FilmSwinLayer(
@@ -378,6 +389,7 @@ class SwinNDUnet(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm, use_rpb=use_rpb,
                 gated_attention=gated_attention, norm_affine=norm_affine, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
         else:
             self.middle = ViTLayer(
@@ -407,6 +419,7 @@ class SwinNDUnet(eqx.Module):
             use_rpb=use_rpb, gated_attention=gated_attention,
             norm_affine=norm_affine, use_skip=up_use_skip,
             rms_norm=rms_norm, cond_dim=cond_dim, cond_mode=cond_mode,
+            legacy_double_shortcut=legacy_double_shortcut,
         )
         for i in range(num_layers - 1):
             up_blocks.append(
