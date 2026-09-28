@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 
 def dispatch_runner(cfg: DictConfig) -> None:
@@ -55,6 +55,10 @@ def main(cfg: DictConfig) -> None:
         cfg.output_path = str(Path(cfg.output_path) / date_and_time)
     Path(cfg.output_path).mkdir(parents=True, exist_ok=True)
 
+    # jax-trained models use the corrected swin residual; record it so rebuilds from config agree
+    if cfg.get("model") is not None and cfg.model.get("legacy_swin_shortcut") is None:
+        with open_dict(cfg):
+            cfg.model.legacy_swin_shortcut = False
     OmegaConf.save(cfg, Path(cfg.output_path) / "config.yaml")
     print("#" * 88)
     print("Starting neugk-jax with configs:")

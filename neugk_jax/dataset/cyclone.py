@@ -248,7 +248,7 @@ class CycloneDataset:
         self.length = flat
 
         # resolution: assume same across files
-        self.resolution = tuple(self.metadata[0]["resolution"])
+        self.resolution = tuple(int(r) for r in self.metadata[0]["resolution"])
         self.df_shape = (2, *self.resolution)
         self.phi_resolution = (self.resolution[3], self.resolution[2], self.resolution[4])
 
