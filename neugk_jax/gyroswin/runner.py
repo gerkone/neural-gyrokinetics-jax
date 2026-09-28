@@ -6,22 +6,18 @@ yet (pushforward unrolls, Muon optimizer, GradientBalancer, baseline models).
 
 from __future__ import annotations
 
-import math
-from typing import Any
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import optax
-from tqdm import tqdm
 
 from neugk_jax.dataset import CycloneDataset, KvikIOBackend, NumpyBackend
 from neugk_jax.gyroswin.models import build_gyroswin_from_config
 from neugk_jax.training.loss_scheduler import (
-    build_scheduler_dict, compute_multi_task_loss,
+    build_scheduler_dict,
+    compute_multi_task_loss,
 )
-from neugk_jax.training.runner import BaseRunner
+from neugk_jax.training.runner import BaseRunner, build_optimizer
 from neugk_jax.training.schedulers import warmup_cosine
 
 
@@ -69,12 +65,17 @@ class GyroSwinRunner(BaseRunner):
         # build expects a {"model": ..., "dataset": ...} layout
         cfg_d.setdefault("dataset", cfg_d.get("dataset", {}))
         cfg_d["dataset"].setdefault("resolution", list(self.train_ds.resolution))
-        import yaml
         import tempfile
+
+        import yaml
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             yaml.safe_dump({"model": cfg_d["model"], "dataset": cfg_d["dataset"]}, f)
             tmp_cfg = f.name
-        self.model = build_gyroswin_from_config(tmp_cfg, key=jr.PRNGKey(getattr(cfg, "seed", 0)))
+        # a jax-trained model uses the corrected residual unless the config says otherwise
+        self.model = build_gyroswin_from_config(
+            tmp_cfg, key=jr.PRNGKey(getattr(cfg, "seed", 0)),
+            legacy_double_shortcut=cfg.model.get("legacy_swin_shortcut", False),
+        )
 
         steps_per_epoch = max(1, len(self.train_ds) // cfg.training.batch_size)
         total = cfg.training.n_epochs * steps_per_epoch
@@ -83,12 +84,7 @@ class GyroSwinRunner(BaseRunner):
             steps_per_epoch=steps_per_epoch, n_epochs=cfg.training.n_epochs,
             min_lr=cfg.training.get("final_learning_rate", 1e-6),
         )
-        wd = cfg.training.get("weight_decay", 0.0)
-        opt = optax.chain(
-            optax.clip_by_global_norm(cfg.training.get("clip_to", 1.0))
-            if cfg.training.get("clip_grad", True) else optax.identity(),
-            optax.adamw(self.schedule, weight_decay=wd) if wd > 0 else optax.adam(self.schedule),
-        )
+        opt = build_optimizer(self.schedule, cfg.training, self.model, decoupled=False, b2=0.95)
         params, _ = eqx.partition(self.model, eqx.is_array)
         self.optimizer = opt
         self.opt_state = opt.init(params)
@@ -151,8 +147,8 @@ class GyroSwinRunner(BaseRunner):
         n = len(self.train_ds)
         idx = jr.permutation(key, n)
         starts = list(range(0, n - bs + 1, bs))
-        from concurrent.futures import ThreadPoolExecutor
         import time as _time
+        from concurrent.futures import ThreadPoolExecutor
 
         # only fetch geometry when the integral losses are actually active
         need_geom = any(self.loss_weights.get(k, 0.0) > 0 or k in self.loss_schedulers

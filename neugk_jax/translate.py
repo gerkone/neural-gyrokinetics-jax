@@ -26,7 +26,6 @@ import jax.numpy as jnp
 import numpy as np
 import yaml
 
-
 _LAYERS_RE = re.compile(r"\.layers\.(\d+)")
 _NON_PERSISTENT = (".attn_mask", ".rel_pos", ".rpb", ".rpb_idx", ".omega")
 _AE_DEAD = ("backbone.middle.",)
@@ -47,10 +46,43 @@ def force_f32(model):
     )
 
 
+def _stub_pickle_module():
+    """``pickle`` shim whose unpickler stubs classes it cannot import.
+
+    Deepspeed-saved checkpoints pickle trainer-side objects (``LossScaler``) whose
+    module only imports with a CUDA toolchain present. We read tensors, never those
+    objects, so a placeholder class is enough to get past them.
+    """
+    import pickle
+    import types
+
+    mod = types.ModuleType("neugk_jax_stub_pickle")
+    mod.__dict__.update(pickle.__dict__)
+    mod.__name__ = "neugk_jax_stub_pickle"
+
+    class _StubUnpickler(pickle.Unpickler):
+        def find_class(self, mod_name, name):
+            try:
+                return super().find_class(mod_name, name)
+            except Exception:
+                # permissive ctor: enums/scalers are rebuilt as ``Cls(value)``
+                return type(name, (), {
+                    "__init__": lambda self, *a, **k: None,
+                    "__setstate__": lambda self, state: None,
+                })
+
+    mod.Unpickler = _StubUnpickler
+    return mod
+
+
 def load_torch_state(path: str) -> dict[str, np.ndarray]:
     """Open a torch ``.pth`` on CPU and return a flat numpy dict."""
     import torch
-    blob = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        blob = torch.load(path, map_location="cpu", weights_only=False,
+                          pickle_module=_stub_pickle_module())
     sd = blob["model_state_dict"] if isinstance(blob, dict) and "model_state_dict" in blob else blob
     if any(k.startswith("module.") for k in sd):
         sd = {k.removeprefix("module."): v for k, v in sd.items()}
@@ -130,6 +162,11 @@ def _gyroswin_name_map(jax_name: str) -> list[str]:
     base = base.replace(".swin.", ".swin_att.")
     base = base.replace(".downsample.proj.", ".downsample.reduction.")
     base = base.replace(".gate.proj.", ".gate.gate.1.")
+    # DiT modulation (cold/warm): jax DiTModulation.proj -> torch dit.modulation
+    base = base.replace(".mod.proj.", ".dit.modulation.")
+    # SwinBlockUp / PatchExpand keep proj_concat as a single Linear; torch wraps it
+    # in an nn.Sequential, so the param sits at ``proj_concat.0.*``.
+    base = base.replace(".proj_concat.", ".proj_concat.0.")
     base = _LAYERS_RE.sub(lambda m: f".mlp.{int(m.group(1)) * 3}", base)
     return [jax_name, base]
 
@@ -164,6 +201,16 @@ def _translate(model, torch_state, name_map, *, strict: bool = False):
                         and tuple(tw.shape[1:]) == tuple(leaf.shape)):
                     replacements[name] = np.asarray(tw).squeeze(0)
                     used.add(cand); matched = True; break
+                # ConvTranspose weight: torch (in, out, *k) vs equinox (out, in, *k)
+                if (tw.ndim == leaf.ndim and tw.ndim >= 3
+                        and tuple(tw.shape) == (leaf.shape[1], leaf.shape[0], *leaf.shape[2:])):
+                    replacements[name] = np.swapaxes(np.asarray(tw), 0, 1)
+                    used.add(cand); matched = True; break
+                # ConvTranspose bias: torch (out,) vs equinox (out, 1, 1, ...)
+                if (tw.ndim == 1 and leaf.ndim > 1 and tw.shape[0] == leaf.shape[0]
+                        and int(np.prod(leaf.shape[1:])) == 1):
+                    replacements[name] = np.asarray(tw).reshape(leaf.shape)
+                    used.add(cand); matched = True; break
         if not matched and not _is_non_persistent(name) and not _is_dead_leaf(name):
             missing.append((name, tuple(leaf.shape)))
     unused = sorted(set(torch_state) - used)
@@ -189,8 +236,15 @@ def translate_gyroswin(model, torch_state, *, strict: bool = False):
 
 def build_ae_from_config(
     cfg_path: str, *, key, resolution: Optional[Sequence[int]] = None,
+    legacy_double_shortcut: Optional[bool] = None,
 ):
-    """Construct a ``Swin5DAE`` from a Hydra YAML config (upstream or local)."""
+    """Construct a ``Swin5DAE`` from a Hydra YAML config (upstream or local).
+
+    ``legacy_double_shortcut`` defaults to the config's
+    ``model.legacy_swin_shortcut``, and to True when absent: every upstream torch
+    checkpoint was trained before the e79b021 swin-shortcut fix, so its weights only
+    reproduce under the doubled residual.
+    """
     from neugk_jax.autoencoders import Swin5DAE
     with open(cfg_path) as f:
         cfg = yaml.safe_load(f)
@@ -201,6 +255,8 @@ def build_ae_from_config(
     depth = vit["depth"]
     n_layers = mcfg.get("num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4)
     sep_zf = dataset.get("separate_zf", False)
+    if legacy_double_shortcut is None:
+        legacy_double_shortcut = bool(mcfg.get("legacy_swin_shortcut", True))
     return force_f32(Swin5DAE(
         space=5,
         decouple_mu=mcfg.get("decouple_mu", True),
@@ -230,6 +286,7 @@ def build_ae_from_config(
         use_rpb=vit.get("use_rpb", True),
         gated_attention=vit.get("gated_attention", False),
         norm_affine=False,
+        legacy_double_shortcut=legacy_double_shortcut,
         key=key,
     ))
 
@@ -258,9 +315,9 @@ def build_dit_from_config(cfg_path: str, ae, *, key):
 
 def load_or_translate(template, ckpt_path: str):
     """``.eqx`` → load; ``.pth`` → on-the-fly translate. Returns the model."""
-    from neugk_jax.training.checkpoint import load_model_only
     from neugk_jax.diffusion.dit import DiT
     from neugk_jax.gyroswin.models.gyroswin import GyroSwinMultitask
+    from neugk_jax.training.checkpoint import load_model_only
 
     if ckpt_path.endswith(".eqx"):
         return load_model_only(ckpt_path, template)

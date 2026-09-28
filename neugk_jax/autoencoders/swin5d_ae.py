@@ -10,13 +10,12 @@ from __future__ import annotations
 from typing import Callable, Optional, Sequence
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 
 from neugk_jax.models.gk_unet import Swin5DUnet
-from neugk_jax.models.utils import LayerNorm, Linear, gelu
 from neugk_jax.models.patching import PatchExpand
+from neugk_jax.models.utils import LayerNorm, Linear, gelu
 from neugk_jax.models.vit import ViTLayer
 
 
@@ -71,6 +70,7 @@ class Swin5DAE(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         norm_affine: bool = False,
+        legacy_double_shortcut: bool = False,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -100,6 +100,7 @@ class Swin5DAE(eqx.Module):
             qkv_bias=qkv_bias, qk_norm=qk_norm,
             use_rpb=use_rpb, gated_attention=gated_attention,
             norm_affine=norm_affine,
+            legacy_double_shortcut=legacy_double_shortcut,
             rms_norm=True,  # upstream config uses RMSNorm
             # AE has no encoder→decoder skips
             up_use_skip=False,
@@ -166,7 +167,6 @@ class Swin5DAE(eqx.Module):
     def decode(self, z: jnp.ndarray, pad_axes=None):
         if pad_axes is None:
             # reconstruct pad_axes from the base resolution
-            from neugk_jax.models.patching import pad_to_blocks
             dummy = jnp.zeros((self.backbone.original_in_channels, *self.backbone.full_resolution))
             _, pad_axes = self.backbone.patch_encode(dummy)
         if self.normalized_latent:

@@ -11,8 +11,8 @@ import jax.random as jr
 import numpy as np
 
 from neugk_jax.models.attention import MultiHeadSelfAttention
-from neugk_jax.models.utils import MLP, LayerNorm, RMSNorm, DiTModulation, gelu
 from neugk_jax.models.patching import pad_to_blocks, unpad
+from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, Linear, RMSNorm, gelu
 
 
 def _prod(xs):
@@ -138,6 +138,7 @@ class SwinBlock(eqx.Module):
     window_size: tuple[int, ...] = eqx.field(static=True)
     shift_size: tuple[int, ...] = eqx.field(static=True)
     attn_mask: Optional[jax.Array]
+    legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -148,6 +149,7 @@ class SwinBlock(eqx.Module):
         *,
         key,
         shift: bool = False,
+        legacy_double_shortcut: bool = False,
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
@@ -184,22 +186,22 @@ class SwinBlock(eqx.Module):
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
+        self.legacy_double_shortcut = legacy_double_shortcut
 
     def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
-        """SwinV2 post-norm forward with upstream's doubled residual.
+        """SwinV2 post-norm forward (single residual, upstream fix e79b021).
 
-        Mirrors ``neugk/models/nd_vit/swin_layers.py:SwinTransformerBlock.forward``:
+        Mirrors ``neugk/models/nd_vit/swin_layers.py:SwinTransformerBlock.forward``
+        at HEAD:
 
         * ``forward_part1`` runs attention on the un-normed input and
           applies ``norm1`` to the result (post-norm).
-        * ``forward_part2`` runs ``mlp`` then drop_path then ``norm2``.
-        * The combine pattern is::
+        * ``forward_part2`` runs ``mlp`` then drop_path then ``norm2``;
+          combined as ``x_res1 + norm2(dp(mlp(x_res1)))``.
 
-              x_res1 = shortcut + dp(norm1(attn_part(x)))
-              out    = x_res1 + (x_res1 + norm2(dp(mlp(x_res1))))
-                     = 2 * x_res1 + norm2(dp(mlp(x_res1)))
-
-          — i.e. the residual_1 input is accumulated *twice*.
+        ``legacy_double_shortcut=True`` restores the pre-e79b021 topology
+        (``2·x_res1 + mlp_out``) that every neurips26 torch checkpoint was
+        trained with — required to reproduce their training-time outputs.
         """
         spatial = x.shape[:-1]
         shortcut = x  # upstream self.skip is Identity (dim_out == dim)
@@ -226,7 +228,9 @@ class SwinBlock(eqx.Module):
 
         mlp_out = self.norm2(self.drop_path(self.mlp(x_res1), key=key2, inference=inference))
 
-        return x_res1 + x_res1 + mlp_out
+        if self.legacy_double_shortcut:
+            return 2.0 * x_res1 + mlp_out
+        return x_res1 + mlp_out
 
 
 class DiTSwinBlock(eqx.Module):
@@ -256,6 +260,11 @@ class DiTSwinBlock(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        use_rpb: bool = False,
+        gated_attention: bool = False,
+        rms_norm: bool = False,
     ):
         eff_w, _ = _build_partition_grid(grid_size, window_size)
         # same upstream-faithful shift rule as SwinBlock above
@@ -267,10 +276,16 @@ class DiTSwinBlock(eqx.Module):
         self.window_size = eff_w
         self.shift_size = shift_size
 
-        self.norm1 = LayerNorm(dim, elementwise_affine=False)
-        self.norm2 = LayerNorm(dim, elementwise_affine=False)
+        # DiT modulation provides scale/shift, so the norm is non-affine; the norm
+        # *type* follows the model (cold/warm use RMSNorm; torch confirms RMSNorm here).
+        _Norm = RMSNorm if rms_norm else LayerNorm
+        self.norm1 = _Norm(dim, elementwise_affine=False)
+        self.norm2 = _Norm(dim, elementwise_affine=False)
         katt, kmlp, kmod = jr.split(key, 3)
-        self.attn = MultiHeadSelfAttention(dim, num_heads, key=katt)
+        self.attn = MultiHeadSelfAttention(
+            dim, num_heads, key=katt, qkv_bias=qkv_bias, qk_norm=qk_norm,
+            use_rpb=use_rpb, gated_attention=gated_attention, window_size=eff_w,
+        )
         hidden = max(int(dim * mlp_ratio), dim)
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
@@ -312,8 +327,8 @@ class DiTSwinBlock(eqx.Module):
         key1, key2 = (None, None) if key is None else jr.split(key, 2)
         x = shortcut + gate_msa * self.drop_path(h, key=key1, inference=inference)
         h2 = self.mlp(self.norm2(x) * (1.0 + scale_mlp) + shift_mlp)
-        x = x + gate_mlp * self.drop_path(h2, key=key2, inference=inference)
-        return x
+        mlp_out = gate_mlp * self.drop_path(h2, key=key2, inference=inference)
+        return x + mlp_out
 
 
 class SwinLayer(eqx.Module):
@@ -349,6 +364,8 @@ class SwinLayer(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         norm_affine: bool = False,
+        rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
         **_unused,
     ):
         keys = jr.split(key, depth)
@@ -368,6 +385,8 @@ class SwinLayer(eqx.Module):
                 use_rpb=use_rpb,
                 gated_attention=gated_attention,
                 norm_affine=norm_affine,
+                rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
         ]
@@ -417,6 +436,12 @@ class DiTSwinLayer(eqx.Module):
         act_fn: Callable = gelu,
         norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        use_rpb: bool = False,
+        gated_attention: bool = False,
+        rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,  # no-op: torch DiT swin blocks never doubled the residual
         **_unused,
     ):
         keys = jr.split(key, depth)
@@ -432,6 +457,11 @@ class DiTSwinLayer(eqx.Module):
                 mlp_ratio=mlp_ratio,
                 drop_path=drop_path,
                 act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                rms_norm=rms_norm,
             )
             for i in range(depth)
         ]
@@ -449,4 +479,90 @@ class DiTSwinLayer(eqx.Module):
         for blk, k in zip(self.blocks, keys):
             call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
             x = call(x, condition, key=k, inference=inference)
+        return x
+
+
+class Film(eqx.Module):
+    """FiLM modulation: ``x * (scale + 1) + shift`` from a conditioning vector.
+
+    Port of ``neugk/models/layers.py:Film``. A single ``Linear(cond_dim -> 2*dim)``
+    produces (scale, shift); broadcast over all spatial/token axes. Applied to a
+    block's input *before* the block runs (see ``FilmSwinLayer``).
+    """
+
+    modulation: Linear
+
+    def __init__(self, cond_dim: int, dim: int, *, key):
+        self.modulation = Linear(cond_dim, 2 * dim, key=key)
+
+    def __call__(self, x: jnp.ndarray, cond: jnp.ndarray) -> jnp.ndarray:
+        mod = self.modulation(cond)  # (2*dim,)
+        scale, shift = jnp.split(mod, 2, axis=-1)
+        # broadcast over leading spatial/token axes of x (..., dim)
+        for _ in range(x.ndim - 1):
+            scale = scale[None, ...]
+            shift = shift[None, ...]
+        return x * (scale + 1.0) + shift
+
+
+class FilmSwinLayer(eqx.Module):
+    """``depth`` standard SwinBlocks, each preceded by a per-block FiLM modulation.
+
+    Mirrors torch ``FilmSwinLayer``: ``conditioning`` is one ``Film`` per block,
+    applied to the block input; the blocks are ordinary (unconditioned) SwinBlocks
+    so they reuse the AE-parity-verified attention/MLP path.
+    """
+
+    blocks: list[SwinBlock]
+    conditioning: list[Film]
+    dim: int = eqx.field(static=True)
+    use_checkpoint: bool = eqx.field(static=True)
+
+    def __init__(
+        self,
+        space: int,
+        dim: int,
+        depth: int,
+        num_heads: int,
+        grid_size: Sequence[int],
+        window_size: Sequence[int],
+        *,
+        key,
+        cond_dim: int,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        act_fn: Callable = gelu,
+        use_checkpoint: bool = False,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        use_rpb: bool = False,
+        gated_attention: bool = False,
+        norm_affine: bool = False,
+        rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
+        **_unused,
+    ):
+        bkeys = jr.split(key, depth)
+        fkeys = jr.split(jr.fold_in(key, 1), depth)
+        self.blocks = [
+            SwinBlock(
+                dim, num_heads, grid_size, window_size, key=bkeys[i],
+                shift=bool(i % 2), mlp_ratio=mlp_ratio, drop_path=drop_path,
+                act_fn=act_fn, qkv_bias=qkv_bias, qk_norm=qk_norm,
+                use_rpb=use_rpb, gated_attention=gated_attention,
+                norm_affine=norm_affine, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
+            )
+            for i in range(depth)
+        ]
+        self.conditioning = [Film(cond_dim, dim, key=fkeys[i]) for i in range(depth)]
+        self.dim = dim
+        self.use_checkpoint = use_checkpoint
+
+    def __call__(self, x, condition, *, key=None, inference=False, **_):
+        keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
+        for blk, film, k in zip(self.blocks, self.conditioning, keys):
+            x = film(x, condition)
+            call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
+            x = call(x, key=k, inference=inference)
         return x

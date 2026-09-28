@@ -12,12 +12,12 @@ from itertools import combinations
 from typing import Optional
 
 import matplotlib
+
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 
 from neugk_jax.utils import recombine_zf as _recombine_zf
-
 
 GK_LABELS = {
     6: [r"t", r"v_{\parallel}", r"\mu", r"s", r"k_x", r"k_y"],
@@ -39,8 +39,9 @@ def _plt_to_wandb_image(fig):
     """Convert a figure to ``wandb.Image`` (or return it unchanged if wandb is
     missing). Closes the figure to free the matplotlib resources."""
     try:
-        import wandb
         from PIL import Image as PILImage
+
+        import wandb
         buf = io.BytesIO()
         fig.savefig(buf, bbox_inches="tight", format="png", dpi=120, pad_inches=0.01)
         buf.seek(0)
@@ -189,3 +190,32 @@ def generate_val_plots(
         fig = plot_nd(x, y, cmap=cfg["cmap"])
         plots[cfg["name"]] = _plt_to_wandb_image(fig) if to_wandb else fig
     return plots
+
+
+def avg_flux_confidence(
+    pred_means: np.ndarray,
+    pred_stds: np.ndarray,
+    tgt_vals: np.ndarray,
+    traj_ids: list,
+    to_wandb: bool = True,
+):
+    """Per-trajectory flux mean ± std vs ground truth — port of
+    ``neugk.plot_utils.avg_flux_confidence``."""
+    fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
+    x_pos = np.arange(len(traj_ids))
+    ax.errorbar(
+        x_pos, pred_means, yerr=pred_stds, fmt="o", capsize=6,
+        label="Predicted (Mean ± Std)", color="#1f77b4",
+        mfc="white", mew=2, alpha=0.8,
+    )
+    ax.scatter(x_pos, tgt_vals, marker="x", s=80, color="#d62728",
+               label="Ground Truth", zorder=3)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(traj_ids, rotation=45, ha="right")
+    ax.set_xlabel("Trajectory ID", fontsize=12)
+    ax.set_ylabel("Average Flux", fontsize=12)
+    ax.set_title("Flux Prediction Accuracy across Trajectories", fontsize=14)
+    ax.set_ylim(bottom=0)
+    ax.legend(frameon=True, loc="upper right")
+    ax.grid(True, axis="y", alpha=0.3, ls="--")
+    return _plt_to_wandb_image(fig) if to_wandb else fig

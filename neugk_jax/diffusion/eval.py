@@ -19,14 +19,12 @@ import re
 from collections import defaultdict
 from typing import Any, Callable, Optional
 
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
 from neugk_jax.evaluate.base import BaseEvaluator, validation_metrics
 from neugk_jax.evaluate.plots import avg_flux_confidence, generate_val_plots
-
 
 _TRAJ_RE = re.compile(r"iteration_\d+")
 
@@ -47,10 +45,13 @@ class DiffusionEvaluator(BaseEvaluator):
         autoencoder: Any,
         sample_fn: Callable,
         is_rank0: bool = True,
+        cond_field: str = "conditioning",
     ):
         super().__init__(cfg, val_ds=val_ds, is_rank0=is_rank0)
         self.autoencoder = autoencoder
         self.sample_fn = sample_fn
+        # which CycloneSample field carries the conditioning ("linear" for LinearCondDiT)
+        self.cond_field = cond_field
 
     def __call__(
         self,
@@ -61,6 +62,7 @@ class DiffusionEvaluator(BaseEvaluator):
         n_steps: int = 50,
         n_samples_per_traj: int = 1,
         eval_integrals: bool = True,
+        eval_spectra: bool = False,
         max_batches: Optional[int] = None,
         val_subsample: int = 1,
         **kwargs,
@@ -90,6 +92,8 @@ class DiffusionEvaluator(BaseEvaluator):
         n_acc = 0.0
         per_traj_pred = defaultdict(list)
         per_traj_tgt: dict[str, float] = {}
+        # per-trajectory spectral diagnostics (zonal flow + ky/Q spectra)
+        spectra_store: dict[int, tuple] = {}
         val_plots: dict[str, Any] = {}
         key = jr.PRNGKey(epoch)
 
@@ -102,11 +106,8 @@ class DiffusionEvaluator(BaseEvaluator):
             while len(sel) < batch_size:
                 sel.append(sel[-1])
             samples = [ds[i] for i in sel]
-            cond = (
-                jnp.stack([jnp.asarray(s.conditioning) for s in samples])
-                if samples[0].conditioning is not None
-                else None
-            )
+            cond_vals = [getattr(s, self.cond_field) for s in samples]
+            cond = jnp.stack([jnp.asarray(c) for c in cond_vals]) if cond_vals[0] is not None else None
             df_tgt = jnp.stack([jnp.asarray(s.df) for s in samples])
             tgt_avg_flux = np.asarray([float(s.avg_flux) for s in samples])
             file_idx = np.asarray([int(s.file_index) for s in samples])
@@ -161,6 +162,22 @@ class DiffusionEvaluator(BaseEvaluator):
                                 continue
                             per_traj_pred[tid].append(float(eflux[b]))
                             per_traj_tgt[tid] = float(tgt_avg_flux[b])
+                        # spectral diagnostics on the denormalized pred/tgt df
+                        if eval_spectra:
+                            from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
+                            df_tgt_np = np.asarray(df_tgt)
+                            if ds.normalization is not None and hasattr(ds, "denormalize"):
+                                df_tgt_np = np.stack([
+                                    np.asarray(ds.denormalize(int(file_idx[b]),
+                                                              df=df_tgt_np[b]))
+                                    for b in range(batch_size)
+                                ])
+                            if not accumulate_spectral_diagnostics(
+                                spectra_store, df_pred_np, df_tgt_np, file_idx, ds,
+                            ):
+                                if self.is_rank0:
+                                    print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
+                                eval_spectra = False
                     except Exception as e:
                         if batch_idx == 0:
                             print(f"[evaluate] gyaradax flux-integral failed: {e}")
@@ -196,6 +213,11 @@ class DiffusionEvaluator(BaseEvaluator):
         running, n_acc = self._sync(running, n_acc)
         metrics = self._finalize(running, n_acc)
 
+        # time-averaged spectral metrics, mean over trajectories
+        if spectra_store:
+            from neugk_jax.evaluate.metrics import merged_spectral_metrics
+            metrics.update(merged_spectral_metrics(spectra_store))
+
         # per-trajectory flux RMSE + UQ scatter
         if per_traj_pred and self.is_rank0:
             traj_ids_sorted = sorted(per_traj_pred.keys())
@@ -205,6 +227,20 @@ class DiffusionEvaluator(BaseEvaluator):
             metrics["avg_flux_rmse"] = float(
                 np.sqrt(np.mean((pred_means - tgt_vals) ** 2))
             )
+            # the per-trajectory table used to exist only inside the PNG
+            for t, pm, ps, gt in zip(traj_ids_sorted, pred_means, pred_stds, tgt_vals):
+                metrics[f"avg_flux_pred/{t}"] = float(pm)
+                metrics[f"avg_flux_std/{t}"] = float(ps)
+                metrics[f"avg_flux_gt/{t}"] = float(gt)
+            if len(tgt_vals) > 2:
+                # a compressed conditional mean still correlates well, so report the slope
+                c = float(np.corrcoef(pred_means, tgt_vals)[0, 1])
+                var = float(np.var(pred_means))
+                metrics["avg_flux_corr"] = c
+                metrics["avg_flux_slope"] = float(
+                    np.cov(pred_means, tgt_vals)[0, 1] / var) if var > 0 else float("nan")
+                metrics["avg_flux_rel_mae"] = float(
+                    np.mean(np.abs(pred_means - tgt_vals) / np.maximum(tgt_vals, 1e-9)))
             val_plots["avg_flux_UQ"] = avg_flux_confidence(
                 pred_means, pred_stds, tgt_vals, traj_ids_sorted, to_wandb=True,
             )

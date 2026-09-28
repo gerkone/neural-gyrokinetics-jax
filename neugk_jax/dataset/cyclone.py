@@ -22,15 +22,26 @@ import pickle
 import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.dataset.backend import DataBackend, KvikIOBackend, NumpyBackend, resolve_trajectories
-from neugk_jax.utils import RunningMeanStd, separate_zf as separate_zf_fn
+from neugk_jax.dataset.backend import DataBackend, KvikIOBackend, resolve_trajectories
+from neugk_jax.utils import RunningMeanStd
+from neugk_jax.utils import separate_zf as separate_zf_fn
+
+
+class _StatsUnpickler(pickle.Unpickler):
+    """Reads upstream stats pickles without importing the torch-side package."""
+
+    def find_class(self, module, name):
+        # the jax twin carries the same buffers and pickle restores __dict__ directly
+        if module.startswith("neugk.") and name == "RunningMeanStd":
+            return RunningMeanStd
+        return super().find_class(module, name)
 
 
 @dataclass(frozen=True)
@@ -106,6 +117,10 @@ class CycloneDataset:
         Same semantics as upstream — see ``neugk/dataset/cyclone.py``.
     separate_zf, decouple_mu
         Optional channel-axis preprocessing matching the AE config.
+    lightweight_metadata
+        Read ``metadata_light.pkl`` instead of the full pickle (~900x smaller —
+        the full one carries per-element df moments). Requires
+        ``normalization_stats``, since the per-trajectory moments are then absent.
     bundle_seq_length
         Time-bundling stride. Default ``1`` (one timestep per sample).
     offset
@@ -134,6 +149,7 @@ class CycloneDataset:
         subsample: int = 1,
         separate_zf: bool = False,
         decouple_mu: bool = False,
+        lightweight_metadata: bool = False,
         backend: Optional[DataBackend] = None,
         num_workers: int = 0,
         rank: int = 0,
@@ -158,6 +174,12 @@ class CycloneDataset:
         self.subsample = subsample
         self.separate_zf = separate_zf
         self.decouple_mu = decouple_mu
+        self.lightweight_metadata = lightweight_metadata
+        if lightweight_metadata and normalization is not None and normalization_stats is None:
+            raise ValueError(
+                "lightweight_metadata drops the per-trajectory df moments; pass "
+                "normalization_stats or disable it"
+            )
         # default to KvikIOBackend for GPU-direct reads; falls back to NumpyBackend transparently
         self.backend = backend or KvikIOBackend(rank=rank)
         self.num_workers = num_workers
@@ -189,19 +211,31 @@ class CycloneDataset:
         # metadata loads are I/O bound and tiny; cap workers at 16
         with ThreadPoolExecutor(max_workers=max(1, min(16, num_workers or 8))) as ex:
             metas = list(ex.map(
-                lambda f: self.backend.read_metadata(f, self.fields_to_load),
+                lambda f: self.backend.read_metadata(
+                    f, self.fields_to_load, lightweight=lightweight_metadata,
+                ),
                 self.files,
             ))
         self.metadata: dict[int, dict] = {}
         kept_files = []
+        # metadata keys _build_sample hard-requires, plus any non-alias conditioning field
+        required = {"ion_temp_grad", "density_grad", "s_hat", "q", "flux", "timesteps"}
+        required |= {c for c in self.conditions if c not in ("itg", "dg", "s_hat", "q")}
         for fp, meta in zip(self.files, metas):
-            if self._passes_cond_filter(meta):
-                fid = len(kept_files)
-                kept_files.append(fp)
-                # OOD trajectories use "fluxes" key instead of "flux" — normalise here
-                if "flux" not in meta and "fluxes" in meta:
-                    meta["flux"] = meta["fluxes"]
-                self.metadata[fid] = meta
+            if not self._passes_cond_filter(meta):
+                continue
+            # OOD trajectories use "fluxes" key instead of "flux" — normalise here
+            if "flux" not in meta and "fluxes" in meta:
+                meta["flux"] = meta["fluxes"]
+            missing = sorted(k for k in required if k not in meta)
+            if missing:
+                # traj missing a conditioning/metadata field -> exclude it rather than crash
+                if self.rank == 0:
+                    warnings.warn(f"{fp}: missing metadata {missing}; excluding trajectory")
+                continue
+            fid = len(kept_files)
+            kept_files.append(fp)
+            self.metadata[fid] = meta
         self.files = kept_files
 
         self.flat_index_to_file_and_tstep: dict[int, tuple[int, int]] = {}
@@ -294,7 +328,7 @@ class CycloneDataset:
         (``stats[field]['full']`` with mean / std / min / max numpy arrays).
         """
         with open(path, "rb") as f:
-            raw = pickle.load(f)
+            raw = _StatsUnpickler(f).load()
         out: dict[str, dict] = {}
         for k, rms in raw.items():
             mean = np.asarray(rms.mean, dtype=np.float64)
@@ -437,6 +471,11 @@ class CycloneDataset:
 
     def get_avg_flux(self, fid: int) -> float:
         return float(np.mean(self.metadata[fid]["flux"][-80:]))
+
+    def get_ds(self, fid: int) -> float | None:
+        # parallel (s) grid spacing; None when the trajectory metadata doesn't carry it
+        ds = self.metadata[fid].get("ds")
+        return None if ds is None else float(ds)
 
     def get_batch_geometry(self, file_indices: np.ndarray) -> dict[str, np.ndarray]:
         """Stack per-file geometry into a batched dict."""

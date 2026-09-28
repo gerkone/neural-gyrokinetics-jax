@@ -2,23 +2,17 @@
 
 from __future__ import annotations
 
-import math
-from typing import Any
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import optax
-from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
 from neugk_jax.autoencoders.swin5d_ae import Swin5DAE
 from neugk_jax.dataset import CycloneDataset, KvikIOBackend, NumpyBackend
 from neugk_jax.losses import df_loss
 from neugk_jax.training.ddp import data_sharding, replicated
-from neugk_jax.training.runner import BaseRunner
+from neugk_jax.training.runner import BaseRunner, build_optimizer
 from neugk_jax.training.schedulers import warmup_cosine
 
 
@@ -92,16 +86,6 @@ class AERunner(BaseRunner):
             **common,
         )
 
-    @staticmethod
-    def _omegaconf_to_dict(node):
-        if node is None:
-            return None
-        try:
-            from omegaconf import OmegaConf
-            return OmegaConf.to_container(node, resolve=True)
-        except Exception:
-            return dict(node)
-
     def setup_components(self) -> None:
         cfg = self.cfg
         key = jr.PRNGKey(getattr(cfg, "seed", 0))
@@ -139,6 +123,7 @@ class AERunner(BaseRunner):
             use_rpb=vit.get("use_rpb", True),
             gated_attention=vit.get("gated_attention", False),
             norm_affine=False,
+            legacy_double_shortcut=mcfg.get("legacy_swin_shortcut", False),
             key=key,
         )
 
@@ -151,14 +136,7 @@ class AERunner(BaseRunner):
             n_epochs=cfg.training.n_epochs,
             min_lr=cfg.training.get("final_learning_rate", 1e-6),
         )
-        wd = cfg.training.get("weight_decay", 0.0)
-        exclude = list(cfg.training.get("exclude_from_wd", []))
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(cfg.training.get("clip_to", 1.0))
-            if cfg.training.get("clip_grad", True)
-            else optax.identity(),
-            optax.adamw(self.schedule, weight_decay=wd) if wd > 0 else optax.adam(self.schedule),
-        )
+        optimizer = build_optimizer(self.schedule, cfg.training, self.model, decoupled=False)
         self.optimizer = optimizer
         params, _ = eqx.partition(self.model, eqx.is_array)
         self.opt_state = optimizer.init(params)
@@ -196,8 +174,8 @@ class AERunner(BaseRunner):
         losses = []
         starts = list(range(0, n - bs + 1, bs))
         # single-threaded prefetch: load batch i+1 while jax is training on batch i
-        from concurrent.futures import ThreadPoolExecutor
         import time as _time
+        from concurrent.futures import ThreadPoolExecutor
 
         def _load(start):
             samples = [self.train_ds[int(idx[i])] for i in range(start, start + bs)]
@@ -252,5 +230,6 @@ class AERunner(BaseRunner):
             epoch=epoch,
             batch_size=self.cfg.training.batch_size,
             eval_integrals=self.cfg.validation.get("eval_integrals", False),
+            eval_spectra=self.cfg.validation.get("eval_spectra", False),
         )
         return metrics, plots

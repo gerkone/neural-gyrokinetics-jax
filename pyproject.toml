@@ -43,6 +43,44 @@ target-version = "py312"
 select = ["E", "F", "I", "W"]
 ignore = ["E501"]
 
+[tool.basedpyright]
+# JAX / Equinox / NumPy are largely untyped, so basedpyright's default
+# ("recommended") mode drowns the project in type-completeness noise that
+# never catches a real bug here. Run in standard mode and explicitly silence
+# the "unknown/any/missing-annotation" families plus the numpy<->jax Array
+# interop and equinox-module false positives. Real-bug rules (possibly-unbound,
+# unused, self/cls, etc.) stay on.
+typeCheckingMode = "standard"
+# untyped-3rd-party cascade (jax, equinox, numpy, torch have no/partial stubs)
+reportMissingTypeStubs = false
+reportMissingTypeArgument = false
+reportMissingParameterType = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportUnknownLambdaType = false
+reportAny = false
+reportExplicitAny = false
+reportUnannotatedClassAttribute = false
+reportImplicitOverride = false
+reportUnusedCallResult = false
+reportDeprecated = false
+# equinox eqx.Module fields are typed as `object`; calling them trips these
+reportCallIssue = false
+reportMissingSuperCall = false
+# numpy NDArray <-> jax Array <-> ndarray annotations don't unify cleanly
+reportArgumentType = false
+reportAttributeAccessIssue = false
+reportReturnType = false
+reportOptionalMemberAccess = false
+# gyaradax (optional dep) and neugk (sibling torch repo) aren't importable here
+reportMissingImports = false
+# runner/backend subclasses intentionally specialize return types; module-level
+# __getattr__ lazy re-exports confuse the __all__ presence check
+reportIncompatibleMethodOverride = false
+reportUnsupportedDunderAll = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

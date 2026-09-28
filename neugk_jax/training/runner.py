@@ -15,8 +15,7 @@ from typing import Any
 
 import equinox as eqx
 import jax
-import jax.numpy as jnp
-from tqdm import tqdm
+import optax
 
 from neugk_jax.training.checkpoint import (
     CheckpointState,
@@ -26,6 +25,34 @@ from neugk_jax.training.checkpoint import (
 from neugk_jax.training.ddp import DistributedInfo, init_distributed
 from neugk_jax.training.logging import Logger
 
+
+def weight_decay_mask(params, exclude):
+    """Pytree of bools, False where the leaf path contains any ``exclude`` substring."""
+    if exclude == "all":
+        return jax.tree_util.tree_map(lambda _: False, params)
+    exclude = [e.lower() for e in exclude or []]
+
+    def keep(path, _):
+        name = jax.tree_util.keystr(path).lower()
+        return not any(e in name for e in exclude)
+
+    return jax.tree_util.tree_map_with_path(keep, params)
+
+
+def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999):
+    """Clip + Adam chain; ``decoupled`` picks torch AdamW over Adam's coupled L2 decay."""
+    wd = tcfg.get("weight_decay", 0.0)
+    params, _ = eqx.partition(model, eqx.is_array)
+    mask = weight_decay_mask(params, tcfg.get("exclude_from_wd", []))
+    clip = (optax.clip_by_global_norm(tcfg.get("clip_to", 1.0))
+            if tcfg.get("clip_grad", True) else optax.identity())
+    if wd <= 0:
+        return optax.chain(clip, optax.adam(schedule, b2=b2))
+    if decoupled:
+        return optax.chain(clip, optax.adamw(schedule, b2=b2, weight_decay=wd, mask=mask))
+    # torch Adam adds wd * p to the gradient before the moment estimates
+    return optax.chain(clip, optax.add_decayed_weights(wd, mask=mask),
+                       optax.scale_by_adam(b2=b2), optax.scale_by_learning_rate(schedule))
 
 class BaseRunner(ABC):
     cfg: Any
@@ -50,6 +77,17 @@ class BaseRunner(ABC):
         self.setup_data()
         self.setup_components()
         self._maybe_resume()
+
+    @staticmethod
+    def _omegaconf_to_dict(node):
+        """OmegaConf node → plain python containers (dataset code indexes them directly)."""
+        if node is None:
+            return None
+        try:
+            from omegaconf import OmegaConf
+            return OmegaConf.to_container(node, resolve=True)
+        except Exception:
+            return dict(node)
 
     @abstractmethod
     def setup_data(self) -> None: ...
@@ -140,6 +178,9 @@ class BaseRunner(ABC):
             if val < self.best_val:
                 self.best_val = val
                 self.save_checkpoint(epoch, val, "best.eqx")
-            self.save_checkpoint(epoch, val, "ckp.eqx")
+            # serialization dominates short epochs — throttle the rolling checkpoint
+            save_every = getattr(self.cfg.training, "save_every_n_epochs", 1)
+            if epoch % save_every == 0 or epoch == self.cfg.training.n_epochs:
+                self.save_checkpoint(epoch, val, "ckp.eqx")
 
         self.logger.finish()

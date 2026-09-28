@@ -23,8 +23,6 @@ import jax.numpy as jnp
 import jax.random as jr
 
 
-
-
 def gelu(x):
     """Exact (erf-based) GELU — matches ``torch.nn.GELU()`` default.
 
@@ -178,7 +176,7 @@ class Film(eqx.Module):
 
 
 class DiTModulation(eqx.Module):
-    """DiT-style 6-way modulation: (shift1, scale1, gate1, shift2, scale2, gate2)."""
+    """DiT-style 6-way modulation: (scale1, shift1, gate1, scale2, shift2, gate2) — upstream order."""
 
     proj: Linear
     dim: int = eqx.field(static=True)

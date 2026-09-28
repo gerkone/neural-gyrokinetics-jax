@@ -22,8 +22,8 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from neugk_jax.models.utils import Linear
-
+from neugk_jax.models.embeddings import RPB
+from neugk_jax.models.utils import Gate, Linear, RMSNorm
 
 _DEFAULT_BACKEND = "einsum"
 
@@ -127,9 +127,6 @@ class MultiHeadSelfAttention(eqx.Module):
         window_size: Optional[tuple[int, ...]] = None,
         backend: Optional[str] = None,
     ):
-        from neugk_jax.models.utils import RMSNorm, Gate
-        from neugk_jax.models.embeddings import RPB
-
         assert dim % num_heads == 0, f"dim={dim} not divisible by num_heads={num_heads}"
         self.num_heads = num_heads
         self.head_dim = dim // num_heads

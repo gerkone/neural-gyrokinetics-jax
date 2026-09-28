@@ -24,7 +24,8 @@ pip install -e ".[cuda,gyro,dev]"
 - `neugk_jax/evaluate/` — base evaluator, AE/diffusion evaluators, gyaradax integrals adapter
 - `configs/` — Hydra configs (mirror upstream layout)
 - `main.py` — Hydra entrypoint (mirrors the upstream `main.py`)
-- `scripts/` — `translate_*ckpt.py`, `eval_diffusion.py`, `plot_reconstruction.py`,
+- `scripts/` — `translate_*ckpt.py`, `check_ckpt_parity.py`, `{ae,gyroswin}_forward_parity.py`,
+  `eval_diffusion.py`, `plot_reconstruction.py`,
   `quantization_error_study.py`, `benchmark_{ae_train,dataloader}.py`
 - `tests/`
 
