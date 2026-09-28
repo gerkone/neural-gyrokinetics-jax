@@ -191,7 +191,6 @@ class LinearCondDiT(eqx.Module):
     time_embed: ContinuousConditionEmbed
     lin_encoder: LinearFieldEncoder
     lin_proj: Optional[Linear]
-    ctx_proj: Optional[Linear]
     act: Callable = eqx.field(static=True)
     cond_mode: str = eqx.field(static=True)
     z_dim: int = eqx.field(static=True)
@@ -228,11 +227,9 @@ class LinearCondDiT(eqx.Module):
         if cond_mode == "adaln":
             # match the scalar-embed convention (4x width, silu) used for the timestep
             self.lin_proj = Linear(linear_encoder.code_dim, 4 * lin_embed_dim, key=keys[1])
-            self.ctx_proj = None
             cdim = self.time_embed.cond_dim + 4 * lin_embed_dim
         else:
             self.lin_proj = None
-            self.ctx_proj = Linear(linear_encoder.out_dim, dim, key=keys[1])
             cdim = self.time_embed.cond_dim
         self.cond_dim = cdim
         self.code_dim = linear_encoder.code_dim
@@ -246,7 +243,7 @@ class LinearCondDiT(eqx.Module):
         )
         self.backbone = (
             DiTLayer(**common) if cond_mode == "adaln"
-            else CrossAttnDiTLayer(context_dim=dim, **common)
+            else CrossAttnDiTLayer(context_dim=linear_encoder.out_dim, **common)
         )
         self.decoder = Linear(dim, z_dim, key=keys[5], use_bias=False)
 
@@ -282,6 +279,5 @@ class LinearCondDiT(eqx.Module):
             cond = jnp.concatenate([t_emb, jax.nn.silu(self.lin_proj(condition))], axis=-1)
             h = self.backbone(h, cond, key=k_bb, inference=inference)
         else:
-            h = self.backbone(h, t_emb, self.ctx_proj(condition),
-                              key=k_bb, inference=inference)
+            h = self.backbone(h, t_emb, condition, key=k_bb, inference=inference)
         return self.decoder(h)

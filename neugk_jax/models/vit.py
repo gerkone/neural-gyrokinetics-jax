@@ -238,10 +238,11 @@ class DiTLayer(eqx.Module):
 class CrossAttnDiTBlock(eqx.Module):
     """Self-attention → cross-attention → MLP, Stable-Diffusion block order.
 
-    The conditioning sequence enters through cross-attention (SD's
-    ``BasicTransformerBlock``); the timestep keeps the DiT scale/shift/gate
-    modulation, so switching ``cond_mode`` only changes where the *condition*
-    enters, not how time does.
+    Residuals and pre-norms follow SD's ``BasicTransformerBlock``, with the
+    conditioning sequence entering through cross-attention. It deviates in three
+    ways: the timestep drives DiT scale/shift/gate modulation (SD adds it in the
+    UNet ResBlocks, which this backbone does not have), the feed-forward is a
+    plain GELU MLP rather than GEGLU, and regularization is drop-path not dropout.
     """
 
     norm1: LayerNorm
@@ -280,18 +281,16 @@ class CrossAttnDiTBlock(eqx.Module):
         self.drop_path = _DropPath(drop_path)
         self.mod = DiTModulation(cond_dim, dim, key=kmod)
 
-    def __call__(self, x, cond, context, *, key=None, inference=False):
-        mods = self.mod(cond)
-        scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = (
-            m[None, :] for m in mods
-        )
+    def __call__(self, x, mod_cond, context, *, key=None, inference=False):
+        # mod_cond modulates (the timestep); context is what cross-attention attends to
+        s1, b1, g1, s2, b2, g2 = (m[None, :] for m in self.mod(mod_cond))
         k1, k2, k3 = (None, None, None) if key is None else jr.split(key, 3)
-        h = self.attn(self.norm1(x) * (1.0 + scale_msa) + shift_msa)
-        x = x + gate_msa * self.drop_path(h, key=k1, inference=inference)
-        x = x + self.drop_path(self.cross(self.norm_cross(x), context),
-                               key=k2, inference=inference)
-        h2 = self.mlp(self.norm2(x) * (1.0 + scale_mlp) + shift_mlp)
-        return x + gate_mlp * self.drop_path(h2, key=k3, inference=inference)
+        h = self.attn(self.norm1(x) * (1.0 + s1) + b1)
+        x = x + g1 * self.drop_path(h, key=k1, inference=inference)
+        x = x + self.drop_path(self.cross(self.norm_cross(x), context), key=k2,
+                               inference=inference)
+        h = self.mlp(self.norm2(x) * (1.0 + s2) + b2)
+        return x + g2 * self.drop_path(h, key=k3, inference=inference)
 
 
 class CrossAttnDiTLayer(eqx.Module):
@@ -331,13 +330,13 @@ class CrossAttnDiTLayer(eqx.Module):
         self.grid_size = tuple(grid_size)
         self.dim = dim
 
-    def __call__(self, x, condition, context, *, key=None, inference=False, **_):
+    def __call__(self, x, mod_cond, context, *, key=None, inference=False, **_):
         spatial = x.shape[:-1]
         dim = x.shape[-1]
         x = x.reshape(-1, dim)
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
-            x = blk(x, condition, context, key=k, inference=inference)
+            x = blk(x, mod_cond, context, key=k, inference=inference)
         return x.reshape(*spatial, dim)
 
 

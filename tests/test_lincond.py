@@ -255,7 +255,9 @@ def test_cross_attention_cond_mode(lincond_dir):
     assert tok.ndim == 2 and tok.shape[0] == np.prod(enc.grid_sizes[-1])
     # cross mode's modulation is driven by the timestep alone
     assert built["cross"].cond_dim == built["cross"].time_embed.cond_dim
-    assert built["cross"].lin_proj is None and built["adaln"].ctx_proj is None
+    assert built["cross"].lin_proj is None
+    # SD feeds the context straight into to_k/to_v, so no extra projection
+    assert built["cross"].backbone.blocks[0].cross.kv.weight.shape[1] == enc.out_dim
 
 
 def test_dit_accepts_field_or_precomputed_code():
