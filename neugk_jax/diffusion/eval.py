@@ -1,8 +1,5 @@
 """Diffusion evaluator: sample → integrals → per-trajectory flux RMSE.
 
-Mirrors ``neugk/diffusion/eval.py:DiffusionEvaluator`` in flow-matching
-terms:
-
 * draw ``n_samples`` per validation example (stochastic eval)
 * integrate via gyaradax to get ``eflux`` from the decoded df
 * aggregate predicted fluxes per ``iteration_<id>`` trajectory across all
@@ -67,15 +64,12 @@ class DiffusionEvaluator(BaseEvaluator):
         val_subsample: int = 1,
         **kwargs,
     ) -> tuple[dict[str, float], dict[str, Any]]:
-        """Run the FM sampler over the val set linearly — mirrors upstream
-        ``neugk/diffusion/eval.py:DiffusionEvaluator``.
+        """Run the FM sampler over the val set linearly.
 
-        Iterates the dataset linearly with stride ``val_subsample`` (the
-        upstream ``cfg.dataset.val_subsample``, default 1; the paper uses
-        10). Each batch produces one diffusion sample → eflux. After the
-        loop, predicted instantaneous fluxes are grouped by ``iteration_N``
-        trajectory id, averaged, and compared to ``tgt_avg_flux`` per
-        trajectory.
+        Iterates the dataset with stride ``val_subsample``. Each batch
+        produces one diffusion sample → eflux. After the loop, predicted
+        instantaneous fluxes are grouped by ``iteration_N`` trajectory id,
+        averaged, and compared to ``tgt_avg_flux`` per trajectory.
         """
         ds = self.val_ds
         n = len(ds)
@@ -122,12 +116,12 @@ class DiffusionEvaluator(BaseEvaluator):
                 metrics, _ = validation_metrics(
                     preds={"df": df_pred},
                     tgts={"df": df_tgt, "flux": jnp.asarray(tgt_avg_flux)},
-                    eval_integrals=False,  # use upstream torch FluxIntegral below
+                    eval_integrals=False,  # computed via gyaradax below instead
                     geometry=None,
                 )
                 running, n_acc = self._accumulate(running, metrics, n_acc, n_new=batch_size)
 
-                # route through gyaradax (~300× faster than torch on CPU); parseval corrected; denorm before integral
+                # route through gyaradax; parseval corrected; denorm before integral
                 if eval_integrals and hasattr(ds, "get_batch_geometry"):
                     try:
                         from neugk_jax.evaluate.integrals import gyaradax_flux_integrals
@@ -218,7 +212,7 @@ class DiffusionEvaluator(BaseEvaluator):
             from neugk_jax.evaluate.metrics import merged_spectral_metrics
             metrics.update(merged_spectral_metrics(spectra_store))
 
-        # per-trajectory flux RMSE + UQ scatter
+        # per-trajectory flux rmse + uq scatter
         if per_traj_pred and self.is_rank0:
             traj_ids_sorted = sorted(per_traj_pred.keys())
             pred_means = np.array([np.mean(per_traj_pred[t]) for t in traj_ids_sorted])
@@ -227,13 +221,13 @@ class DiffusionEvaluator(BaseEvaluator):
             metrics["avg_flux_rmse"] = float(
                 np.sqrt(np.mean((pred_means - tgt_vals) ** 2))
             )
-            # the per-trajectory table used to exist only inside the PNG
+            # also emit per-trajectory values as scalar metrics
             for t, pm, ps, gt in zip(traj_ids_sorted, pred_means, pred_stds, tgt_vals):
                 metrics[f"avg_flux_pred/{t}"] = float(pm)
                 metrics[f"avg_flux_std/{t}"] = float(ps)
                 metrics[f"avg_flux_gt/{t}"] = float(gt)
             if len(tgt_vals) > 2:
-                # a compressed conditional mean still correlates well, so report the slope
+                # report the regression slope of predicted vs target means
                 c = float(np.corrcoef(pred_means, tgt_vals)[0, 1])
                 var = float(np.var(pred_means))
                 metrics["avg_flux_corr"] = c

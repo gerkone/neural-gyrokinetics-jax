@@ -16,7 +16,6 @@ def test_swin_layer_forwards_rms_norm():
     from neugk_jax.models.utils import RMSNorm
 
     grid, win, dim = (4, 8), (2, 4), 8
-    # used to land in **_unused
     layer = SwinLayer(2, dim, depth=2, num_heads=2, grid_size=grid, window_size=win,
                       key=jr.PRNGKey(2), rms_norm=True)
     assert all(isinstance(b.norm1, RMSNorm) and isinstance(b.norm2, RMSNorm)

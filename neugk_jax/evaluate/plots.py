@@ -1,8 +1,7 @@
 """Validation plot helpers.
 
-Pure-numpy port of ``neugk.plot_utils.plot_nd`` + ``generate_val_plots``.
-The same upper-triangular ND view of axis-pair projections the torch
-pipeline produces, no upstream import.
+Pure-numpy upper-triangular ND view of axis-pair projections, plus
+cross-section panel generation for validation.
 """
 
 from __future__ import annotations
@@ -161,7 +160,7 @@ def generate_val_plots(
     ts: Optional[np.ndarray] = None,
     to_wandb: bool = True,
 ) -> dict[str, object]:
-    """Cross-section panels — port of ``neugk.plot_utils.generate_val_plots``.
+    """Cross-section panels for validation.
 
     ``df`` is plotted with the 5D upper-triangular view (recombines the
     separate-zf channel back to 2-channel first). ``phi`` is plotted as
@@ -199,8 +198,7 @@ def avg_flux_confidence(
     traj_ids: list,
     to_wandb: bool = True,
 ):
-    """Per-trajectory flux mean ± std vs ground truth — port of
-    ``neugk.plot_utils.avg_flux_confidence``."""
+    """Per-trajectory flux mean ± std vs ground truth."""
     fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
     x_pos = np.arange(len(traj_ids))
     ax.errorbar(

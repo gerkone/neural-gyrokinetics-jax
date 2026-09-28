@@ -1,11 +1,10 @@
 """Latent-space DiT (Diffusion Transformer).
 
-Mirrors ``neugk/diffusion/models/dit.py``: ``encoder`` (single Linear, no
-bias, followed by ``act_fn``) projects per-token latents into the
-transformer dim, ``ape`` adds learnable absolute position embeddings,
-``backbone`` runs the DiT-modulated transformer stack with time + scalar
-condition embeddings concatenated, and ``decoder`` (single Linear, no
-bias) projects back to ``z_dim``.
+``encoder`` (single Linear, no bias, followed by ``act_fn``) projects
+per-token latents into the transformer dim, ``ape`` adds learnable
+absolute position embeddings, ``backbone`` runs the DiT-modulated
+transformer stack with time + scalar condition embeddings concatenated,
+and ``decoder`` (single Linear, no bias) projects back to ``z_dim``.
 
 Patching (``patch_embed``/``unpatch``) is omitted — the production
 ``DIFF_FLOW`` config uses ``patch_size: null``.
@@ -32,7 +31,7 @@ class DiT(eqx.Module):
         → ``(*grid, z_dim)``
     """
 
-    encoder: list  # [Linear] — mirrors torch Sequential(Linear, act)
+    encoder: list  # single-element list holding the projection Linear
     ape: APE
     backbone: DiTLayer
     decoder: Linear

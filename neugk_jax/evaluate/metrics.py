@@ -1,8 +1,6 @@
 """Zonal-flow / spectral turbulence metrics for validation.
 
-Numpy port of ``neugk/pinc/eval/metrics.py`` (the PINC compression eval) on
-top of the gyaradax integrals adapter. The psnr/ml_eval and optical-flow
-``temporal_epe`` parts are intentionally not ported.
+Numpy implementation built on top of the gyaradax integrals adapter.
 """
 
 from __future__ import annotations
@@ -18,16 +16,14 @@ def _pearson(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _spearman(a: np.ndarray, b: np.ndarray) -> float:
-    # ordinal ranks (== scipy average ranks when there are no ties; spectra are
-    # continuous so ties don't occur), then Pearson on the ranks.
+    # ordinal ranks (spectra are continuous, so no ties), then pearson on the ranks
     ra = np.argsort(np.argsort(a)).astype(np.float64)
     rb = np.argsort(np.argsort(b)).astype(np.float64)
     return _pearson(ra, rb)
 
 
 def _wasserstein_1d(u: np.ndarray, v: np.ndarray) -> float:
-    # 1D W1 for equal-length, uniform-weight samples == mean|sorted(u)-sorted(v)|;
-    # matches scipy.stats.wasserstein_distance(u, v) on the (same-length) spectra.
+    # 1D w1 for equal-length, uniform-weight samples == mean|sorted(u)-sorted(v)|
     return float(np.abs(np.sort(u) - np.sort(v)).mean())
 
 
@@ -58,13 +54,11 @@ def diagnostics(
 ) -> Dict[str, np.ndarray]:
     """Turbulence diagnostics from the potential FFT and the heat-flux field.
 
-    Port of ``neugk/physics/diagnostics.py:diagnostics`` (minus the unused
-    ``phi_zf`` profile) with the axis arithmetic kept verbatim — including
-    the mid slice taken at index ``shape[-3] // 2``. The last three axes of
-    ``phi_fft_`` are ``(nx, *, ny)``; ``kxspec`` sums the y axis, ``kyspec``
-    sums the x (``*``) axis. ``aggregate`` selects how the remaining nx axis
-    is collapsed: ``"mean"`` sums it, ``"mid"`` takes the central slice,
-    ``"none"`` keeps it.
+    The last three axes of ``phi_fft_`` are ``(nx, *, ny)``; ``kxspec``
+    sums the y axis, ``kyspec`` sums the x (``*``) axis. ``aggregate``
+    selects how the remaining nx axis is collapsed: ``"mean"`` sums it,
+    ``"mid"`` takes the central slice (index ``shape[-3] // 2``), ``"none"``
+    keeps it.
     """
     diag: Dict[str, np.ndarray] = {}
     nx = phi_fft_.shape[-3]
@@ -84,8 +78,6 @@ def diagnostics(
     diag["kyspec"] = _agg(kyspec)
 
     # heat-flux spectrum: sum everything except the trailing wavenumber axis
-    # (upstream sums dims (0,1,2,3) of the 5D torch flux field; the gyaradax
-    # eflux field is already reduced to (kx, ky), so this is sum(axis=0))
     diag["qspec"] = (
         eflux_field.sum(axis=tuple(range(eflux_field.ndim - 1)))
         if eflux_field.ndim >= 2
@@ -101,7 +93,7 @@ def spectral_diagnostics(
 
     ``df_batch`` is the (already denormalised) spatial df ``(B, 4, vp, mu, s,
     x, y)``; ``geom`` is a single-trajectory geometry dict. Returns one dict
-    per batch element (the upstream torch function is per-snapshot).
+    per batch element.
     """
     from neugk_jax.evaluate.integrals import gyaradax_spectral_fields
     phi_spec, eflux = gyaradax_spectral_fields(df_batch, geom)
@@ -125,12 +117,11 @@ def time_averaged_spectral_metrics(
         out[f"{key}_pc"] = float(_pearson(p, g))
         out[f"{key}_sc"] = float(_spearman(p, g))
         out[f"{key}_l1"] = float(np.abs(p - g).sum())
-        out[f"{key}_rl2"] = float(np.linalg.norm(p - g) / (np.linalg.norm(g) + 1e-12))  # relative L2
-        out[f"{key}_rl1"] = float(np.abs(p - g).sum() / (np.abs(g).sum() + 1e-12))  # relative L1
+        out[f"{key}_rl2"] = float(np.linalg.norm(p - g) / (np.linalg.norm(g) + 1e-12))  # relative l2
+        out[f"{key}_rl1"] = float(np.abs(p - g).sum() / (np.abs(g).sum() + 1e-12))  # relative l1
         pn, gn = p / (p.sum() + 1e-12), g / (g.sum() + 1e-12)
         out[f"{key}_wd"] = float(_wasserstein_1d(pn, gn))
-    # zonal-flow fidelity (gkw diagnos_zfshear quantities): the profiles are signed
-    # and time-varying, so score per snapshot (rel-L2) and average over time.
+    # zonal-flow fidelity (gkw diagnos_zfshear quantities): score per snapshot (rel-l2), average over time
     for key in ("zfphi", "zfflow", "zfshear"):
         if key in pred_diags[0]:
             rl2 = [
@@ -181,9 +172,7 @@ DIRECTION = {
 }
 
 
-# --------------------------------------------------------------------------- #
-# evaluator glue — shared between the AE and diffusion evaluators
-# --------------------------------------------------------------------------- #
+# evaluator glue — shared between the ae and diffusion evaluators
 def accumulate_spectral_diagnostics(
     store: Dict[int, tuple],
     df_pred: np.ndarray,

@@ -1,18 +1,10 @@
 """Dataset preprocessing for the JAX port.
 
-Currently a thin entrypoint with mode dispatch (similar to upstream
-``neugk/dataset/preprocess.py``'s ``--metadata_only`` / ``--geometry_only``
-flags). The full raw GKW → fp32 preprocessing path is still on the torch
-side (it does the GKW IFFT, geometry parsing, flux verification against
-the legacy integrator) and is left intentionally torch-bound for now —
-all the moving parts live in upstream ``neugk/`` and reproducing them
-brings in `load_geometry`, `K_files`, `parse_input_dat`, ... none of
-which the JAX trainer needs at runtime.
-
-What this file does cover today: take an existing fp32 ``.bin`` shard
-and produce side-by-side quantized siblings (``.bf16.bin``, ``.fp16.bin``,
-``.i8.bin``, ``.i4.bin``) used by the dataloader's
-``prefer_dtype="…"`` graceful-fallback path.
+Thin entrypoint with mode dispatch. Takes an existing fp32 ``.bin`` shard
+and produces side-by-side quantized siblings (``.bf16.bin``, ``.fp16.bin``,
+``.i8.bin``, ``.i4.bin``) used by the dataloader's ``prefer_dtype="…"``
+fallback path. The raw GKW → fp32 preprocessing path stays in
+``neugk/dataset/preprocess.py``.
 
 Layout per file::
 
@@ -58,7 +50,7 @@ _DTYPE_SUFFIX = {
 
 
 def quantized_sibling(fp32_path: str, bits: str) -> str:
-    """``foo.bin`` → ``foo.<dtype>.bin`` (the side-by-side quantized shard)."""
+    # foo.bin -> foo.<dtype>.bin
     if not fp32_path.endswith(".bin"):
         return fp32_path + _DTYPE_SUFFIX[bits]
     return fp32_path[:-4] + _DTYPE_SUFFIX[bits]
@@ -260,7 +252,7 @@ def run_quantize(
     )
 
 
-# ---------- CLI --------------------------------------------------------
+# ---------- cli --------------------------------------------------------
 def main(argv: Iterable[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(

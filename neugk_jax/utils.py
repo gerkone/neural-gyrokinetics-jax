@@ -12,7 +12,6 @@ import numpy as np
 
 
 def set_seed(seed: int) -> None:
-    """Seed Python, NumPy. JAX uses explicit keys threaded through ops."""
     random.seed(seed)
     np.random.seed(seed)
 
@@ -104,7 +103,7 @@ class RunningMeanStd:
 
 
 def expand_as(x: np.ndarray | jnp.ndarray, ref: np.ndarray | jnp.ndarray):
-    """Broadcast x to the shape of ref by inserting leading singleton axes."""
+    # insert leading singleton axes until x.ndim == ref.ndim
     x = jnp.asarray(x) if isinstance(ref, jnp.ndarray) else np.asarray(x)
     while x.ndim < ref.ndim:
         x = x[None, ...] if isinstance(x, np.ndarray) else jnp.expand_dims(x, 0)
@@ -112,10 +111,8 @@ def expand_as(x: np.ndarray | jnp.ndarray, ref: np.ndarray | jnp.ndarray):
 
 
 def split_keys(key: jax.Array, n: int) -> list[jax.Array]:
-    """Convenience: split into a Python list of subkeys."""
     return list(jax.random.split(key, n))
 
 
 def stop_grad(x):
-    """Alias for jax.lax.stop_gradient (used for frozen buffers stored as leaves)."""
     return jax.lax.stop_gradient(x)

@@ -33,7 +33,6 @@ class FlowMatchingRunner(BaseRunner):
     dataset_cls = CycloneDataset
 
     def _dataset_kwargs(self) -> dict:
-        """Extra kwargs for ``dataset_cls`` — subclass hook."""
         return {}
 
     def setup_data(self) -> None:
@@ -48,11 +47,11 @@ class FlowMatchingRunner(BaseRunner):
         ae_path = cfg.ae_checkpoint
         if ae_path is None:
             raise ValueError("diffusion workflow requires ae_checkpoint")
-        # build the AE template + load translated weights
+        # build the ae template + load translated weights
         from neugk_jax.translate import build_ae_from_config, load_or_translate
         ae_cfg = Path(ae_path).parent / "config.yaml"
         ae_template = build_ae_from_config(str(ae_cfg), key=jr.PRNGKey(0))
-        # .eqx loads directly; an upstream torch .pth is translated on the fly
+        # .eqx loads directly; a torch .pth is translated on the fly
         self.ae = load_or_translate(ae_template, ae_path)
 
         backend = (
@@ -90,7 +89,7 @@ class FlowMatchingRunner(BaseRunner):
             **extra,
         )
 
-        # encode every sample once so training is just MSE on cached latents
+        # encode every sample once so training is just mse on cached latents
         def encode_fn(df_batch, cond_batch):
             return jax.vmap(lambda x: self.ae.encode(x)[0])(df_batch)
 
@@ -106,7 +105,7 @@ class FlowMatchingRunner(BaseRunner):
                 precompute_latents(ds, encode_fn=encode_fn, ae_tag=ae_tag,
                                    batch_size=cfg.training.get("precompute_batch", 2))
 
-        # 1 / sqrt(mean variance) — matches the upstream latent_scale
+        # 1 / sqrt(mean variance)
         var = self.train_ds.latent_stats.var
         self.latent_scale = float(1.0 / np.sqrt(max(float(np.mean(var)), 1e-12)))
         if self.dist.is_rank0:
@@ -190,7 +189,7 @@ class FlowMatchingRunner(BaseRunner):
         def _sample(*, key, batch, cond=None, steps=50):
             return self.sample(key=key, batch=batch, cond=cond, steps=steps)
 
-        # for cheap eval we also report the FM training-loss on the val set
+        # for cheap eval we also report the fm training-loss on the val set
         cfg = self.cfg
         bs = cfg.training.batch_size
         n = min(len(self.val_ds), bs * 4)
@@ -212,7 +211,7 @@ class FlowMatchingRunner(BaseRunner):
             )))
         out = {"fm_loss": sum(losses) / max(len(losses), 1)}
 
-        # sample-based eval — only when explicitly enabled (slow on CPU)
+        # sample-based eval — only when explicitly enabled (slow on cpu)
         if cfg.validation.get("eval_sampling", False):
             ev = DiffusionEvaluator(
                 cfg, val_ds=self.val_ds,

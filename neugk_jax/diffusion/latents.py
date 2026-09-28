@@ -1,10 +1,9 @@
 """Precompute and cache AE latents for the diffusion training mode.
 
-After training the AE (M4), the diffusion training (M5) operates on
-the AE's bottleneck latents instead of the raw distribution functions.
-We encode every sample once, cache the result, and the dataset serves
-the latents in mode='diff' instead of doing a costly forward through
-the encoder on each step.
+Diffusion training operates on the AE's bottleneck latents instead of
+the raw distribution functions. Encodes every sample once, caches the
+result, and the dataset serves the latents in mode='diff' instead of
+running the encoder on each step.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ def _tqdm(*args, **kwargs):
 
 
 def _cache_path(dataset, split: str, ae_tag: str) -> Path:
-    """Deterministic name for a precomputed-latents pickle on disk."""
     basenames = sorted(os.path.basename(f) for f in dataset.files)
     h = hashlib.sha256("".join(basenames).encode()).hexdigest()[:12]
     name = f"diff_{split}_latents_offset{dataset.offset}_{h}_{ae_tag}.pkl"
@@ -103,11 +101,10 @@ def load_precomputed_latents(
     """Populate ``dataset.precomputed_latents`` from a pre-existing pickle.
 
     Bypasses the ``encode_fn`` path in :func:`precompute_latents` when the
-    cache has been computed externally (e.g. by the upstream torch
-    pipeline). The pickle is expected to be ``dict[(file_idx, t_idx),
-    dict]`` with the same per-entry schema written by
-    :func:`precompute_latents` — at minimum ``x``, ``flux``, ``timestep``;
-    optionally ``phi`` and the scalar conditioning fields.
+    cache has been computed externally. The pickle is expected to be
+    ``dict[(file_idx, t_idx), dict]`` with the same per-entry schema
+    written by :func:`precompute_latents` — at minimum ``x``, ``flux``,
+    ``timestep``; optionally ``phi`` and the scalar conditioning fields.
 
     ``verify`` cross-checks the cache against this dataset: every indexed
     ``(fid, t_idx)`` must be present, and where the cache carries the scalar

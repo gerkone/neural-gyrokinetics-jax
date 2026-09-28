@@ -33,15 +33,14 @@ class AERunner(BaseRunner):
 
     def setup_data(self) -> None:
         cfg = self.cfg
-        # conditioning is gyroswin-specific; AE must stay unconditional
+        # conditioning is gyroswin-specific; ae must stay unconditional
         if cfg.model.get("conditioning") not in (None, [], ()):
             raise ValueError(
                 "`model.conditioning` is set but the AE workflow does not accept "
                 "scalar conditioning. Drop it from the config or switch to "
                 "workflow=gyroswin."
             )
-        # training.amp.enable=True → train reads bf16 shards (or fp32 with on-the-fly
-        # quantize when the shard is missing). validation always reads fp32.
+        # training.amp.enable=True → train reads bf16 shards (or fp32 with on-the-fly quantize); validation always reads fp32
         amp = cfg.training.get("amp", {}) or {}
         amp_enabled = bool(amp.get("enable", False))
         amp_dtype = amp.get("dtype", "bf16") if amp_enabled else None
@@ -68,7 +67,7 @@ class AERunner(BaseRunner):
             normalization_stats=norm_stats,
             offset=cfg.dataset.get("offset", 0),
         )
-        # mirrors torch ``neugk/dataset/__init__.py:217`` — separate filters per split
+        # separate cond filters per split
         train_filters = self._omegaconf_to_dict(cfg.dataset.get("training_cond_filters"))
         eval_filters = self._omegaconf_to_dict(cfg.dataset.get("eval_cond_filters"))
         self.train_ds = CycloneDataset(

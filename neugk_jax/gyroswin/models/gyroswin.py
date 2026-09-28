@@ -1,21 +1,19 @@
-"""GyroSwin multitask model — JAX/Equinox port of ``neugk/gyroswin/models/gyroswin.py``.
+"""GyroSwin multitask model — 5D df to 5D df + 3D phi with cross-attention mixing.
 
-Composition (mirrors upstream ``GyroSwinMultitask`` after ``__init__``):
+Composition:
 
 * ``df_unet``: ``Swin5DUnet`` — full 5D Swin U-Net on the distribution function.
-* ``phi_unet``: ``SwinNDUnet`` (space=3) — only the **up** path is kept;
+* ``phi_unet``: ``SwinNDUnet`` (space=3) — only the up path is kept;
   the down path's outputs come from ``vspace_attn_down`` reducing the df features.
 * ``vspace_attn_down`` / ``vspace_attn_middle`` / ``vspace_attn_patch_skip``:
   ``VSpaceReduce`` blocks that turn the 5D df latents into the 3D phi shape.
 * ``df_mix_middle`` / ``phi_mix_middle``: bottleneck cross-attention.
 * ``df_mix_up`` / ``phi_mix_up``: up-path cross-attention at each scale.
 
-The flux head and baseline models (FNO/PointNet/...) are out of scope —
-they were never needed by the user's training configs.
+The flux head and baseline models (FNO/PointNet/...) are out of scope.
 
-NOTE: conditioning (DiT modulation through the Swin blocks) is plumbed
-via the existing ``Swin5DUnet`` API. For configs without conditioning the
-forward still works.
+Conditioning (DiT modulation through the Swin blocks) is plumbed via the
+existing ``Swin5DUnet`` API; configs without conditioning still work.
 """
 
 from __future__ import annotations
@@ -96,8 +94,7 @@ class GyroSwinMultitask(eqx.Module):
         phi_window_size = tuple(df_window_size[2:])
 
         keys = jr.split(key, 18)
-        # conditioning embeds live INSIDE each U-Net (torch parity: df_unet.cond_embed,
-        # phi_unet.cond_embed), not at the top level.
+        # conditioning embeds live inside each u-net, not at the top level
         self.cond_embed = None
         cond_kw = dict(n_cond=n_cond, cond_embed_dim=cond_embed_dim, cond_mode=cond_mode,
                        middle_swin=True, unpatch_patch_skip=patch_skip, rms_norm=rms_norm,
@@ -116,7 +113,7 @@ class GyroSwinMultitask(eqx.Module):
             num_heads=num_heads,
             num_layers=num_layers,
             c_multiplier=c_multiplier,
-            hidden_mlp_ratio=8.0,  # torch hardcodes this for gyroswin
+            hidden_mlp_ratio=8.0,  # hardcoded for gyroswin
             merging_hidden_ratio=merging_hidden_ratio,
             unmerging_hidden_ratio=unmerging_hidden_ratio,
             qk_norm=qk_norm,
@@ -146,12 +143,10 @@ class GyroSwinMultitask(eqx.Module):
             gated_attention=gated_attention,
             use_checkpoint=use_checkpoint,
             key=keys[1],
-            conv_patch=True,  # phi uses ConvTranspose patch ops (torch conv_patch=True)
+            conv_patch=True,  # phi uses ConvTranspose patch ops
             **cond_kw,
         )
-        # torch deletes phi_unet.patch_embed + down_blocks (phi is produced from df via
-        # velocity-space reduction, never encoded). Null them so they don't count as
-        # unmatched params; the gyroswin forward never calls the phi encoder path.
+        # phi's patch_embed/down_blocks are unused; forward never calls the phi encoder path
         self.phi_unet = eqx.tree_at(
             lambda u: (u.patch_embed, u.down_blocks),
             self.phi_unet, (None, []),
@@ -161,8 +156,7 @@ class GyroSwinMultitask(eqx.Module):
         # SwinNDUnet exposes ``down_dims`` (input dim of each stage; len = num_layers+1).
         df_down_dims = list(self.df_unet.down_dims)
         phi_down_dims = list(self.phi_unet.down_dims)
-        # torch builds ONE VSpaceReduce per actual df down block (num_layers), with
-        # out_dim = the matching phi up block dim (zip(df_down_blocks, phi_up_blocks[::-1])).
+        # one VSpaceReduce per df down block; out_dim matches the corresponding phi up block
         df_in_dims = df_down_dims[:-1]                  # input dim per down block
         phi_up_blk_dims = phi_down_dims[::-1][1:][::-1]  # phi up-block dims, zip order
         self.vspace_attn_down = [
@@ -207,14 +201,12 @@ class GyroSwinMultitask(eqx.Module):
                         num_heads=8, key=k)
             for i, k in enumerate(jr.split(keys[13], n_up))
         ]
-        # patch-space mixing — operates AFTER the patch-skip concat, so the dim is
-        # doubled when patch_skip (torch df_mix_unpatch.attn.q is (128,128) for dim=64).
+        # patch-space mixing operates after the patch-skip concat, so the dim doubles when patch_skip
         unpatch_dim = dim * (2 if patch_skip else 1)
         self.df_mix_unpatch = MixingBlock(left_dim=unpatch_dim, right_dim=unpatch_dim, num_heads=8, key=keys[14])
         self.phi_mix_unpatch = MixingBlock(left_dim=unpatch_dim, right_dim=unpatch_dim, num_heads=8, key=keys[15])
 
-        # flux head: one cross-attn stage per scale (phi=query, df=kv), max-pooled
-        # then concatenated -> scalar. dims = reversed down_dims (deepest first).
+        # flux head: one cross-attn stage per scale (phi=query, df=kv), max-pooled and concatenated to a scalar; dims are reversed down_dims (deepest first)
         if self.use_flux:
             self.flux_head = FluxDecoder(
                 left_dims=phi_down_dims[::-1], right_dims=df_down_dims[::-1],
@@ -229,7 +221,7 @@ class GyroSwinMultitask(eqx.Module):
 
         df: ``(C, vp, mu, s, x, y)``; cond: ``(n_cond,)`` scalars (raw).
         """
-        # per-U-Net conditioning embeddings (torch parity: df/phi have separate embeds)
+        # per-u-net conditioning embeddings; df and phi have separate embeds
         c_df = self.df_unet.condition(cond)
         c_phi = self.phi_unet.condition(cond)
 
@@ -237,16 +229,14 @@ class GyroSwinMultitask(eqx.Module):
         # patch-skip residuals: df0 (full patch grid) and its velocity-reduced phi0
         df0 = zdf
         phi0 = self.vspace_attn_patch_skip(df0) if (self.patch_skip and self.vspace_attn_patch_skip is not None) else None
-        # down path. The pre-downsample df skip feeds the df up block, and (via
-        # vspace_attn_down[i]) the phi up block skip — torch passes phi_features[i]
-        # to phi_up_blocks[i] as a KEYWORD s=..., so it is NOT dead.
+        # down path: pre-downsample df skip feeds the df up block; vspace_attn_down[i] produces the phi up block skip
         df_skips, phi_skips = [], []
         for i, blk in enumerate(self.df_unet.down_blocks):
             zdf, sk = blk(zdf, c_df, inference=inference, return_skip=True)
             df_skips.append(sk)
             if self.use_phi and i < len(self.vspace_attn_down):
                 phi_skips.append(self.vspace_attn_down[i](sk))
-        # bottleneck — vspace-reduce df → phi, then cross-mix, then middle swin/ViT
+        # bottleneck — vspace-reduce df → phi, then cross-mix, then middle swin/vit
         if self.df_unet.middle_pe is not None:
             zdf = self.df_unet.middle_pe(zdf)
         zphi = self.vspace_attn_middle(zdf)
@@ -263,8 +253,7 @@ class GyroSwinMultitask(eqx.Module):
             flux_lats.append(self.flux_head.mix(0, zphi, zdf))
         zdf = self.df_unet.middle_upscale(zdf)
         zphi = self.phi_unet.middle_upscale(zphi)
-        # up path with per-scale cross-mix. torch updates df FIRST then mixes phi against
-        # the UPDATED df (sequential, unlike the parallel middle mix above).
+        # up path with per-scale cross-mix: df updates first, then phi mixes against the updated df (sequential, unlike the parallel middle mix above)
         for i, (df_blk, phi_blk) in enumerate(zip(self.df_unet.up_blocks, self.phi_unet.up_blocks)):
             zdf = self.df_mix_up[i](zdf, zphi)
             zphi = self.phi_mix_up[i](zphi, zdf)   # uses the just-updated zdf
@@ -295,10 +284,10 @@ class GyroSwinMultitask(eqx.Module):
 def build_gyroswin_from_config(cfg_path: str, *, key,
                                resolution: Optional[Sequence[int]] = None,
                                legacy_double_shortcut: Optional[bool] = None) -> GyroSwinMultitask:
-    """Build a ``GyroSwinMultitask`` from a Hydra YAML (upstream torch config layout).
+    """Build a ``GyroSwinMultitask`` from a Hydra YAML.
 
-    ``legacy_double_shortcut`` defaults to ``model.legacy_swin_shortcut``, and to True
-    when absent (upstream checkpoints predate the e79b021 swin-shortcut fix).
+    ``legacy_double_shortcut`` defaults to ``model.legacy_swin_shortcut``, or
+    to True when absent.
     """
     import yaml
 
@@ -331,7 +320,7 @@ def build_gyroswin_from_config(cfg_path: str, *, key,
         patch_skip=swin.get("patch_skip", True),
         swin_bottleneck=swin.get("swin_bottleneck", True),
         use_rpb=swin.get("use_rpb", True),
-        # torch gyroswin swin blocks have no qk_norm / gated-attention (unlike the AE)
+        # gyroswin swin blocks default qk_norm/gated-attention off, unlike the ae
         qk_norm=swin.get("qk_norm", False),
         gated_attention=swin.get("gated_attention", False),
         cond_mode=swin.get("modulation", "film"),

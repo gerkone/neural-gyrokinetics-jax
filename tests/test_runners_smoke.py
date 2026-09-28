@@ -118,10 +118,10 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     the freshly initialised AE first."""
     path, resolution = cyclone_dir
     ae_cfg = _tiny_ae_cfg(path, resolution)
-    # build + save a tiny AE so the FM runner has something to load
+    # build + save a tiny ae so the fm runner has something to load
     from neugk_jax.training.checkpoint import save_model_only
     from scripts.translate_ckpt import build_ae_from_config
-    # FlowMatchingRunner expects AE config at <ae_ckpt_dir>/config.yaml with resolution for build_ae_from_config
+    # FlowMatchingRunner expects ae config at <ae_ckpt_dir>/config.yaml with resolution for build_ae_from_config
     ae_dir = tmp_path / "ae_ckpt"
     ae_dir.mkdir(exist_ok=True)
     ae_cfg_with_res = OmegaConf.create(OmegaConf.to_container(ae_cfg))

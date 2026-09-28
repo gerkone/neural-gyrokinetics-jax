@@ -11,8 +11,7 @@ __all__ = [
 
 
 def __getattr__(name):
-    # lazy re-exports to avoid circular imports — workflow evaluators import
-    # ``neugk_jax.evaluate.base`` themselves, so we can't eagerly load them here.
+    # lazy re-exports to avoid circular imports with the workflow evaluators
     if name == "AEEvaluator":
         from neugk_jax.autoencoders.eval import AEEvaluator
         return AEEvaluator

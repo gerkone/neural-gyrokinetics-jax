@@ -29,12 +29,6 @@ _DEFAULT_BACKEND = "einsum"
 
 
 def set_default_attention_backend(backend: str) -> None:
-    """Globally switch the attention implementation used by new modules.
-
-    Useful for benchmarks: build once with ``"einsum"`` then re-build with
-    ``"flash"`` and compare. Existing modules already-built remember their
-    own choice.
-    """
     global _DEFAULT_BACKEND
     if backend not in ("einsum", "flash"):
         raise ValueError(f"unknown attention backend: {backend!r}")
@@ -90,7 +84,7 @@ def _flash_attention(q, k, v, scale, bias):
 
 
 class MultiHeadSelfAttention(eqx.Module):
-    """Multi-head self-attention with parity-with-upstream optional extras.
+    """Multi-head self-attention with optional extras.
 
     Switches:
 
@@ -160,7 +154,7 @@ class MultiHeadSelfAttention(eqx.Module):
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
-        # fold RPB bias into the attention bias slot
+        # fold rpb bias into the attention bias slot
         if self.rpb is not None:
             rpb_bias = self.rpb()  # shape: (heads, sl, sl)
             attn_bias = rpb_bias if attn_bias is None else attn_bias + rpb_bias

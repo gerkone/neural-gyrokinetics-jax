@@ -1,15 +1,7 @@
 """Unified ``CycloneDataset`` for both AE training and latent diffusion.
 
-This is a deliberate consolidation of the upstream torch ``CycloneDataset``
-(``neugk/dataset/cyclone.py``) and ``CycloneAEDataset``
-(``neugk/dataset/cyclone_diff.py``):
-
-* **Same** file resolution / metadata loading / conditioning extraction.
-* **Same** per-timestep flat indexing and normalisation conventions.
-* **Drops** the SimSiam / VAE / VQVAE / LinearCyclone / Coordinate
-  variants — not in the user's requested scope.
-* ``mode="ae"`` returns raw distribution-function tensors; ``mode="diff"``
-  returns precomputed latents (after running ``precompute_latents``).
+``mode="ae"`` returns raw distribution-function tensors; ``mode="diff"``
+returns precomputed latents (after running ``precompute_latents``).
 
 Returns host-side numpy arrays in a frozen ``CycloneSample`` dataclass.
 JAX consumes them via ``jnp.asarray`` when the dataloader stacks a batch.
@@ -35,7 +27,7 @@ from neugk_jax.utils import separate_zf as separate_zf_fn
 
 
 class _StatsUnpickler(pickle.Unpickler):
-    """Reads upstream stats pickles without importing the torch-side package."""
+    """Unpickles stats without importing the torch package."""
 
     def find_class(self, module, name):
         # the jax twin carries the same buffers and pickle restores __dict__ directly
@@ -114,7 +106,8 @@ class CycloneDataset:
         ``"ae"`` returns raw df reads; ``"diff"`` returns precomputed latents
         (after calling :func:`precompute_latents`).
     normalization, normalization_scope, normalization_stats
-        Same semantics as upstream — see ``neugk/dataset/cyclone.py``.
+        Normalization config, its scope (``"dataset"`` or per-trajectory),
+        and optional precomputed stats.
     separate_zf, decouple_mu
         Optional channel-axis preprocessing matching the AE config.
     lightweight_metadata
@@ -180,7 +173,7 @@ class CycloneDataset:
                 "lightweight_metadata drops the per-trajectory df moments; pass "
                 "normalization_stats or disable it"
             )
-        # default to KvikIOBackend for GPU-direct reads; falls back to NumpyBackend transparently
+        # default to KvikIOBackend for gpu-direct reads; falls back to NumpyBackend transparently
         self.backend = backend or KvikIOBackend(rank=rank)
         self.num_workers = num_workers
         self.rank = rank
@@ -224,7 +217,7 @@ class CycloneDataset:
         for fp, meta in zip(self.files, metas):
             if not self._passes_cond_filter(meta):
                 continue
-            # OOD trajectories use "fluxes" key instead of "flux" — normalise here
+            # ood trajectories use "fluxes" key instead of "flux" — normalise here
             if "flux" not in meta and "fluxes" in meta:
                 meta["flux"] = meta["fluxes"]
             missing = sorted(k for k in required if k not in meta)
@@ -287,11 +280,10 @@ class CycloneDataset:
         ``normalization_stats`` can be:
 
         * a ``dict`` already in the ``stats[field][key]`` form — used as-is;
-        * a ``str`` / ``Path`` pointing at the upstream stats pickle
-          (``RunningMeanStd`` per field) — we load and apply the
-          per-field ``agg_axes`` from ``self.normalization`` to collapse
-          the full per-element stats into the aggregation requested by
-          the model config.
+        * a ``str`` / ``Path`` pointing at a stats pickle (``RunningMeanStd``
+          per field) — loaded and reduced with the per-field ``agg_axes``
+          from ``self.normalization`` into the aggregation the model
+          config requests.
         """
         if isinstance(self.normalization_stats, (str, os.PathLike)):
             return self._load_stats_pkl(self.normalization_stats)
@@ -322,7 +314,7 @@ class CycloneDataset:
         return out
 
     def _load_stats_pkl(self, path) -> dict[str, dict]:
-        """Load upstream ``RunningMeanStd``-pkl and apply per-field ``agg_axes``.
+        """Load a ``RunningMeanStd`` pickle and apply per-field ``agg_axes``.
 
         Returns the stats dict in our internal format
         (``stats[field]['full']`` with mean / std / min / max numpy arrays).
@@ -478,7 +470,6 @@ class CycloneDataset:
         return None if ds is None else float(ds)
 
     def get_batch_geometry(self, file_indices: np.ndarray) -> dict[str, np.ndarray]:
-        """Stack per-file geometry into a batched dict."""
         geoms = [self.metadata[int(f)]["geometry"] for f in file_indices]
         keys = geoms[0].keys()
         return {k: np.stack([np.ascontiguousarray(g[k]) for g in geoms]) for k in keys}

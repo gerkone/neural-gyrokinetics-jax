@@ -1,8 +1,8 @@
 """GyroSwin evaluator — multi-step autoregressive recon metrics + plots.
 
-Mirrors ``neugk/gyroswin/eval/eval.py``: for each starting sample, predict
-``n_eval_steps`` ahead, comparing each step's ``df`` / ``phi`` against the
-ground-truth at the same timestep. Logs ``df_x{t}`` / ``phi_x{t}`` keys.
+For each starting sample, predicts ``n_eval_steps`` ahead, comparing each
+step's ``df`` / ``phi`` against the ground-truth at the same timestep. Logs
+``df_x{t}`` / ``phi_x{t}`` keys.
 """
 
 from __future__ import annotations

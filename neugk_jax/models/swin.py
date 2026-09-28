@@ -34,7 +34,7 @@ def _effective_window(grid_size, window_size):
 
 
 def _build_partition_grid(grid_size, window_size):
-    """Return (effective_window_size, partition_grid) where each grid axis = g // w."""
+    # returns (effective_window_size, partition_grid) where each grid axis = g // w
     eff = _effective_window(grid_size, window_size)
     grid = tuple(g // w for g, w in zip(grid_size, eff))
     return eff, grid
@@ -162,7 +162,7 @@ class SwinBlock(eqx.Module):
     ):
         eff_w, _ = _build_partition_grid(grid_size, window_size)
         if shift:
-            # matches upstream get_window_size: skip shift on axes where window covers the full grid
+            # skip shift on axes where window covers the full grid
             shift_size = tuple(
                 (e // 2) if (g > w and e > 1) else 0
                 for g, w, e in zip(grid_size, window_size, eff_w)
@@ -189,22 +189,18 @@ class SwinBlock(eqx.Module):
         self.legacy_double_shortcut = legacy_double_shortcut
 
     def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
-        """SwinV2 post-norm forward (single residual, upstream fix e79b021).
+        """SwinV2 post-norm forward (single residual).
 
-        Mirrors ``neugk/models/nd_vit/swin_layers.py:SwinTransformerBlock.forward``
-        at HEAD:
+        ``forward_part1`` runs attention on the un-normed input and applies
+        ``norm1`` to the result (post-norm); ``forward_part2`` runs ``mlp``
+        then drop_path then ``norm2``, combined as
+        ``x_res1 + norm2(dp(mlp(x_res1)))``.
 
-        * ``forward_part1`` runs attention on the un-normed input and
-          applies ``norm1`` to the result (post-norm).
-        * ``forward_part2`` runs ``mlp`` then drop_path then ``norm2``;
-          combined as ``x_res1 + norm2(dp(mlp(x_res1)))``.
-
-        ``legacy_double_shortcut=True`` restores the pre-e79b021 topology
-        (``2·x_res1 + mlp_out``) that every neurips26 torch checkpoint was
-        trained with — required to reproduce their training-time outputs.
+        ``legacy_double_shortcut=True`` uses ``2·x_res1 + mlp_out`` instead,
+        for checkpoints trained with that topology.
         """
         spatial = x.shape[:-1]
-        shortcut = x  # upstream self.skip is Identity (dim_out == dim)
+        shortcut = x  # skip is identity since dim_out == dim
 
         h, pads = pad_to_blocks(x, self.window_size)
         padded_spatial = h.shape[:-1]
@@ -269,7 +265,7 @@ class DiTSwinBlock(eqx.Module):
         legacy_double_shortcut: bool = False,
     ):
         eff_w, _ = _build_partition_grid(grid_size, window_size)
-        # same upstream-faithful shift rule as SwinBlock above
+        # same shift rule as SwinBlock above
         shift_size = tuple(
             (e // 2) if (shift and g > w and e > 1) else 0
             for g, w, e in zip(grid_size, window_size, eff_w)
@@ -278,8 +274,7 @@ class DiTSwinBlock(eqx.Module):
         self.window_size = eff_w
         self.shift_size = shift_size
 
-        # DiT modulation provides scale/shift, so the norm is non-affine; the norm
-        # *type* follows the model (cold/warm use RMSNorm; torch confirms RMSNorm here).
+        # DiT modulation provides scale/shift, so the norm is non-affine; norm type follows the model (rmsnorm for cold/warm)
         _Norm = RMSNorm if rms_norm else LayerNorm
         self.norm1 = _Norm(dim, elementwise_affine=False)
         self.norm2 = _Norm(dim, elementwise_affine=False)
@@ -297,7 +292,7 @@ class DiTSwinBlock(eqx.Module):
 
     def __call__(self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=False) -> jnp.ndarray:
         spatial = x.shape[:-1]
-        # upstream order: (scale1, shift1, gate1, scale2, shift2, gate2) from DiTModulation
+        # order: (scale1, shift1, gate1, scale2, shift2, gate2) from DiTModulation
         scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = self.mod(cond)
         def _bc(t):
             for _ in range(len(spatial)):
@@ -331,7 +326,7 @@ class DiTSwinBlock(eqx.Module):
         x = shortcut + gate_msa * self.drop_path(h, key=key1, inference=inference)
         h2 = self.mlp(self.norm2(x) * (1.0 + scale_mlp) + shift_mlp)
         mlp_out = gate_mlp * self.drop_path(h2, key=key2, inference=inference)
-        # pre-7a77490 upstream doubled the residual here too
+        # legacy_double_shortcut doubles the residual here too
         return (2.0 * x + mlp_out) if self.legacy_double_shortcut else (x + mlp_out)
 
 
@@ -490,9 +485,9 @@ class DiTSwinLayer(eqx.Module):
 class Film(eqx.Module):
     """FiLM modulation: ``x * (scale + 1) + shift`` from a conditioning vector.
 
-    Port of ``neugk/models/layers.py:Film``. A single ``Linear(cond_dim -> 2*dim)``
-    produces (scale, shift); broadcast over all spatial/token axes. Applied to a
-    block's input *before* the block runs (see ``FilmSwinLayer``).
+    A single ``Linear(cond_dim -> 2*dim)`` produces (scale, shift); broadcast
+    over all spatial/token axes. Applied to a block's input before the block
+    runs (see ``FilmSwinLayer``).
     """
 
     modulation: Linear
@@ -513,9 +508,8 @@ class Film(eqx.Module):
 class FilmSwinLayer(eqx.Module):
     """``depth`` standard SwinBlocks, each preceded by a per-block FiLM modulation.
 
-    Mirrors torch ``FilmSwinLayer``: ``conditioning`` is one ``Film`` per block,
-    applied to the block input; the blocks are ordinary (unconditioned) SwinBlocks
-    so they reuse the AE-parity-verified attention/MLP path.
+    ``conditioning`` is one ``Film`` per block, applied to the block input; the
+    blocks are ordinary (unconditioned) SwinBlocks.
     """
 
     blocks: list[SwinBlock]

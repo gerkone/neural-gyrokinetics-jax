@@ -18,9 +18,7 @@ def _sincos_1d(length: int, dim: int, base: float = 10000.0) -> jnp.ndarray:
     """Standard sinusoidal embedding of shape (length, dim). dim must be even."""
     assert dim % 2 == 0, "sincos dim must be even"
     pos = jnp.arange(length, dtype=jnp.float32)
-    # force f32: with x64 enabled (gyaradax import) ``math.log(base)`` is a
-    # Python float which promotes freqs/angles to f64; the resulting buffer
-    # then contaminates every downstream call (DiT output → scan dtype mismatch)
+    # force f32 — x64 mode promotes math.log(base) to f64, which would contaminate downstream dtypes
     freqs = jnp.exp(-math.log(base) * jnp.arange(0, dim, 2, dtype=jnp.float32) / dim).astype(jnp.float32)
     angles = pos[:, None] * freqs[None, :]
     return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1).astype(jnp.float32)
@@ -53,10 +51,7 @@ def _sincos_nd(grid_size: Sequence[int], dim: int) -> jnp.ndarray:
 class APE(eqx.Module):
     """Absolute positional embedding broadcast-added to the last axis.
 
-    Field is named ``pos_embed`` to match upstream torch's ``register_buffer``
-    name. ``learnable=False`` keeps it frozen via stop_gradient. With
-    ``leading_batch=True`` the stored tensor has an extra leading ``(1,)``
-    axis — used by ``vel_pe`` in the 5D AE to mirror torch's shape exactly.
+    ``learnable=False`` keeps it frozen via stop_gradient.
     """
 
     pos_embed: jax.Array
@@ -94,14 +89,13 @@ class APE(eqx.Module):
 class ContinuousConditionEmbed(eqx.Module):
     """Sinusoidal embedding for continuous scalars (timestep, ITG, dg, ...).
 
-    Faithful port of ``neugk/models/layers.py:ContinuousConditionEmbed``:
-    splits ``dim`` evenly across ``n_cond`` axes, sincos-encodes each with a
+    Splits ``dim`` evenly across ``n_cond`` axes, sincos-encodes each with a
     shared log-spaced ``omega`` buffer, zero-pads to ``dim``, then projects
     through a single ``Linear(dim, 4·dim)`` followed by SiLU. Output is
     ``(..., 4·dim)`` and ``self.cond_dim = 4·dim``.
     """
 
-    mlp: list  # [Linear] — list mirrors torch nn.Sequential indexing
+    mlp: list  # [Linear]
     omega: jax.Array
     dim: int = eqx.field(static=True)
     n_cond: int = eqx.field(static=True)
@@ -131,8 +125,7 @@ class ContinuousConditionEmbed(eqx.Module):
         self.padding = padding
         self.cond_per_wave = cond_per_wave
 
-        # force f32: with x64 enabled (gyaradax import), Python float
-        # ``max_wavelength`` would promote omega to f64 and contaminate the DiT output.
+        # force f32 — x64 mode would otherwise promote omega to f64 and contaminate the dit output
         omega = 1.0 / (max_wavelength ** (
             jnp.arange(0, cond_per_wave, 2, dtype=jnp.float32) / cond_per_wave
         ))
@@ -165,9 +158,9 @@ class ContinuousConditionEmbed(eqx.Module):
 def _build_rpb_table(window_size: Sequence[int]) -> jnp.ndarray:
     """Continuous log-scaled relative-coordinate table for the cpb MLP.
 
-    Shape ``(1, *(2w-1)_per_axis, space)`` — leading ``(1,)`` matches torch's
-    buffer. Per-axis coords are normalised to ``[-1, 1]``, scaled to ``[-8, 8]``,
-    then softened by ``sign(c)·log₂(|c|+1)/log₂8``.
+    Shape ``(1, *(2w-1)_per_axis, space)``. Per-axis coords are normalised to
+    ``[-1, 1]``, scaled to ``[-8, 8]``, then softened by
+    ``sign(c)·log₂(|c|+1)/log₂8``.
     """
     coords = [jnp.arange(-(w - 1), w, dtype=jnp.float32) for w in window_size]
     table = jnp.stack(jnp.meshgrid(*coords, indexing="ij"), axis=-1)
@@ -200,8 +193,6 @@ def _build_rpb_idx(window_size: Sequence[int]) -> jnp.ndarray:
 
 class RPB(eqx.Module):
     """SwinV2 relative position bias.
-
-    Faithful port of ``neugk/models/nd_vit/positional.py:RPB``:
 
     1. ``rpb``: frozen continuous coordinate table, shape ``(1, *(2w-1), space)``.
     2. ``rpb_idx``: integer ``(sl, sl)`` gather indices into that flat table.

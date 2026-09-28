@@ -117,6 +117,5 @@ def test_torch_to_jax_translation(tmp_path):
 
 
 def iter_leaves_compat(tree):
-    """Re-export for the test (avoids reaching into scripts.* from tests)."""
     from scripts.translate_ckpt import iter_leaves
     yield from iter_leaves(tree)

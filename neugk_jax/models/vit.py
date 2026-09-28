@@ -52,7 +52,7 @@ class ViTBlock(eqx.Module):
         self.attn = MultiHeadSelfAttention(
             dim, num_heads, key=katt,
             qkv_bias=qkv_bias, qk_norm=qk_norm,
-            gated_attention=gated_attention, use_rpb=False,  # ViT has no windowing, so no RPB
+            gated_attention=gated_attention, use_rpb=False,  # vit has no windowing, so no rpb
         )
         hidden = max(int(dim * mlp_ratio), dim)
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
@@ -64,7 +64,7 @@ class ViTBlock(eqx.Module):
         key1, key2 = (None, None) if key is None else jr.split(key, 2)
         x = x + self.drop_path(self.attn(self.norm1(x)), key=key1, inference=inference)
         mlp_out = self.drop_path(self.mlp(self.norm2(x)), key=key2, inference=inference)
-        # pre-7a77490 upstream doubled the residual
+        # legacy_double_shortcut doubles the residual
         return (2.0 * x + mlp_out) if self.legacy_double_shortcut else (x + mlp_out)
 
 
@@ -104,7 +104,7 @@ class DiTViTBlock(eqx.Module):
         self.legacy_double_shortcut = legacy_double_shortcut
 
     def __call__(self, x, cond, *, key=None, inference=False):
-        # upstream order: (scale1, shift1, gate1, scale2, shift2, gate2) — matches DiT.forward in models/layers.py
+        # order: (scale1, shift1, gate1, scale2, shift2, gate2)
         scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = self.mod(cond)
         shift_msa = shift_msa[None, :]
         scale_msa = scale_msa[None, :]
@@ -248,9 +248,8 @@ class DiTLayer(eqx.Module):
 class FilmViTLayer(eqx.Module):
     """``depth`` standard ViT blocks, each preceded by a per-block FiLM modulation.
 
-    Mirrors torch ``FilmSwinLayer`` applied at the bottleneck ViT: ``conditioning``
-    is one ``Film`` per block, applied to the block input. Blocks are ordinary
-    (unconditioned) ViTBlocks so they reuse the parity-verified attention/MLP path.
+    ``conditioning`` is one ``Film`` per block, applied to the block input.
+    Blocks are ordinary (unconditioned) ViTBlocks.
     """
 
     blocks: list[ViTBlock]

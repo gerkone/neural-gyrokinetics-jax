@@ -1,17 +1,8 @@
 """I/O backend for the cyclone preprocessed dataset (.bin per-timestep).
 
-The upstream torch project uses two backends: ``H5Backend`` (for the
-canonical HDF5 files) and ``KvikIOBackend`` (for a directory of float32
-``.bin`` files plus a ``metadata.pkl``). The user told us KvikIOBackend
-is the only one we need; it's also the format the AE precompute pipeline
-already writes to.
-
-We default to ``NumpyBackend`` (``np.fromfile``) because it's portable
-across nodes without cupy and just-as-fast on most setups. ``KvikIOBackend``
-wraps cupy + kvikio for GPU-direct reads where available — it exists for
-parity with the torch path and is gated behind an import guard.
-
-All readers return host-side ``numpy`` arrays — JAX consumes them via
+``NumpyBackend`` reads with plain ``np.fromfile``; ``KvikIOBackend`` wraps
+cupy + kvikio for GPU-direct reads where available, gated behind an import
+guard. All readers return host-side ``numpy`` arrays — JAX consumes them via
 ``jnp.asarray(...)`` when batching, which is zero-copy on a single host.
 """
 
@@ -109,12 +100,6 @@ def _bf16_sibling(fp32_path: str) -> str:
 
 
 def _quantize_roundtrip(arr_f32: np.ndarray, dtype: str) -> np.ndarray:
-    """Round-trip an fp32 array through the requested quantization and back to fp32.
-
-    Used by the loader's on-the-fly fallback: when ``prefer_dtype`` is set but the
-    pre-computed quantized shard isn't on disk, we still want the model to see
-    inputs with the same precision the shard would have produced.
-    """
     from neugk_jax.dataset.preprocess import dequantize_array, quantize_array
     payload, scale = quantize_array(arr_f32, dtype)
     return dequantize_array(payload, scale, dtype, arr_f32.size).astype(np.float32, copy=False)
@@ -125,8 +110,7 @@ def _resolve_dtyped_path(fp32_path: str, prefer_dtype: str | None) -> tuple[str,
 
     ``prefer_dtype`` is one of ``fp32`` / ``fp16`` / ``bf16`` / ``i8`` /
     ``i4`` (or ``None`` / ``False`` for fp32). Falls back to fp32 silently
-    when the preferred sibling is missing — that's the graceful
-    fp32-fallback the dataset config relies on.
+    when the preferred sibling is missing.
 
     Returns ``(path, mode)`` where ``mode`` is one of ``fp32``, ``fp16``,
     ``bf16``, ``i8``, ``i4``.
@@ -172,7 +156,7 @@ class DataBackend(ABC):
     def read_phi(self, f: Any, timestamp: str, shape: Sequence[int]) -> np.ndarray: ...
 
     def read_field(self, f: Any, name: str, shape: Sequence[int]) -> np.ndarray:
-        """Read an arbitrary named ``data/<name>.bin`` shard (no timestep index)."""
+        # reads an arbitrary named data/<name>.bin shard, no timestep index
         raise NotImplementedError
 
 
@@ -183,7 +167,7 @@ class NumpyBackend(DataBackend):
 
         traj_dir/
         ├── metadata.pkl
-        ├── metadata_light.pkl  (optional; written by the upstream code)
+        ├── metadata_light.pkl  (optional)
         └── data/
             ├── timestep_00000.bin
             ├── timestep_00001.bin
@@ -203,9 +187,7 @@ class NumpyBackend(DataBackend):
         if prefer_bf16 and not prefer_dtype:
             prefer_dtype = "bf16"
         self.prefer_dtype = prefer_dtype or "fp32"
-        # if true and the preferred sibling is missing, read fp32 and round-trip
-        # through the preferred dtype on-the-fly so the model sees the same
-        # precision regardless of whether the bf16/fp16/... shards exist
+        # if true and the preferred sibling is missing, read fp32 and round-trip through the preferred dtype on-the-fly
         self.quantize_fallback = quantize_fallback
         # keep the legacy attribute name for any code still reading it
         self.prefer_bf16 = (self.prefer_dtype == "bf16")
@@ -242,8 +224,7 @@ class NumpyBackend(DataBackend):
         lightweight: bool = False,
     ) -> dict:
         path = self._strip_h5(path)
-        # metadata is stored as npz (safe, no pickle) or pkl; prefer npz, and fall back to the
-        # lightweight file when the full one is absent (published datasets ship only the light one)
+        # metadata is stored as npz (safe, no pickle) or pkl; prefer npz, fall back to the lightweight file when the full one is absent
         light_base = os.path.join(path, "metadata_light")
         full_base = os.path.join(path, "metadata")
         if (lightweight or _meta_ext(full_base) is None) and _meta_ext(light_base) is not None:
@@ -265,7 +246,7 @@ class NumpyBackend(DataBackend):
             for k in ("adiabatic", "de", "beta", "nlapar", "nlbpar"):
                 if k not in g:
                     g[k] = np.array(1.0, dtype=np.float64)
-            # gyaradax needs ffun (flux-surface function); stub with ones for CYCLONE s-α at ε→0
+            # gyaradax needs ffun (flux-surface function); stub with ones for cyclone s-α at ε→0
             if "ffun" not in g and "ints" in g:
                 g["ffun"] = np.ones_like(np.asarray(g["ints"]), dtype=np.float64)
         return meta
@@ -323,8 +304,7 @@ class NumpyBackend(DataBackend):
 class KvikIOBackend(NumpyBackend):
     """GPU-direct reads via cupy + kvikio (NVIDIA GDS).
 
-    Default backend — the upstream torch loader uses kvikio for the same
-    reason: disk → GPU bypassing the host buffer. Two modes:
+    Two modes:
 
     * ``return_jax=True`` (default): returns a ``jax.Array`` on GPU via
       ``jax.dlpack.from_dlpack(cp_arr.toDlpack())``. Zero-copy from cupy.
@@ -437,7 +417,7 @@ class KvikIOBackend(NumpyBackend):
                 arr = read_bin(path, shape)
             else:
                 gpu = self._cp_read(path, tuple(shape), dtype="fp32")
-                # host round-trip is simpler than a GPU bf16 emulation on cupy 14
+                # round-trip through host to apply the quantization
                 import cupy as cp
                 arr = cp.asnumpy(gpu).reshape(shape)
             quantized = _quantize_roundtrip(arr.ravel(), self.prefer_dtype).reshape(shape)

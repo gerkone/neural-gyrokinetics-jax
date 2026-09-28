@@ -139,9 +139,7 @@ class BaseRunner(ABC):
         for epoch in range(self.start_epoch + 1, self.cfg.training.n_epochs + 1):
             key, train_key = jax.random.split(key)
             t0 = time.perf_counter()
-            # train_epoch returns either ``loss_logs`` (back-compat) or
-            # ``(loss_logs, info_dict)`` — torch's split between core losses
-            # and per-step timing
+            # train_epoch returns either loss_logs, or (loss_logs, info_dict)
             train_out = self.train_epoch(epoch, train_key)
             if isinstance(train_out, tuple) and len(train_out) == 2:
                 loss_logs, info_dict = train_out
@@ -178,7 +176,7 @@ class BaseRunner(ABC):
             if val < self.best_val:
                 self.best_val = val
                 self.save_checkpoint(epoch, val, "best.eqx")
-            # serialization dominates short epochs — throttle the rolling checkpoint
+            # rolling checkpoint save cadence
             save_every = getattr(self.cfg.training, "save_every_n_epochs", 1)
             if epoch % save_every == 0 or epoch == self.cfg.training.n_epochs:
                 self.save_checkpoint(epoch, val, "ckp.eqx")

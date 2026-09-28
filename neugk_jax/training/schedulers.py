@@ -27,7 +27,7 @@ def warmup_cosine(
     else:
         n_warmup = max(total_steps // 10, 10 * steps_per_epoch)
     n_warmup = min(n_warmup, max(1, total_steps - 1))
-    # decay_steps is the TOTAL step count in optax; cosine phase length = decay_steps - warmup_steps
+    # decay_steps is the total step count in optax; cosine phase length = decay_steps - warmup_steps
     return optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,

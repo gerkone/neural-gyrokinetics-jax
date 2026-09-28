@@ -101,8 +101,8 @@ class Swin5DAE(eqx.Module):
             use_rpb=use_rpb, gated_attention=gated_attention,
             norm_affine=norm_affine,
             legacy_double_shortcut=legacy_double_shortcut,
-            rms_norm=True,  # upstream config uses RMSNorm
-            # AE has no encoder→decoder skips
+            rms_norm=True,
+            # ae has no encoder→decoder skips
             up_use_skip=False,
             key=kb,
         )
@@ -116,7 +116,7 @@ class Swin5DAE(eqx.Module):
         self.bottleneck_dim = bd
         self.bottleneck_grid_size = mid_grid
 
-        # bottleneck ViT blocks use RMSNorm(elementwise_affine=True) regardless of encoder setting
+        # bottleneck vit blocks use RMSNorm(elementwise_affine=True) regardless of encoder setting
         vit_kwargs = dict(
             qkv_bias=qkv_bias, qk_norm=qk_norm,
             gated_attention=gated_attention,
@@ -137,7 +137,7 @@ class Swin5DAE(eqx.Module):
         )
         self.middle_downproj = Linear(mid_dim, bd, key=k3)
         self.middle_upproj = Linear(bd, mid_dim, key=k4)
-        # AE middle_upscale uses LayerNorm (with weight + bias), matching upstream default
+        # ae middle_upscale uses LayerNorm (with weight + bias)
         self.middle_upscale = PatchExpand(
             mid_dim, mid_grid, key=k5,
             target_grid_size=self.backbone.grid_sizes[-2],
@@ -174,7 +174,7 @@ class Swin5DAE(eqx.Module):
         z = self.middle_upproj(z)
         z = self.middle_post(z)
         z = self.middle_upscale(z)
-        # no skip connections in AE decoder
+        # no skip connections in ae decoder
         for blk in self.backbone.up_blocks:
             z = blk(z, s=None)
         df = self.backbone.patch_decode(z, pad_axes)

@@ -7,7 +7,6 @@ import jax.numpy as jnp
 
 
 def mse_df(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-    """Mean squared error reduced to a scalar (raw, unnormalized)."""
     return jnp.mean((pred - target) ** 2)
 
 
@@ -42,6 +41,5 @@ def df_loss(pred: jnp.ndarray, target: jnp.ndarray, *, separate_zf: bool = False
 
 
 def per_sample_mse(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-    """Per-sample MSE, returns shape (B,). Used for diffusion SNR weighting."""
     diff = (pred - target) ** 2
     return diff.reshape(diff.shape[0], -1).mean(axis=-1)

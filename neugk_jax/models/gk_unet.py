@@ -1,9 +1,6 @@
 """N-dimensional Swin-UNet backbone used by the autoencoder.
 
-Mirrors the torch ``SwinNDUnet`` / ``Swin5DUnet`` structure but drops the
-PINC-only branches (flux head, simsiam, mask augmentation). For M1 only
-the un-conditioned forward path is wired; DiT-conditioned forward will be
-added when the diffusion model is composed.
+Drops the PINC-only branches (flux head, simsiam, mask augmentation).
 """
 
 from __future__ import annotations
@@ -92,7 +89,7 @@ class SwinBlockDown(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=rms_norm,
-                legacy_double_shortcut=False,  # e79b021 only affected plain swin blocks
+                legacy_double_shortcut=False,  # only affects plain swin blocks
             )
         else:
             self.swin = SwinLayer(
@@ -169,14 +166,7 @@ class SwinBlockUp(eqx.Module):
             self.proj_concat = None
         self.pos_embed = APE(dim, grid_size, init="sincos") if use_abs_pe else None
         self.use_cond = cond_dim is not None and cond_dim > 0
-        # UPSTREAM QUIRK (load-bearing): torch's SwinBlockUp constructs its
-        # ``swin_att`` WITHOUT forwarding ``norm_layer`` (gk_unet.py:203-214),
-        # so decoder swin blocks always use the default nn.LayerNorm even when
-        # the model's norm_fn is RMSNorm (which SwinBlockDown / middle DO get).
-        # The norms are elementwise_affine=False (no params), so translation
-        # can't catch this — but the math differs. Mirror it: the up-block
-        # swin layer is always LayerNorm; ``rms_norm`` still applies to the
-        # PatchExpand upsample (torch passes norm_layer there).
+        # decoder swin blocks always use plain layernorm regardless of rms_norm; only the patchexpand upsample respects it
         up_rms_norm = False
         if self.use_cond and cond_mode == "film":
             self.swin = FilmSwinLayer(
@@ -198,7 +188,7 @@ class SwinBlockUp(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=up_rms_norm,
-                legacy_double_shortcut=False,  # e79b021 only affected plain swin blocks
+                legacy_double_shortcut=False,  # only affects plain swin blocks
             )
         else:
             self.swin = SwinLayer(
@@ -251,7 +241,7 @@ class SwinNDUnet(eqx.Module):
     patch_embed: PatchEmbed
     cond_embed: Optional[object]
     down_blocks: list[SwinBlockDown]
-    middle: object  # ViTLayer (AE) or FilmSwinLayer (gyroswin windowed+RPB middle)
+    middle: object  # ViTLayer (ae) or FilmSwinLayer (gyroswin windowed+rpb middle)
     middle_pe: Optional[APE]
     middle_upscale: PatchExpand
     up_blocks: list[SwinBlockUp]
@@ -334,8 +324,7 @@ class SwinNDUnet(eqx.Module):
             rms_norm=rms_norm, act_fn=act_fn,
         )
         ki += 1
-        # per-U-Net conditioning embed (gyroswin): raw scalars -> 4*cond_embed_dim.
-        # When present it drives cond_dim for all FiLM/DiT blocks below.
+        # per-u-net conditioning embed (gyroswin): raw scalars to 4*cond_embed_dim; when present it drives cond_dim for all film/dit blocks below
         if n_cond > 0:
             self.cond_embed = ContinuousConditionEmbed(
                 dim=cond_embed_dim, n_cond=n_cond, key=jr.fold_in(key, 999),
@@ -368,9 +357,7 @@ class SwinNDUnet(eqx.Module):
         self.grid_sizes = tuple(grid_sizes)
         self.down_dims = tuple(down_dims)
 
-        # middle: global attention at the deepest grid. The AE uses a plain ViT
-        # (dead in translation); gyroswin uses a windowed SwinLayer with RPB whose
-        # window == the bottleneck grid (so it is global) + per-block FiLM.
+        # middle: global attention at the deepest grid; the ae uses a plain vit, gyroswin uses a windowed swinlayer with rpb whose window equals the bottleneck grid (so it's global) plus per-block film
         if middle_swin and cond_mode == "dit":
             self.middle = DiTSwinLayer(
                 space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
@@ -379,7 +366,7 @@ class SwinNDUnet(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm, use_rpb=use_rpb,
                 gated_attention=gated_attention, rms_norm=rms_norm,
-                legacy_double_shortcut=False,  # e79b021 only affected plain swin blocks
+                legacy_double_shortcut=False,  # only affects plain swin blocks
             )
         elif middle_swin:
             self.middle = FilmSwinLayer(
@@ -402,7 +389,7 @@ class SwinNDUnet(eqx.Module):
             )
         ki += 1
         self.middle_pe = APE(down_dims[-1], grid_sizes[-1], init="sincos") if use_abs_pe else None
-        # upstream middle_upscale uses LayerNorm (unlike PatchMerge which uses RMSNorm)
+        # middle_upscale always uses layernorm (unlike PatchMerge's rmsnorm)
         self.middle_upscale = PatchExpand(
             down_dims[-1], grid_sizes[-1], key=keys[ki],
             target_grid_size=grid_sizes[-2], c_multiplier=c_multiplier,
@@ -451,7 +438,7 @@ class SwinNDUnet(eqx.Module):
         ki += 1
         self.up_blocks = up_blocks
 
-        # unpatch: expand back to padded base resolution (norm=False, matching upstream)
+        # unpatch: expand back to padded base resolution (norm=False)
         self.unpatch = PatchExpand(
             up_dims[-1], up_grid_sizes[-1], key=keys[ki],
             expand_by=tuple(p if p > 0 else 1 for p in patch_size),
@@ -460,7 +447,6 @@ class SwinNDUnet(eqx.Module):
             norm=False, use_conv=conv_patch, patch_skip=unpatch_patch_skip,
             cond_dim=(cond_dim if self.cond_embed is not None else None),
         )
-        # assign static fields
         self.space = space
         self.base_resolution = tuple(base_resolution)
         self.padded_base_resolution = tuple(padded_base)
@@ -473,7 +459,6 @@ class SwinNDUnet(eqx.Module):
     # forward path
 
     def condition(self, cond):
-        """Embed raw conditioning scalars to the block cond_dim (or None)."""
         if self.cond_embed is None or cond is None:
             return None
         return self.cond_embed(cond)
@@ -566,7 +551,7 @@ class Swin5DUnet(SwinNDUnet):
         self.original_in_channels = full_in
         self.original_out_channels = full_out
         if decouple_mu:
-            # learnable pe for the collapsed mu axis; shape mirrors torch vel_pe buffer
+            # learnable pe for the collapsed mu axis
             vel_pe_resolution = (1, decoupled_dim, 1, 1, 1)
             self.vel_pe = APE(
                 full_in, vel_pe_resolution, init="normal", learnable=True,

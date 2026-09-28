@@ -1,8 +1,6 @@
 """Gyaradax adapter — phi / particle / heat / momentum fluxes from df.
 
-The upstream torch repo carries its own python port of the GKW field-solve
-+ phase-space integrals (``neugk/integrals.py:FluxIntegral``). We delegate
-to the pure-JAX ``gerkone/gyaradax`` package instead. The API:
+Delegates to the pure-JAX ``gerkone/gyaradax`` package. The API:
 
     from gyaradax.integrals import get_integrals
     phi, (pflux, eflux, vflux) = get_integrals(df, geometry, params=None, ...)
@@ -13,8 +11,7 @@ quantities should run in ``float64`` — ``gyaradax`` sets
 the training graph so the x64 promotion is contained to eval-only
 ``jit`` blocks.
 
-Note: ``gyaradax`` is electrostatic-only at the moment (no apar/bpar
-paths). That matches what the upstream evaluator actually uses.
+``gyaradax`` is electrostatic-only at the moment (no apar/bpar paths).
 """
 
 from __future__ import annotations
@@ -35,11 +32,6 @@ _PARAM_KEYS = ("adiabatic", "beta", "nlapar", "nlbpar")
 
 
 def _split_geom_and_params(geometry: dict[str, jnp.ndarray]):
-    """Separate gyaradax's geometry dict from its params dict.
-
-    Upstream's torch ``FluxIntegral`` lumps everything into one geometry
-    dict; gyaradax expects them split.
-    """
     geom = {k: geometry[k] for k in _GEOMETRY_KEYS if k in geometry}
     params_dict = {k: geometry[k] for k in _PARAM_KEYS if k in geometry}
     return geom, params_dict
@@ -73,7 +65,6 @@ def batched_integrals(
     *,
     adiabatic_electrons: bool = True,
 ):
-    """``vmap``ed compute_integrals over the batch axis (axis 0)."""
     def one(df, geom_one):
         return compute_integrals(df, geom_one, adiabatic_electrons=adiabatic_electrons)
     return jax.vmap(one)(df_batch, geometry_batch)
@@ -98,19 +89,8 @@ def gyaradax_flux_integrals(
         forward FFT (x, y, norm='forward'; ifftshift on x) → gyaradax
         ``get_integrals`` adiabatic path.
 
-    **Parseval correction** — upstream torch's metadata.pkl ships
-    ``parseval = [1, ny, ny, ...]`` (a physics bug: it should be the
-    Hermitian-symmetry factor ``[1, 2, 2, ...]``, see
-    ``gyaradax/geometry/geom.py:geometry_from_geom_dat_and_input``).
-    Torch's ``pev_fluxes`` then double-counts ``ints`` to cancel the
-    ``ny/2`` overcount — both bugs land on the right flux. We refuse to
-    inherit the bug: ``parseval`` is replaced here with the correct
-    ``where(|krho|<1e-12, 1, 2)``, and the single-``ints`` formula in
-    gyaradax then gives the same flux values as upstream torch to fp64
-    precision, with the correct underlying physics.
-
-    Roughly **300× faster** than the torch FluxIntegral bridge on CPU
-    (~12 ms vs ~3.35 s per batch-of-4).
+    Overrides ``parseval`` with the Hermitian-symmetry factor
+    ``where(|krho|<1e-12, 1, 2)``.
     """
     df_batch = jnp.asarray(df_batch)
     B = df_batch.shape[0]
@@ -162,8 +142,7 @@ def gyaradax_spectral_fields(
                       channel-of-4 layout; a plain 2-channel df also works).
         geometry_one: single-trajectory geometry dict (no batch axis).
 
-    Applies the same corrected-parseval override as
-    ``gyaradax_flux_integrals`` (see the comment there).
+    Applies the same ``parseval`` override as ``gyaradax_flux_integrals``.
     """
     import gyaradax  # noqa: F401 — enables jax x64 before any array conversion
     df_batch = jnp.asarray(df_batch)
@@ -197,17 +176,9 @@ def _gyaradax_spectral_one(df_one, geom):
 
 
 def _torch_zonal_quirk(gt, geom, spec, phi):
-    """Replicate upstream torch's zonal-correction quirk on one phi mode.
-
-    ``neugk/physics/integrals.py:solve_fields`` special-cases kx INDEX 0 on
-    the zonal (ky index 0) column (``poisson_diag[..., 0, 0] = 0``,
-    ``maty[..., 0, :] = 1``) instead of the kx=0 mode. gyaradax applies the
-    same treatment at ``ixzero = argmin|kxrh|`` — at that mode the two
-    formulations coincide analytically (gamma=1 there), so torch and
-    gyaradax phi differ ONLY at (kx_idx=0, ky_idx=0). The mode is the
-    zonal-profile diagnostic's, so we inherit the torch value for metric
-    parity; fluxes are untouched (eflux ∝ krho = 0 on the zonal column).
-    torch there reduces to ``phi = phi_raw + Σ_s matz·phi_raw``.
+    """Special-case the zonal (kx_idx=0, ky_idx=0) phi mode to match the
+    torch zonal-profile convention; fluxes are unaffected (eflux ∝ krho = 0
+    on the zonal column). Reduces to ``phi = phi_raw + Σ_s matz·phi_raw``.
     """
     de, signz, tmp = gt["de"], gt["signz"], gt["tmp"]
     intvp, intmu, bn = gt["intvp"], gt["intmu"], gt["bn"]
@@ -277,12 +248,11 @@ def torch_flux_integrals(
     df_batch,
     geometry_batch: dict,
 ):
-    """Compute ``(phi, eflux)`` by delegating to upstream torch ``FluxIntegral``.
+    """Compute ``(phi, eflux)`` by delegating to torch ``FluxIntegral``.
 
-    Runs on CUDA so the eval doesn't blow up to thousands of CPU OpenMP
-    threads (saw 1290 threads at 0% GPU util before — the per-batch
-    CPU FluxIntegral was the eval bottleneck). The integrator is built
-    once and cached. Returns ``(phi_np, eflux_np)`` as host numpy arrays.
+    Prefers CUDA, falls back to CPU with a capped thread count. The
+    integrator is built once and cached. Returns ``(phi_np, eflux_np)``
+    as host numpy arrays.
     """
     import numpy as _np
     import torch
@@ -291,7 +261,7 @@ def torch_flux_integrals(
 
     device = torch_flux_integrals._device
     if device is None:
-        # FluxIntegral CUDA path fails nvrtc on this cluster; CPU fallback with thread cap (override via TORCH_FLUX_DEVICE)
+        # cpu fallback with a capped thread count; override via TORCH_FLUX_DEVICE
         import os
         override = os.environ.get("TORCH_FLUX_DEVICE")
         if override:

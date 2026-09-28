@@ -92,11 +92,7 @@ def test_spectral_metrics_parity(snapshots):
         if k in tam:
             print(f"{k:>16}: torch={tam[k]: .8e}  jax={jam[k]: .8e}  rel={_rel(jam[k], tam[k]):.2e}")
 
-    # zonal-flow profile metrics come from the phi solve; the jax port
-    # replicates torch's zonal-correction quirk (solve_fields special-cases
-    # kx INDEX 0 on the ky=0 column instead of the kx=0 mode — see
-    # integrals._torch_zonal_quirk), so these agree to ~1e-6 (measured);
-    # assert the required ~1e-4
+    # jax replicates torch's zonal-correction quirk (kx index 0 special-cased on the ky=0 column, see integrals._torch_zonal_quirk)
     for k in ("zfphi_rl2", "zfflow_rl2", "zfshear_rl2", "zf_energy_err"):
         assert _rel(jam[k], tam[k]) < 1e-4, (
             f"{k}: torch={tam[k]} jax={jam[k]} rel={_rel(jam[k], tam[k]):.3e}"
@@ -108,15 +104,7 @@ def test_spectral_metrics_parity(snapshots):
             f"{k}: torch={tam[k]} jax={jam[k]} rel={_rel(jam[k], tam[k]):.3e}"
         )
 
-    # qspec: torch pev_fluxes double-counts ints AND ships the ny-parseval
-    # (ny=32 -> 16x per non-zonal mode); gyaradax corrects both (single ints,
-    # parseval=2). For this dataset the two torch bugs cancel EXACTLY:
-    # uniform ints = 1/16 double-counted x parseval 32/2 = 16 -> ratio 1.
-    # Measured torch/jax per-mode ratio: mean 0.99999741, std 1.4e-5 — i.e.
-    # NO scale factor; the +-1e-5 scatter is bessel-implementation noise
-    # (torch.special.bessel_j0/i0 vs jax.scipy bessel_jn/i0e), largest on
-    # near-zero-amplitude corner modes, not a constant offset. Assert the
-    # ratio stays 1 at that noise level rather than elementwise equality.
+    # torch pev_fluxes double-counts ints and ships the ny-parseval factor; gyaradax corrects both, and for this dataset the two torch bugs cancel to a ratio of 1
     q_t = np.stack([d["qspec"] for d in tg], 0).mean(0)
     q_j = np.stack([d["qspec"] for d in jg], 0).mean(0)
     mask = np.abs(q_j) > 1e-12 * np.abs(q_j).max()

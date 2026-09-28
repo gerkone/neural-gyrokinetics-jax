@@ -36,7 +36,7 @@ def _prod(xs):
 
 
 def _normalize_patch(patch_size: Sequence[int]) -> tuple[int, ...]:
-    """Replace 0/None entries with 1 (axis kept unchanged)."""
+    # 0/none entries become 1
     return tuple(p if p and p > 0 else 1 for p in patch_size)
 
 
@@ -106,7 +106,7 @@ def pad_to_blocks(
 def unpad(
     x: jnp.ndarray, pad_amounts: Sequence[int], base_resolution: Sequence[int]
 ) -> jnp.ndarray:
-    """Trim back to ``base_resolution`` along the leading axes."""
+    # trim back to base_resolution along the leading axes
     slices = [slice(0, s) for s in base_resolution]
     slices += [slice(None)] * (x.ndim - len(base_resolution))
     return x[tuple(slices)]
@@ -118,8 +118,7 @@ class PatchEmbed(eqx.Module):
     """Fold + MLP channel mixer.
 
     Input  ``(*spatial, in_channels)`` → output ``(*grid, embed_dim)``.
-    The MLP is stored under ``patch`` to match upstream torch's naming
-    (``patch_embed.patch.mlp.{0,3}.{weight,bias}``).
+    The MLP is stored under ``patch`` (``patch_embed.patch.mlp.{0,3}.{weight,bias}``).
     """
 
     patch: MLP
@@ -149,10 +148,10 @@ class PatchEmbed(eqx.Module):
         self.in_channels = in_channels
         self.embed_dim = embed_dim
         patch_elems = _prod(ps) * in_channels
-        # hidden = embed_dim * mlp_ratio, no max-clamp (matches torch)
+        # hidden = embed_dim * mlp_ratio, no max-clamp
         hidden = int(embed_dim * mlp_ratio)
         dims = [patch_elems] + [hidden] * (mlp_depth - 1) + [embed_dim]
-        # PatchEmbed MLP uses the model act_fn (config: GELU); bias=False
+        # PatchEmbed mlp uses the model act_fn (config: gelu); bias=False
         self.patch = MLP(dims, key=key, act_fn=act_fn, use_bias=False)
         self.norm = _norm(embed_dim, rms=rms_norm) if norm else None
 
@@ -208,7 +207,7 @@ class PatchMerge(eqx.Module):
         self.proj = Linear(in_features, out_features, key=key, use_bias=False)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # pad odd-length axes to a multiple of 2, matching upstream torch PatchMerge.forward
+        # pad odd-length axes to a multiple of 2
         x, _ = pad_to_blocks(x, self.patch_size)
         x = fold_patches(x, self.patch_size)
         x = self.norm(x)
@@ -258,11 +257,10 @@ class PatchExpand(eqx.Module):
 
     Upsamples spatial axes by ``expand_by`` and reduces channels by
     ``c_multiplier`` (or sets them to ``out_channels`` when given). The
-    MLP is stored under ``expansion`` to match upstream's naming
-    (``unpatch.expansion.mlp.0.weight`` etc.).
+    MLP is stored under ``expansion`` (``unpatch.expansion.mlp.0.weight`` etc.).
     """
 
-    expansion: object  # MLP (mlp patch) or eqx.nn.ConvTranspose (conv patch)
+    expansion: object  # mlp (mlp patch) or eqx.nn.ConvTranspose (conv patch)
     proj_concat: Optional[Linear]
     modulation: Optional[object]  # Film, when cond_dim given (unpatch)
     norm: Optional[object]
@@ -326,23 +324,23 @@ class PatchExpand(eqx.Module):
             # stride==kernel ConvTranspose, torch layout (in, out, *kernel) -> direct copy
             self.expansion = StridedConvTranspose(dim, self.out_dim, eb, key=kexp)
         else:
-            # hidden = prod(expand_by) * mlp_ratio, not dim * mlp_ratio (matches torch)
+            # hidden = prod(expand_by) * mlp_ratio, not dim * mlp_ratio
             hidden = int(_prod(eb) * mlp_ratio)
             dims = [dim] + [hidden] * (mlp_depth - 1) + [inner]
-            # upstream PatchExpand uses LeakyReLU + bias=True
+            # leaky_relu, bias=true
             self.expansion = MLP(dims, key=kexp, act_fn=leaky_relu, use_bias=True)
-        # patch-skip residual projection (Linear(2*dim->dim) + LeakyReLU) and FiLM
+        # patch-skip residual projection (linear 2*dim->dim + leaky_relu) and film modulation
         self.proj_concat = Linear(2 * dim, dim, key=kpc) if patch_skip else None
         if cond_dim:
             from neugk_jax.models.swin import Film
             self.modulation = Film(cond_dim, dim, key=kmod)
         else:
             self.modulation = None
-        # norm runs over out_dim channels after unfold, matching torch PatchExpand.forward
+        # norm runs over out_dim channels after unfold
         self.norm = _norm(self.out_dim, rms=rms_norm) if norm else None
 
     def __call__(self, x: jnp.ndarray, cond: Optional[jnp.ndarray] = None) -> jnp.ndarray:
-        # torch order: proj_concat (skip residual) -> FiLM -> expansion -> crop -> norm
+        # order: proj_concat (skip residual) -> film -> expansion -> crop -> norm
         if self.proj_concat is not None:
             x = leaky_relu(self.proj_concat(x))
         if self.modulation is not None:

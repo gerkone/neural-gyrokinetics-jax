@@ -1,4 +1,4 @@
-"""GyroSwin workflow (JAX port). Mirrors ``neugk.gyroswin``."""
+"""GyroSwin workflow (JAX port)."""
 
 from neugk_jax.gyroswin.runner import GyroSwinRunner
 

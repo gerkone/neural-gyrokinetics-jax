@@ -115,7 +115,7 @@ def test_ae_e2e_train_eval(cyclone_dir, tmp_path):
 
 def test_fm_e2e_train_eval(cyclone_dir, tmp_path):
     path, resolution = cyclone_dir
-    # 1. build + save a tiny AE so the FM runner has something to load
+    # 1. build + save a tiny ae so the fm runner has something to load
     ae_dir = tmp_path / "ae_ckpt"
     ae_dir.mkdir()
     ae_cfg = _tiny_ae_cfg(path, resolution, ae_dir)
@@ -128,7 +128,7 @@ def test_fm_e2e_train_eval(cyclone_dir, tmp_path):
     ae_weights = ae_dir / "ae.eqx"
     save_model_only(ae_weights, ae)
 
-    # 2. compose a tiny FM config that runs full train+eval
+    # 2. compose a tiny fm config that runs full train+eval
     out = tmp_path / "fm_run"
     fm_cfg = OmegaConf.create(OmegaConf.to_container(ae_cfg))
     fm_cfg.workflow = "diffusion"

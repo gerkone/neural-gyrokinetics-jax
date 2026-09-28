@@ -65,7 +65,7 @@ def main():
     torch.save({"model_state_dict": state, "epoch": 0}, args.out)
     sz = os.path.getsize(args.out)
     print(f"wrote {args.out}  ({sz / 1e6:.1f} MB, {len(state)} keys)")
-    # print a small sample of the keys so the JAX translator can be eyeballed
+    # print a small sample of the keys so the jax translator can be eyeballed
     sample = sorted(state.keys())[:6] + ["...(elided)"] + sorted(state.keys())[-6:]
     for k in sample:
         if k.startswith("..."):

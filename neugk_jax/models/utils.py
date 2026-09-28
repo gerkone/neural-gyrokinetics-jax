@@ -24,28 +24,19 @@ import jax.random as jr
 
 
 def gelu(x):
-    """Exact (erf-based) GELU — matches ``torch.nn.GELU()`` default.
-
-    ``jax.nn.gelu`` defaults to ``approximate=True`` (tanh approximation);
-    we want exact so the math lines up with torch-trained weights.
-    """
+    # approximate=False matches torch.nn.GELU()'s default (jax defaults to approximate=True)
     return jax.nn.gelu(x, approximate=False)
 
 
 def relu(x):
-    """ReLU forwarder. We can't pickle ``jax.nn.relu`` directly because its
-    pjit-wrapped identity drifts across imports; this top-level function does.
-    """
     return jax.nn.relu(x)
 
 
 def leaky_relu(x):
-    """LeakyReLU(0.01) forwarder — same pickle workaround as ``relu``."""
     return jax.nn.leaky_relu(x, negative_slope=0.01)
 
 
 def silu(x):
-    """SiLU forwarder — same pickle workaround."""
     return jax.nn.silu(x)
 
 
@@ -176,7 +167,7 @@ class Film(eqx.Module):
 
 
 class DiTModulation(eqx.Module):
-    """DiT-style 6-way modulation: (scale1, shift1, gate1, scale2, shift2, gate2) — upstream order."""
+    """DiT-style 6-way modulation: (scale1, shift1, gate1, scale2, shift2, gate2)."""
 
     proj: Linear
     dim: int = eqx.field(static=True)
@@ -197,9 +188,7 @@ class DiTModulation(eqx.Module):
 class RMSNorm(eqx.Module):
     """Root-mean-square normalisation on the last axis.
 
-    Mirrors ``nn.RMSNorm(dim, elementwise_affine=...)``. With
-    ``elementwise_affine=False`` no learnable weight is allocated —
-    matches torch's swin block norms.
+    With ``elementwise_affine=False`` no learnable weight is allocated.
     """
 
     weight: jax.Array | None
@@ -226,12 +215,7 @@ class RMSNorm(eqx.Module):
 
 
 class Gate(eqx.Module):
-    """Headwise multiplicative gate (``gated_attention=True`` in upstream).
-
-    Mirrors ``Gate(head_dim) = Sequential(ReLU, Linear(d, d), Sigmoid)``.
-    Torch stores the Linear at ``gate.gate.1.{weight,bias}``; ours lives at
-    ``gate.proj.inner.{weight,bias}`` (translator bridges the two).
-    """
+    """Headwise multiplicative gate: ``sigmoid(linear(relu(g))) * x``."""
 
     proj: Linear
 

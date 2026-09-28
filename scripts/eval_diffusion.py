@@ -68,7 +68,7 @@ def main():
         cfg = yaml.safe_load(f)
     dcfg = cfg.get("dataset", {}) or {}
 
-    # AE config lives next to the AE checkpoint — same convention as FlowMatchingRunner
+    # ae config lives next to the ae checkpoint — same convention as FlowMatchingRunner
     ae_cfg = os.path.join(os.path.dirname(args.ae_ckpt), "config.yaml")
     ae = load_or_translate(build_ae_from_config(ae_cfg, key=jr.PRNGKey(0)), args.ae_ckpt)
     dit = load_or_translate(build_dit_from_config(args.config, ae, key=jr.PRNGKey(0)), args.dit_ckpt)
@@ -105,7 +105,7 @@ def main():
                 latent_scale = float(args.latent_scale)
                 print(f"latent_scale = {latent_scale:.4f} (from --latent-scale, as trained)")
             else:
-                # 1 / std of the AE latents, estimated from a few samples of this split
+                # 1 / std of the ae latents, estimated from a few samples of this split
                 idx = np.linspace(0, len(ds) - 1, num=min(8, len(ds)), dtype=int)
                 z = jax.vmap(lambda x: ae.encode(x)[0])(
                     jnp.stack([jnp.asarray(ds[int(i)].df) for i in idx])

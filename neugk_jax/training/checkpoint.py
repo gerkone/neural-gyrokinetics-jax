@@ -20,7 +20,6 @@ import jax.numpy as jnp
 
 
 def _to_numpy_tree(tree):
-    """Convert all jax arrays to numpy arrays for pickling."""
     import numpy as np
     return jax.tree_util.tree_map(
         lambda x: np.asarray(x) if isinstance(x, jax.Array) else x, tree

@@ -1,8 +1,4 @@
-"""GyroSwin training runner — multi-task MSE on df + phi (+ optional flux).
-
-Mirrors ``neugk/gyroswin/run.py`` minus the upstream extras we're not porting
-yet (pushforward unrolls, Muon optimizer, GradientBalancer, baseline models).
-"""
+"""GyroSwin training runner — multi-task MSE on df + phi (+ optional flux)."""
 
 from __future__ import annotations
 
@@ -58,8 +54,7 @@ class GyroSwinRunner(BaseRunner):
 
     def setup_components(self) -> None:
         cfg = self.cfg
-        # we route via translate.build_gyroswin_from_config so the config layout
-        # is identical to torch — pass our hydra ``cfg`` after dumping it to a YAML-shaped dict
+        # route via build_gyroswin_from_config after dumping the hydra cfg to a yaml-shaped dict
         from omegaconf import OmegaConf
         cfg_d = OmegaConf.to_container(cfg, resolve=True)
         # build expects a {"model": ..., "dataset": ...} layout
@@ -71,7 +66,7 @@ class GyroSwinRunner(BaseRunner):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             yaml.safe_dump({"model": cfg_d["model"], "dataset": cfg_d["dataset"]}, f)
             tmp_cfg = f.name
-        # a jax-trained model uses the corrected residual unless the config says otherwise
+        # defaults to the non-legacy residual unless the config overrides it
         self.model = build_gyroswin_from_config(
             tmp_cfg, key=jr.PRNGKey(getattr(cfg, "seed", 0)),
             legacy_double_shortcut=cfg.model.get("legacy_swin_shortcut", False),

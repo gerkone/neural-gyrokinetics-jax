@@ -49,10 +49,7 @@ def _shaped_cfg(cfg_path, extra_ds=None):
 def _report(tag, model, sd, fn):
     n_leaves = len(list(jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))))
     _, missing, unused = fn(model, sd, strict=False)
-    # torch registers shared modules under several names (df_up_blocks =
-    # df_unet.up_blocks, phi_middle = phi_unet.middle, ...), so the state_dict
-    # holds byte-identical duplicates. Only count an unused key as REAL if no
-    # used key carries the same bytes.
+    # torch aliases shared modules under several keys; only count unused as real if no used key has the same bytes
     used_bytes = {sd[k].tobytes() for k in set(sd) - set(unused)}
     real_unused = [k for k in unused if sd[k].tobytes() not in used_bytes]
     print(f"[{tag}] jax_leaves={n_leaves} torch_keys={len(sd)} -> "
@@ -70,8 +67,7 @@ def check_gyroswin(name):
     # show a few of each for debugging
     for m in miss[:12]:
         print("    MISSING", m)
-    # cold/warm train with flux loss weight 0.0 -> torch still builds the
-    # (conditioned) flux head but it never gets a gradient; dead weights.
+    # flux_head weights are dead when the flux loss weight is 0.0 (still built, never trained)
     dead_flux = [u for u in real_unused if u.startswith("flux_head")]
     other = [u for u in real_unused if not u.startswith("flux_head")]
     if dead_flux:
@@ -98,7 +94,7 @@ def check_dit(name="DIFF_FLOW", ae_name="AE_noCond"):
         load_torch_state,
         translate_dit,
     )
-    # only the AE's shapes matter for the DiT template — no AE weights needed
+    # only the ae's shapes matter for the DiT template — no ae weights needed
     ae = build_ae_from_config(_find(ae_name), key=jr.PRNGKey(0), resolution=RES)
     model = build_dit_from_config(_find(name), ae, key=jr.PRNGKey(0))
     sd = load_torch_state(_pth(name))

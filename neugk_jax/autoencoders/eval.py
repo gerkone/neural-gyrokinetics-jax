@@ -1,9 +1,4 @@
-"""AE evaluator: reconstruction MSE + optional integrals via gyaradax.
-
-Mirrors ``neugk/pinc/autoencoders/eval.py:AutoencoderEvaluator`` but
-trimmed to the bits the user actually trains (recon metrics + integrals
-+ cross-section plots). Linear probing is left as a follow-up.
-"""
+"""AE evaluator: reconstruction MSE + optional integrals via gyaradax, plus cross-section plots."""
 
 from __future__ import annotations
 
@@ -110,8 +105,7 @@ class AEEvaluator(BaseEvaluator):
                     rollout = {"df": pred_d}
                     gt = {"df": tgt_d}
                     if integrated is not None and integrated.get("phi") is not None:
-                        # phi is the spectral-space (s, k_x, k_y) potential, complex-valued —
-                        # plot the magnitude so matplotlib can render it
+                        # phi is complex-valued; plot the magnitude so matplotlib can render it
                         rollout["phi"] = np.abs(np.asarray(integrated["phi"])[b_idx])
                         gt["phi"] = np.abs(np.asarray(integrated["phi_tgt"])[b_idx])
                     panels = generate_val_plots(
@@ -127,6 +121,7 @@ class AEEvaluator(BaseEvaluator):
         running, n_acc = self._sync(running, n_acc)
         # rename to torch's canonical keys
         finalized = self._finalize(running, n_acc)
+        # rename to canonical metric keys
         renamed = {
             "df_mse" if k == "df" else
             "phi_int_mse" if k == "phi_int" else

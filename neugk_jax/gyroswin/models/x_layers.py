@@ -1,9 +1,8 @@
 """Cross-attention layers used to mix the df and phi U-Net latents.
 
-Port of ``neugk/gyroswin/models/x_layers.py``: ``MixingBlock`` is a single
-cross-attention + MLP block; ``VSpaceReduce`` integrates over the velocity
-axes via a learned query token; ``RSpaceReduce`` does the same over real
-space (used by the FluxDecoder, kept for completeness).
+``MixingBlock`` is a single cross-attention + MLP block; ``VSpaceReduce``
+integrates over the velocity axes via a learned query token; ``RSpaceReduce``
+does the same over real space (used by the FluxDecoder, kept for completeness).
 """
 
 from __future__ import annotations
@@ -58,12 +57,11 @@ class MixingBlock(eqx.Module):
     def __call__(self, left: jnp.ndarray, right: Optional[jnp.ndarray] = None,
                  *, key=None, inference: bool = True) -> jnp.ndarray:
         right = right if right is not None else left
-        # tokenize: (*spatial, C) -> (N, C). We expect the caller to pass already-flat (*..., C).
+        # tokenize: (*spatial, C) -> (N, C); caller must pass already-flat (*..., C)
         l_shape = left.shape
         l_tok = left.reshape(-1, l_shape[-1])
         r_tok = right.reshape(-1, right.shape[-1])
-        # torch MixingBlock (x_layers.py:90-94): post-norm on attn output, but
-        # PRE-norm on the MLP branch — x = x + drop_path(mlp(norm2(x))).
+        # post-norm on the attn output, pre-norm on the mlp branch
         x = self.drop_path(self.norm1(self.attn(l_tok, r_tok)), key=key, inference=inference)
         x = l_tok + x
         x = x + self.drop_path(jax.vmap(self.mlp)(self.norm2(x)), key=key, inference=inference)
@@ -155,7 +153,6 @@ class LatentMixingTransformer(eqx.Module):
 class FluxDecoder(eqx.Module):
     """Predict a scalar flux from the per-scale (phi, df) latents.
 
-    Port of ``neugk/gyroswin/models/x_layers.py:FluxDecoder`` with reduction="max".
     One ``LatentMixingTransformer`` stage per scale: stage ``i`` cross-attends the
     phi latent (query) to the df latent (kv), global-max-pools over space to a
     vector of ``left_dims[i]``, and the per-scale vectors are concatenated and fed
@@ -175,7 +172,7 @@ class FluxDecoder(eqx.Module):
         self.flux_mlp = MLP([flux_latent, flux_latent // 2, 1], act_fn=gelu, key=ks[-1])
 
     def mix(self, i: int, left: jnp.ndarray, right: jnp.ndarray) -> jnp.ndarray:
-        """Stage ``i``: cross-mix then global max-pool over all spatial axes -> (dim,)."""
+        # cross-mix then global max-pool over all spatial axes -> (dim,)
         x = self.blocks[i](left, right)
         return jnp.max(x.reshape(-1, x.shape[-1]), axis=0)
 

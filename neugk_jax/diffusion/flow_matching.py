@@ -1,8 +1,5 @@
 """Latent rectified flow matching (Gaussian prior, continuous time, OT-coupled).
 
-Mirrors ``FlowMatchingRunner`` in the upstream torch repo
-(``neugk/diffusion/run.py:552-617``):
-
 * ``x0 ~ N(0, I)``
 * ``x1 = encoded_df * latent_scale``
 * ``t ~ sigmoid(N(0, 1))`` (continuous time path)
@@ -27,12 +24,11 @@ import numpy as np
 
 
 def sample_prior(key, shape, dtype=jnp.float32):
-    """Gaussian prior x0."""
     return jr.normal(key, shape, dtype=dtype)
 
 
 def sample_time(key, batch: int, dtype=jnp.float32):
-    """``t ~ sigmoid(N(0, 1))`` — biases mass toward the middle of [0, 1]."""
+    # t ~ sigmoid(n(0, 1))
     return jax.nn.sigmoid(jr.normal(key, (batch,), dtype=dtype))
 
 
@@ -41,16 +37,12 @@ def minibatch_ot(x0: jnp.ndarray, x1: jnp.ndarray) -> jnp.ndarray:
 
     Uses scipy's Hungarian algorithm via ``jax.pure_callback``, so the coupling
     also works inside a jit'd training step — fine for the small batch sizes flow
-    matching typically uses (upstream torch does the same scipy call).
+    matching typically uses.
 
-    Bug fix vs upstream: ``scipy.optimize.linear_sum_assignment`` returns
-    ``(row_ind, col_ind)`` where ``row_ind`` is always the identity
-    permutation for a square cost matrix. Upstream's ``x0[row_ind]`` is
-    therefore a no-op, silently disabling OT coupling during training.
-    The correct permutation is over ``col_ind``: pair ``x0[i]`` with
-    ``x1[col_ind[i]]``. Equivalently we re-order ``x0`` so that the
-    returned ``x0_new[i]`` is the OT-match for the original ``x1[i]``,
-    which is ``x0[argsort(col_ind)]``.
+    ``scipy.optimize.linear_sum_assignment`` returns ``(row_ind, col_ind)``
+    where ``row_ind`` is the identity permutation for a square cost matrix,
+    so the OT pairing is ``x0[i] <-> x1[col_ind[i]]``. Re-ordering ``x0`` so
+    that ``x0_new[i]`` is the match for ``x1[i]`` gives ``x0[argsort(col_ind)]``.
     """
     bs = x0.shape[0]
     x0_flat = x0.reshape(bs, -1)
@@ -134,7 +126,7 @@ def _midpoint_step(velocity, x, ti, dti):
 
 
 def _heun_step(velocity, x, ti, dti):
-    """Explicit trapezoid: exact for a velocity field that is linear along the path."""
+    # explicit trapezoid
     k1 = velocity(x, ti)
     k2 = velocity(x + dti * k1, ti + dti)
     return 0.5 * dti * (k1 + k2)
@@ -176,10 +168,9 @@ def euler_sample(
     schemes at matched NFE via :data:`NFE_PER_STEP`, not at matched step count.
 
     Fused as a single ``jax.lax.scan`` so the whole sampling roll-out is
-    one jit'd kernel — avoids the per-step host-device sync the previous
-    Python ``for`` loop incurred. ``shape = (B, *latent_grid, z_dim)``
-    matches the encoder's output. Returns a sample in the data scale
-    (divides by ``latent_scale`` at the end to undo the encoder's whitening).
+    one jit'd kernel. ``shape = (B, *latent_grid, z_dim)`` matches the
+    encoder's output. Returns a sample in the data scale (divides by
+    ``latent_scale`` at the end to undo the encoder's whitening).
     """
     bs = shape[0]
     # prior_fn overrides the gaussian source (e.g. structured/tied noise)

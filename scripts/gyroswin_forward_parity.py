@@ -54,7 +54,7 @@ tcfg = OmegaConf.create({"model": mcfg,
 from neugk.gyroswin.models import get_model
 
 if args.pre_fix_residual:
-    # restore the pre-e79b021 doubled MLP shortcut the checkpoints were trained with
+    # restore the pre-e79b021 doubled mlp shortcut the checkpoints were trained with
     from neugk.models.nd_vit import swin_layers as _sl
 
     def _pre_fix_forward(self, x):

@@ -85,15 +85,14 @@ def init_distributed(*, port: int = 29500, axis_name: str = "dp") -> Distributed
 
 
 def data_sharding(mesh: Mesh, axis_name: str = "dp") -> NamedSharding:
-    """``NamedSharding`` that places the leading axis on ``axis_name`` and replicates the rest."""
+    # leading axis on axis_name, rest replicated
     return NamedSharding(mesh, P(axis_name))
 
 
 def replicated(mesh: Mesh) -> NamedSharding:
-    """``NamedSharding`` that fully replicates over the mesh."""
     return NamedSharding(mesh, P())
 
 
 def all_reduce_mean(x):
-    """Cross-device mean (use inside ``shard_map``)."""
+    # use inside shard_map
     return jax.lax.pmean(x, axis_name="dp")

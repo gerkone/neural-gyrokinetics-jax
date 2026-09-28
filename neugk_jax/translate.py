@@ -35,9 +35,7 @@ def force_f32(model):
     """Cast every f64 ``jax.Array`` leaf in ``model`` down to f32.
 
     ``eqx.nn.Linear`` initialises with the JAX default dtype, which is f64
-    whenever ``jax_enable_x64`` is on (gyaradax flips it on import). Letting
-    those f64 leaves through to the sampler breaks ``jax.lax.scan`` and
-    silently doubles every cudnn/cublas kernel cost.
+    whenever ``jax_enable_x64`` is on (gyaradax flips it on import).
     """
     return jax.tree_util.tree_map(
         lambda x: x.astype(jnp.float32)
@@ -49,9 +47,9 @@ def force_f32(model):
 def _stub_pickle_module():
     """``pickle`` shim whose unpickler stubs classes it cannot import.
 
-    Deepspeed-saved checkpoints pickle trainer-side objects (``LossScaler``) whose
-    module only imports with a CUDA toolchain present. We read tensors, never those
-    objects, so a placeholder class is enough to get past them.
+    Replaces any class that fails to import (e.g. deepspeed's ``LossScaler``,
+    which needs a CUDA toolchain) with a permissive placeholder, so tensor
+    data can still be read out.
     """
     import pickle
     import types
@@ -158,14 +156,13 @@ def _gyroswin_name_map(jax_name: str) -> list[str]:
     already align with torch names).
     """
     base = jax_name.replace(".inner.", ".")
-    # the .swin. → .swin_att. rename only applies inside the U-Net subtrees
+    # the .swin. → .swin_att. rename only applies inside the u-net subtrees
     base = base.replace(".swin.", ".swin_att.")
     base = base.replace(".downsample.proj.", ".downsample.reduction.")
     base = base.replace(".gate.proj.", ".gate.gate.1.")
     # DiT modulation (cold/warm): jax DiTModulation.proj -> torch dit.modulation
     base = base.replace(".mod.proj.", ".dit.modulation.")
-    # SwinBlockUp / PatchExpand keep proj_concat as a single Linear; torch wraps it
-    # in an nn.Sequential, so the param sits at ``proj_concat.0.*``.
+    # torch wraps proj_concat in an nn.Sequential, so the param sits at proj_concat.0.*
     base = base.replace(".proj_concat.", ".proj_concat.0.")
     base = _LAYERS_RE.sub(lambda m: f".mlp.{int(m.group(1)) * 3}", base)
     return [jax_name, base]
@@ -196,7 +193,7 @@ def _translate(model, torch_state, name_map, *, strict: bool = False):
                 tw = torch_state[cand]
                 if tuple(tw.shape) == tuple(leaf.shape):
                     replacements[name] = tw; used.add(cand); matched = True; break
-                # torch APE has a leading singleton batch axis — squeeze it
+                # torch ape has a leading singleton batch axis — squeeze it
                 if (tw.ndim == leaf.ndim + 1 and tw.shape[0] == 1
                         and tuple(tw.shape[1:]) == tuple(leaf.shape)):
                     replacements[name] = np.asarray(tw).squeeze(0)
@@ -220,17 +217,14 @@ def _translate(model, torch_state, name_map, *, strict: bool = False):
 
 
 def translate_ae(model, torch_state, *, strict: bool = False):
-    """Translate an upstream torch AE state_dict onto an Equinox ``Swin5DAE``."""
     return _translate(model, torch_state, _ae_name_map, strict=strict)
 
 
 def translate_dit(model, torch_state, *, strict: bool = False):
-    """Translate an upstream torch DiT state_dict onto an Equinox ``DiT``."""
     return _translate(model, torch_state, _dit_name_map, strict=strict)
 
 
 def translate_gyroswin(model, torch_state, *, strict: bool = False):
-    """Translate an upstream torch GyroSwinMultitask state_dict onto our equinox port."""
     return _translate(model, torch_state, _gyroswin_name_map, strict=strict)
 
 
@@ -241,9 +235,8 @@ def build_ae_from_config(
     """Construct a ``Swin5DAE`` from a Hydra YAML config (upstream or local).
 
     ``legacy_double_shortcut`` defaults to the config's
-    ``model.legacy_swin_shortcut``, and to True when absent: every upstream torch
-    checkpoint was trained before the e79b021 swin-shortcut fix, so its weights only
-    reproduce under the doubled residual.
+    ``model.legacy_swin_shortcut``, or True when absent — matches checkpoints
+    trained with the doubled swin-shortcut residual.
     """
     from neugk_jax.autoencoders import Swin5DAE
     with open(cfg_path) as f:
