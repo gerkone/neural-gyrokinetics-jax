@@ -12,7 +12,6 @@ from __future__ import annotations
 import pickle
 from pathlib import Path
 
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -123,8 +122,8 @@ def test_fm_e2e_train_eval(cyclone_dir, tmp_path):
     ae_cfg.dataset.resolution = list(resolution)
     ae_cfg_path = ae_dir / "config.yaml"
     OmegaConf.save(ae_cfg, ae_cfg_path)
-    from scripts.translate_ckpt import build_ae_from_config
     from neugk_jax.training.checkpoint import save_model_only
+    from scripts.translate_ckpt import build_ae_from_config
     ae = build_ae_from_config(str(ae_cfg_path), key=jr.PRNGKey(0), resolution=resolution)
     ae_weights = ae_dir / "ae.eqx"
     save_model_only(ae_weights, ae)

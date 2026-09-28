@@ -25,10 +25,10 @@ import pytest
 from neugk_jax.autoencoders import Swin5DAE
 from neugk_jax.training.checkpoint import (
     CheckpointState,
-    save_checkpoint,
     load_checkpoint,
-    save_model_only,
     load_model_only,
+    save_checkpoint,
+    save_model_only,
 )
 
 
@@ -96,7 +96,6 @@ def test_torch_to_jax_translation(tmp_path):
     See ``PARITY.md`` for the list of architectural mismatches that prevent
     bit-exact translation right now (post-norm vs pre-norm, RPB, …).
     """
-    import numpy as np
     from scripts.translate_ckpt import (
         build_ae_from_config,
         load_torch_state,

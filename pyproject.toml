@@ -38,10 +38,14 @@ include = ["neugk_jax*"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
-ignore = ["E501"]
+ignore = ["E501", "E701", "E702", "E731"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["E402"]
 
 [tool.basedpyright]
 # JAX / Equinox / NumPy are largely untyped, so basedpyright's default

@@ -10,13 +10,11 @@ mesh. Multi-host coordinates via ``SLURM_NODELIST``'s first host.
 from __future__ import annotations
 
 import os
-import socket
 from dataclasses import dataclass
-from typing import Sequence
 
 import jax
-import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 
 @dataclass

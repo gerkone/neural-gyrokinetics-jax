@@ -246,6 +246,7 @@ class DiTSwinBlock(eqx.Module):
     window_size: tuple[int, ...] = eqx.field(static=True)
     shift_size: tuple[int, ...] = eqx.field(static=True)
     attn_mask: Optional[jax.Array]
+    legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -265,6 +266,7 @@ class DiTSwinBlock(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
     ):
         eff_w, _ = _build_partition_grid(grid_size, window_size)
         # same upstream-faithful shift rule as SwinBlock above
@@ -291,6 +293,7 @@ class DiTSwinBlock(eqx.Module):
         self.drop_path = _DropPath(drop_path)
         self.mod = DiTModulation(cond_dim, dim, key=kmod)
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
+        self.legacy_double_shortcut = legacy_double_shortcut
 
     def __call__(self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=False) -> jnp.ndarray:
         spatial = x.shape[:-1]
@@ -328,7 +331,8 @@ class DiTSwinBlock(eqx.Module):
         x = shortcut + gate_msa * self.drop_path(h, key=key1, inference=inference)
         h2 = self.mlp(self.norm2(x) * (1.0 + scale_mlp) + shift_mlp)
         mlp_out = gate_mlp * self.drop_path(h2, key=key2, inference=inference)
-        return x + mlp_out
+        # pre-7a77490 upstream doubled the residual here too
+        return (2.0 * x + mlp_out) if self.legacy_double_shortcut else (x + mlp_out)
 
 
 class SwinLayer(eqx.Module):
@@ -441,7 +445,7 @@ class DiTSwinLayer(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         rms_norm: bool = False,
-        legacy_double_shortcut: bool = False,  # no-op: torch DiT swin blocks never doubled the residual
+        legacy_double_shortcut: bool = False,
         **_unused,
     ):
         keys = jr.split(key, depth)
@@ -462,6 +466,7 @@ class DiTSwinLayer(eqx.Module):
                 use_rpb=use_rpb,
                 gated_attention=gated_attention,
                 rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
         ]

@@ -12,14 +12,12 @@ goal is to verify that:
 
 from __future__ import annotations
 
-import os
 import pickle
 from pathlib import Path
 
-import numpy as np
-import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
@@ -121,8 +119,8 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     path, resolution = cyclone_dir
     ae_cfg = _tiny_ae_cfg(path, resolution)
     # build + save a tiny AE so the FM runner has something to load
-    from scripts.translate_ckpt import build_ae_from_config
     from neugk_jax.training.checkpoint import save_model_only
+    from scripts.translate_ckpt import build_ae_from_config
     # FlowMatchingRunner expects AE config at <ae_ckpt_dir>/config.yaml with resolution for build_ae_from_config
     ae_dir = tmp_path / "ae_ckpt"
     ae_dir.mkdir(exist_ok=True)

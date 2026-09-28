@@ -27,7 +27,6 @@ def separate_zf(x, axis: int = 0):
     Works on both numpy and jax arrays — picks the right namespace via
     duck typing.
     """
-    nky = x.shape[-1]
     if isinstance(x, jnp.ndarray):
         zf = jnp.broadcast_to(x.mean(axis=-1, keepdims=True), x.shape)
         return jnp.concatenate([zf, x - zf], axis=axis)
@@ -39,7 +38,6 @@ def recombine_zf(x, axis: int = 0):
     """Inverse of ``separate_zf``: ``[zf, non_zf]`` → ``zf + non_zf``."""
     if x.shape[axis] <= 2 or x.shape[axis] % 2 != 0:
         return x
-    half = x.shape[axis] // 2
     if isinstance(x, jnp.ndarray):
         zf, non_zf = jnp.split(x, 2, axis=axis)
     else:

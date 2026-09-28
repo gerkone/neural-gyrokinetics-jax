@@ -92,7 +92,7 @@ class SwinBlockDown(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=rms_norm,
-                legacy_double_shortcut=legacy_double_shortcut,
+                legacy_double_shortcut=False,  # e79b021 only affected plain swin blocks
             )
         else:
             self.swin = SwinLayer(
@@ -198,7 +198,7 @@ class SwinBlockUp(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=up_rms_norm,
-                legacy_double_shortcut=legacy_double_shortcut,
+                legacy_double_shortcut=False,  # e79b021 only affected plain swin blocks
             )
         else:
             self.swin = SwinLayer(
@@ -379,7 +379,7 @@ class SwinNDUnet(eqx.Module):
                 act_fn=act_fn, use_checkpoint=use_checkpoint,
                 qkv_bias=qkv_bias, qk_norm=qk_norm, use_rpb=use_rpb,
                 gated_attention=gated_attention, rms_norm=rms_norm,
-                legacy_double_shortcut=legacy_double_shortcut,
+                legacy_double_shortcut=False,  # e79b021 only affected plain swin blocks
             )
         elif middle_swin:
             self.middle = FilmSwinLayer(

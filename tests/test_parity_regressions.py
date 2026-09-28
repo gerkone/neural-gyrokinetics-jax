@@ -7,34 +7,16 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 import optax
+import pytest
 from omegaconf import OmegaConf
 
 
-def test_swin_legacy_double_shortcut_and_rms_norm():
-    """Guards the two port bugs that made pre-e79b021 checkpoints unusable."""
-    from neugk_jax.models.swin import SwinBlock, SwinLayer
+def test_swin_layer_forwards_rms_norm():
+    from neugk_jax.models.swin import SwinLayer
     from neugk_jax.models.utils import RMSNorm
 
     grid, win, dim = (4, 8), (2, 4), 8
-    x = jr.normal(jr.PRNGKey(0), (*grid, dim))
-    kw = dict(mlp_ratio=2.0, drop_path=0.0, rms_norm=True)
-    single = SwinBlock(dim, 2, grid, win, key=jr.PRNGKey(1), **kw)
-    legacy = SwinBlock(dim, 2, grid, win, key=jr.PRNGKey(1),
-                       legacy_double_shortcut=True, **kw)
-
-    # zero the MLP so the block output IS the post-attention residual x_res1:
-    # single -> x_res1, legacy -> 2*x_res1 (the pre-e79b021 upstream topology)
-    def _zero_mlp(blk):
-        zeroed = jax.tree_util.tree_map(
-            lambda a: jnp.zeros_like(a) if eqx.is_array(a) else a, blk.mlp)
-        return eqx.tree_at(lambda b: b.mlp, blk, zeroed)
-    x_res1 = _zero_mlp(single)(x, inference=True)
-    assert jnp.allclose(_zero_mlp(legacy)(x, inference=True), 2.0 * x_res1, atol=1e-6)
-    # with the MLP live the two differ by exactly x_res1
-    assert jnp.allclose(legacy(x, inference=True) - single(x, inference=True),
-                        x_res1, atol=1e-5)
-
-    # SwinLayer must forward rms_norm to its blocks (it used to land in **_unused)
+    # used to land in **_unused
     layer = SwinLayer(2, dim, depth=2, num_heads=2, grid_size=grid, window_size=win,
                       key=jr.PRNGKey(2), rms_norm=True)
     assert all(isinstance(b.norm1, RMSNorm) and isinstance(b.norm2, RMSNorm)
@@ -63,3 +45,58 @@ def test_weight_decay_mask_and_coupling():
         # excluded leaves see no decay, the rest shrink
         assert jnp.all(upd["cond_embed"] == 0)
         assert jnp.all(upd["blocks"]["w"] < 0)
+
+
+def _zero_mlp(blk):
+    zeroed = jax.tree_util.tree_map(lambda a: jnp.zeros_like(a) if eqx.is_array(a) else a, blk.mlp)
+    return eqx.tree_at(lambda b: b.mlp, blk, zeroed)
+
+
+@pytest.mark.parametrize("kind", ["swin", "dit_swin", "vit", "dit_vit"])
+def test_legacy_double_shortcut_every_block(kind):
+    from neugk_jax.models.swin import DiTSwinBlock, SwinBlock
+    from neugk_jax.models.vit import DiTViTBlock, ViTBlock
+
+    dim, cond_dim = 8, 6
+    cond = jr.normal(jr.PRNGKey(3), (cond_dim,))
+    if kind in ("swin", "dit_swin"):
+        x = jr.normal(jr.PRNGKey(0), (4, 8, dim))
+    else:
+        x = jr.normal(jr.PRNGKey(0), (16, dim))
+
+    def build(legacy):
+        k = jr.PRNGKey(1)
+        if kind == "swin":
+            return SwinBlock(dim, 2, (4, 8), (2, 4), key=k, legacy_double_shortcut=legacy)
+        if kind == "dit_swin":
+            return DiTSwinBlock(dim, 2, cond_dim, (4, 8), (2, 4), key=k,
+                                legacy_double_shortcut=legacy)
+        if kind == "vit":
+            return ViTBlock(dim, 2, key=k, legacy_double_shortcut=legacy)
+        return DiTViTBlock(dim, 2, cond_dim, key=k, legacy_double_shortcut=legacy)
+
+    def run(blk):
+        args = (x,) if kind in ("swin", "vit") else (x, cond)
+        return blk(*args, inference=True)
+
+    single, legacy = build(False), build(True)
+    x_res1 = run(_zero_mlp(single))
+    # zeroed mlp leaves the post-attention residual: single -> x_res1, legacy -> 2*x_res1
+    assert jnp.allclose(run(_zero_mlp(legacy)), 2.0 * x_res1, atol=1e-5)
+    assert jnp.allclose(run(legacy) - run(single), x_res1, atol=1e-5)
+
+
+def test_layers_forward_legacy_flag():
+    from neugk_jax.models.swin import DiTSwinLayer, FilmSwinLayer
+    from neugk_jax.models.vit import DiTLayer, FilmViTLayer, ViTLayer
+
+    kw = dict(key=jr.PRNGKey(0), legacy_double_shortcut=True)
+    layers = [
+        DiTSwinLayer(2, 8, 2, 2, (4, 8), (2, 4), cond_dim=6, **kw),
+        FilmSwinLayer(2, 8, 2, 2, (4, 8), (2, 4), cond_dim=6, **kw),
+        ViTLayer(2, 8, 2, 2, (4, 4), **kw),
+        DiTLayer(2, 8, 2, 2, (4, 4), cond_dim=6, **kw),
+        FilmViTLayer(2, 8, 2, 2, (4, 4), cond_dim=6, **kw),
+    ]
+    for layer in layers:
+        assert all(b.legacy_double_shortcut for b in layer.blocks), type(layer).__name__

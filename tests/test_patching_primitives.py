@@ -12,8 +12,8 @@ import pytest
 
 from neugk_jax.models.patching import (
     fold_patches,
-    unfold_patches,
     pad_to_blocks,
+    unfold_patches,
     unpad,
 )
 

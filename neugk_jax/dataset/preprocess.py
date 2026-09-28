@@ -48,7 +48,6 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-
 # ---------- file naming -------------------------------------------------
 _DTYPE_SUFFIX = {
     "fp16": ".fp16.bin",

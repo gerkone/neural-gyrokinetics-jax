@@ -16,7 +16,6 @@ from __future__ import annotations
 from typing import Callable, Optional, Sequence
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 

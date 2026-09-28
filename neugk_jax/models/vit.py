@@ -28,6 +28,7 @@ class ViTBlock(eqx.Module):
     attn: MultiHeadSelfAttention
     mlp: MLP
     drop_path: _DropPath
+    legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -43,6 +44,7 @@ class ViTBlock(eqx.Module):
         qkv_bias: bool = False,
         qk_norm: bool = False,
         gated_attention: bool = False,
+        legacy_double_shortcut: bool = False,
     ):
         katt, kmlp = jr.split(key, 2)
         self.norm1 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
@@ -55,13 +57,15 @@ class ViTBlock(eqx.Module):
         hidden = max(int(dim * mlp_ratio), dim)
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
+        self.legacy_double_shortcut = legacy_double_shortcut
 
     def __call__(self, x, *, key=None, inference=False):
         # x: (n_tokens, dim); standard pre-norm transformer block
         key1, key2 = (None, None) if key is None else jr.split(key, 2)
         x = x + self.drop_path(self.attn(self.norm1(x)), key=key1, inference=inference)
-        x = x + self.drop_path(self.mlp(self.norm2(x)), key=key2, inference=inference)
-        return x
+        mlp_out = self.drop_path(self.mlp(self.norm2(x)), key=key2, inference=inference)
+        # pre-7a77490 upstream doubled the residual
+        return (2.0 * x + mlp_out) if self.legacy_double_shortcut else (x + mlp_out)
 
 
 class DiTViTBlock(eqx.Module):
@@ -73,6 +77,7 @@ class DiTViTBlock(eqx.Module):
     mlp: MLP
     drop_path: _DropPath
     mod: DiTModulation
+    legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -86,6 +91,7 @@ class DiTViTBlock(eqx.Module):
         act_fn: Callable = gelu,
         qkv_bias: bool = False,
         norm_affine: bool = True,
+        legacy_double_shortcut: bool = False,
     ):
         katt, kmlp, kmod = jr.split(key, 3)
         self.norm1 = LayerNorm(dim, elementwise_affine=norm_affine)
@@ -95,6 +101,7 @@ class DiTViTBlock(eqx.Module):
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
         self.mod = DiTModulation(cond_dim, dim, key=kmod)
+        self.legacy_double_shortcut = legacy_double_shortcut
 
     def __call__(self, x, cond, *, key=None, inference=False):
         # upstream order: (scale1, shift1, gate1, scale2, shift2, gate2) — matches DiT.forward in models/layers.py
@@ -109,8 +116,8 @@ class DiTViTBlock(eqx.Module):
         h = self.attn(self.norm1(x) * (1.0 + scale_msa) + shift_msa)
         x = x + gate_msa * self.drop_path(h, key=key1, inference=inference)
         h2 = self.mlp(self.norm2(x) * (1.0 + scale_mlp) + shift_mlp)
-        x = x + gate_mlp * self.drop_path(h2, key=key2, inference=inference)
-        return x
+        mlp_out = gate_mlp * self.drop_path(h2, key=key2, inference=inference)
+        return (2.0 * x + mlp_out) if self.legacy_double_shortcut else (x + mlp_out)
 
 
 class ViTLayer(eqx.Module):
@@ -144,6 +151,7 @@ class ViTLayer(eqx.Module):
         gated_attention: bool = False,
         norm_affine: bool = False,
         rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
         **_unused,
     ):
         keys = jr.split(key, depth)
@@ -154,6 +162,7 @@ class ViTLayer(eqx.Module):
                 qkv_bias=qkv_bias, qk_norm=qk_norm,
                 gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
         ]
@@ -205,6 +214,7 @@ class DiTLayer(eqx.Module):
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         norm_affine: bool = True,
+        legacy_double_shortcut: bool = False,
         **_unused,
     ):
         keys = jr.split(key, depth)
@@ -213,6 +223,7 @@ class DiTLayer(eqx.Module):
                 dim, num_heads, cond_dim, key=keys[i],
                 mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
                 qkv_bias=qkv_bias, norm_affine=norm_affine,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
         ]
@@ -266,6 +277,7 @@ class FilmViTLayer(eqx.Module):
         gated_attention: bool = False,
         norm_affine: bool = False,
         rms_norm: bool = False,
+        legacy_double_shortcut: bool = False,
         **_unused,
     ):
         bkeys = jr.split(key, depth)
@@ -276,6 +288,7 @@ class FilmViTLayer(eqx.Module):
                 mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
                 qkv_bias=qkv_bias, qk_norm=qk_norm, gated_attention=gated_attention,
                 norm_affine=norm_affine, rms_norm=rms_norm,
+                legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
         ]

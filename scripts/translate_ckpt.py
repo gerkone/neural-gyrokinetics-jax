@@ -11,6 +11,8 @@ from neugk_jax.translate import (
     build_ae_from_config,
     iter_leaves,
     load_torch_state,
+)
+from neugk_jax.translate import (
     translate_ae as translate,
 )
 
