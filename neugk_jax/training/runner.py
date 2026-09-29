@@ -23,7 +23,7 @@ from neugk_jax.training.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from neugk_jax.training.ddp import DistributedInfo, init_distributed
+from neugk_jax.training.ddp import DistributedInfo, init_distributed, replicate
 from neugk_jax.training.logging import Logger
 
 
@@ -121,6 +121,8 @@ class BaseRunner(ABC):
             self.model = state.model
             self.opt_state = state.opt_state
             self.start_epoch = state.epoch
+            self.model = replicate(self.dist, self.model)
+            self.opt_state = replicate(self.dist, self.opt_state)
             self.best_val = float((state.meta or {}).get("best_val", math.inf))
             if self.dist.is_rank0:
                 print(f"resumed from epoch {self.start_epoch} (val={self.best_val:.4e})")

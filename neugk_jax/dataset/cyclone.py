@@ -1,7 +1,9 @@
 """Unified ``CycloneDataset`` for both AE training and latent diffusion.
 
 ``mode="ae"`` returns raw distribution-function tensors; ``mode="diff"``
-returns precomputed latents (after running ``precompute_latents``).
+returns precomputed latents (after running ``precompute_latents``);
+``mode="next"`` additionally returns next-step targets (``y_df``, ``y_phi``,
+``y_flux``, ``y_fluxavg``) for autoregressive training.
 
 Returns host-side numpy arrays in a frozen ``CycloneSample`` dataclass.
 JAX consumes them via ``jnp.asarray`` when the dataloader stacks a batch.
@@ -9,6 +11,7 @@ JAX consumes them via ``jnp.asarray`` when the dataloader stacks a batch.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import pickle
 import warnings
@@ -24,6 +27,12 @@ import numpy as np
 from neugk_jax.dataset.backend import DataBackend, KvikIOBackend, resolve_trajectories
 from neugk_jax.utils import RunningMeanStd
 from neugk_jax.utils import separate_zf as separate_zf_fn
+
+
+def _f32(x):
+    if x is None:
+        return None
+    return x.astype(jnp.float32) if isinstance(x, jax.Array) else np.asarray(x).astype(np.float32)
 
 
 class _StatsUnpickler(pickle.Unpickler):
@@ -54,6 +63,11 @@ class CycloneSample:
     dg: np.ndarray
     s_hat: np.ndarray
     q: np.ndarray
+    # next-step targets (mode="next")
+    y_df: np.ndarray | None = None
+    y_phi: np.ndarray | None = None
+    y_flux: np.ndarray | None = None
+    y_fluxavg: np.ndarray | None = None
 
 
 def collate(batch: Sequence[CycloneSample]) -> CycloneSample:
@@ -83,6 +97,10 @@ def collate(batch: Sequence[CycloneSample]) -> CycloneSample:
         dg=stack("dg"),
         s_hat=stack("s_hat"),
         q=stack("q"),
+        y_df=stack("y_df"),
+        y_phi=stack("y_phi"),
+        y_flux=stack("y_flux"),
+        y_fluxavg=stack("y_fluxavg"),
     )
 
 
@@ -104,7 +122,8 @@ class CycloneDataset:
         ``("itg", "dg", "s_hat", "q")``).
     mode
         ``"ae"`` returns raw df reads; ``"diff"`` returns precomputed latents
-        (after calling :func:`precompute_latents`).
+        (after calling :func:`precompute_latents`); ``"next"`` returns the
+        input at ``t`` plus normalized targets at ``t + bundle_seq_length``.
     normalization, normalization_scope, normalization_stats
         Normalization config, its scope (``"dataset"`` or per-trajectory),
         and optional precomputed stats.
@@ -148,7 +167,9 @@ class CycloneDataset:
         rank: int = 0,
     ):
         assert split in ("train", "val")
-        assert mode in ("ae", "diff")
+        assert mode in ("ae", "diff", "next")
+        if mode == "next" and bundle_seq_length != 1:
+            raise NotImplementedError("mode='next' supports bundle_seq_length=1 only")
         self.path = path
         self.split = split
         self.fields_to_load = list(fields_to_load)
@@ -213,7 +234,7 @@ class CycloneDataset:
         kept_files = []
         # metadata keys _build_sample hard-requires, plus any non-alias conditioning field
         required = {"ion_temp_grad", "density_grad", "s_hat", "q", "flux", "timesteps"}
-        required |= {c for c in self.conditions if c not in ("itg", "dg", "s_hat", "q")}
+        required |= {c for c in self.conditions if c not in ("itg", "dg", "s_hat", "q", "timestep")}
         for fp, meta in zip(self.files, metas):
             if not self._passes_cond_filter(meta):
                 continue
@@ -354,7 +375,7 @@ class CycloneDataset:
             return np.float32(1.0), np.float32(0.0)
         key = "full" if self.normalization_scope == "dataset" else fid
         stats = self.stats.get(field, {}).get(key, {})
-        if not stats:
+        if not stats or field not in self.normalization:
             return np.float32(1.0), np.float32(0.0)
         nt = self.normalization[field]["type"]
         if nt == "zscore":
@@ -371,22 +392,49 @@ class CycloneDataset:
             return scale, shift
         raise ValueError(nt)
 
-    def normalize(self, fid: int, *, df=None, phi=None, flux=None) -> np.ndarray:
-        x, field = self._unpack_field(df=df, phi=phi, flux=flux)
+    def normalize(self, fid: int, *, df=None, phi=None, flux=None, fluxavg=None) -> np.ndarray:
+        x, field = self._unpack_field(df=df, phi=phi, flux=flux, fluxavg=fluxavg)
         scale, shift = self._get_scale_shift(fid, field, x)
         return (x - shift) / scale
 
-    def denormalize(self, fid: int, *, df=None, phi=None, flux=None) -> np.ndarray:
-        x, field = self._unpack_field(df=df, phi=phi, flux=flux)
+    def denormalize(self, fid: int, *, df=None, phi=None, flux=None, fluxavg=None) -> np.ndarray:
+        x, field = self._unpack_field(df=df, phi=phi, flux=flux, fluxavg=fluxavg)
         scale, shift = self._get_scale_shift(fid, field, x)
         return x * scale + shift
 
+    def scale_shift(self, fids: Sequence[int], field: str, sample_ndim: int):
+        """Per-batch ``(scale, shift)`` for ``field`` that broadcast against a
+        batch of ``sample_ndim``-dimensional samples.
+
+        Shared statistics (dataset scope, or none) are returned without a batch
+        axis; per-trajectory statistics are stacked along a leading batch axis.
+        """
+        dummy = np.zeros((1,) * sample_ndim, dtype=np.float32)
+        pairs = [self._get_scale_shift(int(f), field, dummy) for f in fids]
+        shared = self.normalization is None or self.normalization_scope in ("dataset", "sample")
+        if shared:
+            scale, shift = pairs[0]
+            return np.asarray(scale, np.float32), np.asarray(shift, np.float32)
+
+        def stack(arrs):
+            out = []
+            for a in arrs:
+                a = np.asarray(a, np.float32)
+                # match the sample rank (pad or drop leading unit axes) so the batch axis lines up
+                while a.ndim > sample_ndim and a.shape[0] == 1:
+                    a = a[0]
+                out.append(a.reshape((1,) * (sample_ndim - a.ndim) + a.shape))
+            return np.stack(out)
+
+        return stack([p[0] for p in pairs]), stack([p[1] for p in pairs])
+
     @staticmethod
-    def _unpack_field(*, df=None, phi=None, flux=None):
+    def _unpack_field(*, df=None, phi=None, flux=None, fluxavg=None):
         if df is not None: return df, "df"
         if phi is not None: return phi, "phi"
         if flux is not None: return flux, "flux"
-        raise ValueError("provide exactly one of df, phi, flux")
+        if fluxavg is not None: return fluxavg, "fluxavg"
+        raise ValueError("provide exactly one of df, phi, flux, fluxavg")
 
 
     def __len__(self) -> int:
@@ -396,7 +444,20 @@ class CycloneDataset:
         fid, t_idx = self.flat_index_to_file_and_tstep[index]
         if self.mode == "diff" and self.precomputed_latents is not None:
             return self._get_latent_sample(fid, t_idx)
+        if self.mode == "next":
+            return self._get_next_sample(fid, t_idx)
         return self._get_ae_sample(fid, t_idx)
+
+    def get_at_time(self, fid: int, t_idx: int, *, normalized: bool = True) -> CycloneSample:
+        if self.mode == "next":
+            return self._get_next_sample(int(fid), int(t_idx), normalized=normalized)
+        return self._get_ae_sample(int(fid), int(t_idx))
+
+    def num_ts(self, fid: int) -> int:
+        return self.file_num_timesteps[int(fid)]
+
+    def get_timestep(self, fid: int, t_idx: int) -> np.ndarray:
+        return np.asarray(self.metadata[int(fid)]["timesteps"][int(t_idx) + self.offset], dtype=np.float32)
 
     def _get_ae_sample(self, fid: int, t_idx: int) -> CycloneSample:
         meta = self.metadata[fid]
@@ -423,6 +484,40 @@ class CycloneDataset:
 
         return self._build_sample(fid, t_idx, df, phi, flux, timestep, meta)
 
+    def _get_next_sample(self, fid: int, t_idx: int, *, normalized: bool = True) -> CycloneSample:
+        meta = self.metadata[fid]
+        original_t = t_idx + self.offset
+        gt_t = original_t + self.bundle_seq_length
+        df = y_df = phi = y_phi = None
+        with self.backend.open(self.files[fid]) as handle:
+            t_str, gt_str = str(original_t).zfill(5), str(gt_t).zfill(5)
+            if "df" in self.fields_to_load:
+                df = self.backend.read_df(handle, t_str, self.df_shape, [0, 1])
+                y_df = self.backend.read_df(handle, gt_str, self.df_shape, [0, 1])
+                if self.separate_zf:
+                    df = separate_zf_fn(df, axis=0)
+                    y_df = separate_zf_fn(y_df, axis=0)
+            if "phi" in self.fields_to_load:
+                phi = self.backend.read_phi(handle, t_str, self.phi_resolution)
+                y_phi = self.backend.read_phi(handle, gt_str, self.phi_resolution)
+
+        flux = np.asarray(meta["flux"][original_t], dtype=np.float32)
+        y_flux = np.asarray(meta["flux"][gt_t], dtype=np.float32)
+        y_fluxavg = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
+        timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
+        if normalized and self.normalization is not None:
+            if df is not None:
+                df, y_df = self.normalize(fid, df=df), self.normalize(fid, df=y_df)
+            if phi is not None:
+                phi, y_phi = self.normalize(fid, phi=phi), self.normalize(fid, phi=y_phi)
+            y_flux = self.normalize(fid, flux=y_flux)
+            y_fluxavg = self.normalize(fid, fluxavg=y_fluxavg)
+        sample = self._build_sample(fid, t_idx, _f32(df), _f32(phi), flux, timestep, meta)
+        return dataclasses.replace(
+            sample, y_df=_f32(y_df), y_phi=_f32(y_phi),
+            y_flux=np.asarray(y_flux, np.float32), y_fluxavg=np.asarray(y_fluxavg, np.float32),
+        )
+
     def _get_latent_sample(self, fid: int, t_idx: int) -> CycloneSample:
         cached = self.precomputed_latents[(fid, t_idx)]
         meta = self.metadata[fid]
@@ -441,7 +536,7 @@ class CycloneDataset:
         cond_vec = None
         if self.conditions:
             packed = []
-            local = {"itg": itg, "dg": dg, "s_hat": s_hat, "q": q}
+            local = {"itg": itg, "dg": dg, "s_hat": s_hat, "q": q, "timestep": timestep}
             for k in self.conditions:
                 v = local.get(k)
                 if v is None:

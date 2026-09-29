@@ -1,13 +1,15 @@
-"""GyroSwin evaluator — multi-step autoregressive recon metrics + plots.
+"""GyroSwin evaluator: autoregressive rollout metrics on denormalized data.
 
-For each starting sample, predicts ``n_eval_steps`` ahead, comparing each
-step's ``df`` / ``phi`` against the ground-truth at the same timestep. Logs
-``df_x{t}`` / ``phi_x{t}`` keys.
+Each validation sample is rolled out for up to ``n_eval_steps`` steps, capped
+per trajectory; targets are looked up by ``(file_index, timestep_index + t)``.
+Logs ``{field}_x{t}`` per step (relative-norm MSE for df/phi, MSE for
+flux/fluxavg, optional ``phi_int``/``flux_int``) plus their step mean ``df``.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import functools
+from typing import Any, Callable, Optional, Sequence
 
 import equinox as eqx
 import jax
@@ -15,78 +17,124 @@ import jax.numpy as jnp
 import numpy as np
 
 from neugk_jax.evaluate.base import BaseEvaluator
-from neugk_jax.losses import mse_df
+from neugk_jax.evaluate.integrals import flux_integral
+from neugk_jax.training.ddp import eval_batch_owner
+from neugk_jax.utils import recombine_zf
+
+
+def _rel_norm_mse(p: np.ndarray, y: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+    p, y = p.reshape(p.shape[0], -1), y.reshape(y.shape[0], -1)
+    return np.sum((p - y) ** 2, -1) / (np.sum(y**2, -1) + eps)
+
+
+@eqx.filter_jit
+def _fwd(m, x, c):
+    return jax.vmap(lambda xi, ci: m(xi, ci, inference=True))(x, c)
+
+
+@functools.partial(jax.jit, static_argnums=3)
+def _integrate(g, d, p, real_potens):
+    return jax.vmap(lambda gi, di, pi: flux_integral(gi, di, pi, real_potens=real_potens))(g, d, p)
+
+
+def _process_local(tree):
+    # a process-local copy of replicated global arrays, so owners can evaluate independently
+    def local(x):
+        if isinstance(x, jax.Array) and not x.is_fully_addressable:
+            return x.addressable_data(0)
+        return x
+    return jax.tree_util.tree_map(local, tree)
 
 
 class GyroSwinEvaluator(BaseEvaluator):
-    """``n_eval_steps`` autoregressive rollout — df_x{t} / phi_x{t} metrics."""
+    """``n_eval_steps`` autoregressive rollout over the (tail-cropped) validation set."""
 
-    def __call__(self, model: Any, *, epoch: int, batch_size: int = 1, **_):
+    def __call__(self, model: Any, *, epoch: int, batch_size: int = 1, dist=None,
+                 outputs: Optional[Sequence[str]] = None,
+                 geometry_fn: Optional[Callable] = None, **_):
         ds = self.val_ds
-        n = len(ds)
         n_eval = int(self.cfg.validation.get("n_eval_steps", 1))
+        outputs = tuple(outputs or ("df", "phi"))
+        fields = [k for k in ("df", "phi", "flux", "fluxavg") if k in outputs]
+        eval_integrals = (bool(self.cfg.validation.get("eval_integrals", False))
+                          and set(outputs) == {"df", "phi", "flux"} and geometry_fn is not None)
+        real_potens = bool(self.cfg.dataset.get("real_potens", True))
+        t_slot = ds.conditions.index("timestep") if "timestep" in ds.conditions else None
+        if jax.process_count() > 1:
+            model = _process_local(model)
 
-        @eqx.filter_jit
-        def fwd(m, x, c):
-            return jax.vmap(lambda xi, ci: m(xi, ci))(x, c)
-
-        from neugk_jax.evaluate.plots import generate_val_plots
-
-        running: dict[str, float] = {}
-        n_acc = 0.0
+        names = fields + (["phi_int", "flux_int"] if eval_integrals else [])
+        running = {f"{k}_x{t}": 0.0 for k in names for t in range(1, n_eval + 1)}
+        running.update({f"_n_x{t}": 0.0 for t in range(1, n_eval + 1)})
         val_plots: dict[str, object] = {}
         plot_drawn = False
 
-        # walk val set in batches of ``batch_size``, leaving room for n_eval lookahead
-        for start in range(0, n - batch_size - n_eval + 1, batch_size):
-            samples = [ds[start + b] for b in range(batch_size)]
-            # initial df + cond + targets at t..t+n_eval
-            df0 = jnp.stack([jnp.asarray(s.df) for s in samples])
-            cond = jnp.stack([jnp.asarray(s.conditioning) for s in samples]) \
-                if getattr(samples[0], "conditioning", None) is not None else None
-            df_pred = df0
-            phi_tgts, df_tgts = [], []
-            for t in range(1, n_eval + 1):
-                tgts_t = [ds[start + b + t] for b in range(batch_size)]
-                df_tgts.append(jnp.stack([jnp.asarray(s.df) for s in tgts_t]))
-                if getattr(tgts_t[0], "phi", None) is not None:
-                    phi_tgts.append(jnp.stack([jnp.asarray(s.phi) for s in tgts_t]))
-                else:
-                    phi_tgts.append(None)
+        n = len(ds)
+        for bi, start in enumerate(range(0, n, batch_size)):
+            if dist is not None and not eval_batch_owner(dist, bi):
+                continue
+            samples = [ds[i] for i in range(start, min(start + batch_size, n))]
+            fids = np.asarray([int(s.file_index) for s in samples])
+            t0 = np.asarray([int(s.timestep_index) for s in samples])
+            steps = np.minimum(n_eval, np.asarray([ds.num_ts(f) for f in fids]) - t0 - 1)
+            x = jnp.stack([jnp.asarray(s.df) for s in samples])
+            cond = None
+            if samples[0].conditioning is not None:
+                cond = np.stack([np.asarray(s.conditioning) for s in samples])
+            geom = geometry_fn(fids) if eval_integrals else None
 
-            step_metrics: dict[str, float] = {}
-            phi_pred_at_t1 = None
-            df_pred_at_t1 = None
-            for t in range(1, n_eval + 1):
-                preds = fwd(model, df_pred, cond)
-                step_metrics[f"df_x{t}"] = float(mse_df(preds["df"], df_tgts[t - 1]))
-                if "phi" in preds and phi_tgts[t - 1] is not None:
-                    step_metrics[f"phi_x{t}"] = float(mse_df(preds["phi"], phi_tgts[t - 1]))
-                if t == 1:
-                    df_pred_at_t1 = preds["df"]
-                    phi_pred_at_t1 = preds.get("phi")
-                df_pred = preds["df"]  # feed prediction back as next-step input
+            for t in range(int(steps.max())):
+                if t_slot is not None:
+                    cond[:, t_slot] = [ds.get_timestep(f, ti + t) for f, ti in zip(fids, t0)]
+                preds = _fwd(model, x, None if cond is None else jnp.asarray(cond))
+                live = np.nonzero(steps > t)[0]
+                tg = [ds.get_at_time(fids[b], t0[b] + t, normalized=False) for b in live]
+                pred_d = {k: np.stack([np.asarray(ds.denormalize(int(fids[b]), **{k: np.asarray(preds[k][b])}))
+                                       for b in live]) for k in fields}
+                tgt_d = {k: np.stack([np.asarray(getattr(s, f"y_{k}")) for s in tg]) for k in fields}
+                if "df" in fields:
+                    pred_d["df"] = recombine_zf(pred_d["df"], axis=1)
+                    tgt_d["df"] = recombine_zf(tgt_d["df"], axis=1)
+                step = {}
+                for k in fields:
+                    p, y = pred_d[k], tgt_d[k].reshape(pred_d[k].shape)
+                    step[k] = _rel_norm_mse(p, y) if k in ("df", "phi") else \
+                        np.mean((p - y).reshape(len(live), -1) ** 2, -1)
+                if eval_integrals:
+                    g = {k: v[live] for k, v in geom.items()}
+                    phi_i, (pflux, eflux, _) = _integrate(g, jnp.asarray(pred_d["df"]),
+                                                          jnp.asarray(pred_d["phi"]), real_potens)
+                    phi_i = np.asarray(phi_i)
+                    tphi = tgt_d["phi"].reshape(phi_i.shape)
+                    step["phi_int"] = np.mean((phi_i - tphi).reshape(len(live), -1) ** 2, -1)
+                    step["flux_int"] = (np.asarray(pflux) ** 2
+                                        + (np.asarray(eflux) - tgt_d["flux"].reshape(-1)) ** 2)
+                for k, v in step.items():
+                    running[f"{k}_x{t + 1}"] += float(np.sum(v))
+                running[f"_n_x{t + 1}"] += float(len(live))
 
-            running, n_acc = self._accumulate(running, step_metrics, n_acc, n_new=batch_size)
-
-            # plot_nd panels on the first batch of the first step
-            if not plot_drawn and self.is_rank0:
-                try:
-                    b = 0
-                    rollout = {"df": np.asarray(df_pred_at_t1[b])}
-                    gt = {"df": np.asarray(df_tgts[0][b])}
-                    if phi_pred_at_t1 is not None and phi_tgts[0] is not None:
-                        rollout["phi"] = np.asarray(phi_pred_at_t1[b])
-                        gt["phi"] = np.asarray(phi_tgts[0][b])
-                    panels = generate_val_plots(
-                        rollout=rollout, gt=gt, phase="random draw",
-                        ts=np.asarray(samples[b].timestep).reshape(-1),
-                    )
-                    val_plots.update(panels)
-                except Exception as e:
-                    print(f"[gyroswin eval] plot skipped: {e}")
-                finally:
+                if not plot_drawn and self.is_rank0 and t == 0:
                     plot_drawn = True
+                    try:
+                        from neugk_jax.evaluate.plots import generate_val_plots
+                        roll = {k: pred_d[k][0] for k in ("df", "phi") if k in pred_d}
+                        gt = {k: tgt_d[k][0] for k in ("df", "phi") if k in tgt_d}
+                        val_plots.update(generate_val_plots(
+                            rollout=roll, gt=gt, phase="random draw",
+                            ts=np.asarray(samples[live[0]].timestep).reshape(-1)))
+                    except Exception as e:
+                        print(f"[gyroswin eval] plot skipped: {e}")
+                x = preds["df"]
 
-        running, n_acc = self._sync(running, n_acc)
-        return self._finalize(running, n_acc), val_plots
+        running, _ = self._sync(running, 0.0)
+        metrics = {}
+        for t in range(1, n_eval + 1):
+            cnt = running[f"_n_x{t}"]
+            if cnt > 0:
+                for k in names:
+                    metrics[f"{k}_x{t}"] = running[f"{k}_x{t}"] / cnt
+        for k in names:
+            per_step = [v for m, v in metrics.items() if m.startswith(f"{k}_x")]
+            if per_step:
+                metrics[k] = float(np.mean(per_step))
+        return metrics, val_plots

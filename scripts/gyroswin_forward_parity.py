@@ -122,5 +122,5 @@ print(f"  shapes: torch df{tdf.shape} phi{tphi.shape} | jax df{jdf.shape} phi{jp
 cmp("df", tdf, jdf)
 cmp("phi", tphi, jphi)
 if tflux is not None and "flux" in jout:
-    tf = float(np.ravel(_t2n(tflux))[0]); jf = float(np.ravel(np.asarray(jout["flux"]))[0])
+    tf = float(np.ravel(_t2n(tflux))[0]); jf = float(np.ravel(np.asarray(jout.get("flux", jout.get("fluxavg"))))[0])
     print(f"  flux: torch={tf:.6f}  jax={jf:.6f}  |diff|={abs(tf - jf):.3e}")

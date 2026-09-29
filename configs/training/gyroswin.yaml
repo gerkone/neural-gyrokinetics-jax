@@ -1,4 +1,4 @@
-batch_size: 4
+batch_size: 4  # per device; the global batch is batch_size * device_count
 n_epochs: 100
 learning_rate: 3.0e-4
 final_learning_rate: 1.0e-6

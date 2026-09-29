@@ -10,7 +10,7 @@ Composition:
 * ``df_mix_middle`` / ``phi_mix_middle``: bottleneck cross-attention.
 * ``df_mix_up`` / ``phi_mix_up``: up-path cross-attention at each scale.
 
-The flux head and baseline models (FNO/PointNet/...) are out of scope.
+Baseline models (FNO/PointNet/...) are out of scope.
 
 Conditioning (DiT modulation through the Swin blocks) is plumbed via the
 existing ``Swin5DUnet`` API; configs without conditioning still work.
@@ -18,6 +18,7 @@ existing ``Swin5DUnet`` API; configs without conditioning still work.
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional, Sequence
 
 import equinox as eqx
@@ -46,6 +47,7 @@ class GyroSwinMultitask(eqx.Module):
     phi_mix_unpatch: MixingBlock
     flux_head: Optional[FluxDecoder]
     use_flux: bool = eqx.field(static=True)
+    flux_key: Optional[str] = eqx.field(static=True)
     use_phi: bool = eqx.field(static=True)
     patch_skip: bool = eqx.field(static=True)
     latent_dim: int = eqx.field(static=True)
@@ -79,6 +81,7 @@ class GyroSwinMultitask(eqx.Module):
         flux_num_heads: int = 4,
         flux_depth: int = 1,
         rms_norm: bool = False,
+        drop_path: float = 0.1,
         use_checkpoint: bool = False,
         legacy_double_shortcut: bool = False,
         key,
@@ -86,7 +89,11 @@ class GyroSwinMultitask(eqx.Module):
         self.latent_dim = dim
         self.patch_skip = patch_skip
         self.use_phi = "phi" in outputs
-        self.use_flux = ("flux" in outputs) or ("fluxavg" in outputs)
+        flux_keys = [k for k in outputs if k in ("flux", "fluxavg")]
+        if len(flux_keys) > 1:
+            raise ValueError("cannot predict both flux and fluxavg")
+        self.flux_key = flux_keys[0] if flux_keys else None
+        self.use_flux = self.flux_key is not None
         self.n_cond = n_cond
 
         phi_base_resolution = tuple(df_base_resolution[2:])  # (s, x, y)
@@ -98,7 +105,7 @@ class GyroSwinMultitask(eqx.Module):
         self.cond_embed = None
         cond_kw = dict(n_cond=n_cond, cond_embed_dim=cond_embed_dim, cond_mode=cond_mode,
                        middle_swin=True, unpatch_patch_skip=patch_skip, rms_norm=rms_norm,
-                       legacy_double_shortcut=legacy_double_shortcut)
+                       legacy_double_shortcut=legacy_double_shortcut, drop_path=drop_path)
 
         self.df_unet = Swin5DUnet(
             space=5,
@@ -217,10 +224,18 @@ class GyroSwinMultitask(eqx.Module):
 
     def __call__(self, df: jnp.ndarray, cond: Optional[jnp.ndarray] = None,
                  *, key=None, inference: bool = True) -> dict:
-        """Forward: df → (df, phi).
+        """Forward: df → ``{"df", "phi"?, flux_key?}``.
 
-        df: ``(C, vp, mu, s, x, y)``; cond: ``(n_cond,)`` scalars (raw).
+        df: ``(C, vp, mu, s, x, y)``; cond: ``(n_cond,)`` scalars (raw). ``key``
+        drives drop-path in the swin stages when ``inference=False``.
         """
+        n_down, n_up = len(self.df_unet.down_blocks), len(self.df_unet.up_blocks)
+        if key is None:
+            ks = [None] * (n_down + 2 + 2 * n_up)
+        else:
+            ks = list(jr.split(key, n_down + 2 + 2 * n_up))
+        k_down, (k_mid_df, k_mid_phi) = ks[:n_down], ks[n_down:n_down + 2]
+        k_up_df, k_up_phi = ks[n_down + 2:n_down + 2 + n_up], ks[n_down + 2 + n_up:]
         # per-u-net conditioning embeddings; df and phi have separate embeds
         c_df = self.df_unet.condition(cond)
         c_phi = self.phi_unet.condition(cond)
@@ -232,7 +247,7 @@ class GyroSwinMultitask(eqx.Module):
         # down path: pre-downsample df skip feeds the df up block; vspace_attn_down[i] produces the phi up block skip
         df_skips, phi_skips = [], []
         for i, blk in enumerate(self.df_unet.down_blocks):
-            zdf, sk = blk(zdf, c_df, inference=inference, return_skip=True)
+            zdf, sk = blk(zdf, c_df, key=k_down[i], inference=inference, return_skip=True)
             df_skips.append(sk)
             if self.use_phi and i < len(self.vspace_attn_down):
                 phi_skips.append(self.vspace_attn_down[i](sk))
@@ -245,8 +260,8 @@ class GyroSwinMultitask(eqx.Module):
         zdf_new = self.df_mix_middle(zdf, zphi)
         zphi_new = self.phi_mix_middle(zphi, zdf)
         zdf, zphi = zdf_new, zphi_new
-        zdf = self.df_unet.middle(zdf, c_df, inference=inference)
-        zphi = self.phi_unet.middle(zphi, c_phi, inference=inference)
+        zdf = self.df_unet.middle(zdf, c_df, key=k_mid_df, inference=inference)
+        zphi = self.phi_unet.middle(zphi, c_phi, key=k_mid_phi, inference=inference)
         # flux stage 0: bottleneck latents (phi=query, df=kv)
         flux_lats = []
         if self.use_flux and self.flux_head is not None:
@@ -257,9 +272,9 @@ class GyroSwinMultitask(eqx.Module):
         for i, (df_blk, phi_blk) in enumerate(zip(self.df_unet.up_blocks, self.phi_unet.up_blocks)):
             zdf = self.df_mix_up[i](zdf, zphi)
             zphi = self.phi_mix_up[i](zphi, zdf)   # uses the just-updated zdf
-            zdf = df_blk(zdf, df_skips[-(i + 1)], c_df, inference=inference)
+            zdf = df_blk(zdf, df_skips[-(i + 1)], c_df, key=k_up_df[i], inference=inference)
             phi_sk = phi_skips[i] if (self.use_phi and i < len(phi_skips)) else None
-            zphi = phi_blk(zphi, phi_sk, c_phi, inference=inference)
+            zphi = phi_blk(zphi, phi_sk, c_phi, key=k_up_phi[i], inference=inference)
             # flux stage i+1: per-scale up-block latents (phi=query, df=kv)
             if self.use_flux and self.flux_head is not None:
                 flux_lats.append(self.flux_head.mix(i + 1, zphi, zdf))
@@ -275,9 +290,11 @@ class GyroSwinMultitask(eqx.Module):
         phi_out = self.phi_unet.patch_decode(zphi, df_pad_axes[2:], condition=c_phi)
         phi_out = jnp.squeeze(phi_out, axis=0)            # (s, x, y)
         phi_out = jnp.transpose(phi_out, (1, 0, 2))       # (x, s, y)
-        out = {"df": df_out, "phi": phi_out}
+        out = {"df": df_out}
+        if self.use_phi:
+            out["phi"] = phi_out
         if self.use_flux and self.flux_head is not None:
-            out["flux"] = self.flux_head(flux_lats)       # scalar
+            out[self.flux_key] = self.flux_head(flux_lats)
         return out
 
 
@@ -302,8 +319,12 @@ def build_gyroswin_from_config(cfg_path: str, *, key,
     base_resolution = resolution or dataset.get("resolution") or (32, 8, 16, 85, 32)
     separate_zf = dataset.get("separate_zf", True)
     in_ch = 2 + (2 if separate_zf else 0)
-    outputs = [k for k, w in (mcfg.get("loss_weights") or {}).items() if w and w > 0]
+    sched = mcfg.get("loss_scheduler") or {}
+    outputs = [k for k, w in (mcfg.get("loss_weights") or {}).items()
+               if (w and w > 0) or sched.get(k)]
     n_cond = len(mcfg.get("conditioning", []) or [])
+    if swin.get("flux_conditioning") and any(k in ("flux", "fluxavg") for k in outputs):
+        warnings.warn("swin.flux_conditioning is not implemented; the flux head is built unconditioned")
     model = GyroSwinMultitask(
         dim=mcfg["latent_dim"],
         df_base_resolution=base_resolution,
@@ -325,6 +346,7 @@ def build_gyroswin_from_config(cfg_path: str, *, key,
         gated_attention=swin.get("gated_attention", False),
         cond_mode=swin.get("modulation", "film"),
         rms_norm=(swin.get("norm_fn") == "RMSNorm"),
+        drop_path=float(mcfg.get("drop_path", 0.1)),
         flux_num_heads=swin.get("flux_num_heads", 4),
         flux_depth=swin.get("flux_depth", 1),
         outputs=outputs or ["df", "phi"],

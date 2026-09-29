@@ -174,7 +174,12 @@ def test_ae_resume_keeps_best_and_continues(cyclone_dir, tmp_path):
 
 
 def test_resume_config_cli_wins(tmp_path):
-    import main as entry
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "neugk_jax_main", Path(__file__).resolve().parents[1] / "main.py")
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
 
     run = tmp_path / "run"
     run.mkdir()
