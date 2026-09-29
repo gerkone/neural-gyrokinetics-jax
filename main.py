@@ -91,6 +91,9 @@ def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
     print("#" * 88)
     dispatch_runner(cfg)
+    import jax
+    if jax.distributed.is_initialized():
+        jax.distributed.shutdown()
 
 
 if __name__ == "__main__":
