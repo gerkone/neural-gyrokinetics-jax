@@ -15,6 +15,7 @@ broadcast freely without explicit vmap.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Callable, Sequence
 
 import equinox as eqx
@@ -225,3 +226,29 @@ class Gate(eqx.Module):
     def __call__(self, x: jax.Array, g: jax.Array) -> jax.Array:
         # x, g: (n, H, D); gate is sigmoid(linear(relu(g)))
         return x * jax.nn.sigmoid(self.proj(relu(g)))
+
+
+def trainable_mask(model):
+    """Bool pytree over ``model``: True on trainable arrays, False on non-arrays and buffers.
+
+    A module marks buffers by listing field names in ``buffer_fields``; the mask is built
+    on a concrete model and reused as the filter spec inside jitted steps.
+    """
+    frozen = set()
+
+    def visit(node):
+        if isinstance(node, eqx.Module):
+            for name in getattr(node, "buffer_fields", ()):
+                if getattr(node, name, None) is not None:
+                    frozen.add(id(getattr(node, name)))
+            for f in dataclasses.fields(node):
+                visit(getattr(node, f.name, None))
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                visit(v)
+        elif isinstance(node, dict):
+            for v in node.values():
+                visit(v)
+
+    visit(model)
+    return jax.tree_util.tree_map(lambda x: eqx.is_array(x) and id(x) not in frozen, model)

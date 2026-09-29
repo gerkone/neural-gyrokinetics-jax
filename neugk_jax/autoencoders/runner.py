@@ -11,8 +11,9 @@ from tqdm import tqdm
 from neugk_jax.autoencoders.swin5d_ae import Swin5DAE
 from neugk_jax.dataset import CycloneDataset, KvikIOBackend, NumpyBackend
 from neugk_jax.losses import df_loss
+from neugk_jax.models.utils import trainable_mask
 from neugk_jax.training.ddp import data_sharding, replicated
-from neugk_jax.training.runner import BaseRunner, build_optimizer
+from neugk_jax.training.runner import BaseRunner, build_optimizer, train_update
 from neugk_jax.training.schedulers import warmup_cosine
 
 
@@ -137,8 +138,8 @@ class AERunner(BaseRunner):
         )
         optimizer = build_optimizer(self.schedule, cfg.training, self.model, decoupled=False)
         self.optimizer = optimizer
-        params, _ = eqx.partition(self.model, eqx.is_array)
-        self.opt_state = optimizer.init(params)
+        self.trainable = trainable_mask(self.model)
+        self.opt_state = optimizer.init(eqx.filter(self.model, self.trainable))
         self.steps_per_epoch = steps_per_epoch
         # multi-device: replicate model+opt_state on the mesh, shard data on leading axis
         if self.dist.local_device_count > 1:
@@ -157,13 +158,7 @@ class AERunner(BaseRunner):
             pred = jax.vmap(lambda x: m(x)["df"])(batch)
             return df_loss(pred, batch, separate_zf=sep_zf)
 
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        params, static = eqx.partition(model, eqx.is_array)
-        g_params, _ = eqx.partition(grads, eqx.is_array)
-        updates, opt_state = self.optimizer.update(g_params, opt_state, params)
-        params = eqx.apply_updates(params, updates)
-        model = eqx.combine(params, static)
-        return model, opt_state, loss
+        return train_update(model, opt_state, loss_fn, self.optimizer, self.trainable)
 
     def train_epoch(self, epoch: int, key) -> dict:
         cfg = self.cfg

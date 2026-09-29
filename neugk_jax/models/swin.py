@@ -138,6 +138,7 @@ class SwinBlock(eqx.Module):
     window_size: tuple[int, ...] = eqx.field(static=True)
     shift_size: tuple[int, ...] = eqx.field(static=True)
     attn_mask: Optional[jax.Array]
+    buffer_fields = ("attn_mask",)
     legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
@@ -242,6 +243,7 @@ class DiTSwinBlock(eqx.Module):
     window_size: tuple[int, ...] = eqx.field(static=True)
     shift_size: tuple[int, ...] = eqx.field(static=True)
     attn_mask: Optional[jax.Array]
+    buffer_fields = ("attn_mask",)
     legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(

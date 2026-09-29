@@ -9,11 +9,12 @@ import jax.random as jr
 
 from neugk_jax.dataset import CycloneDataset, KvikIOBackend, NumpyBackend
 from neugk_jax.gyroswin.models import build_gyroswin_from_config
+from neugk_jax.models.utils import trainable_mask
 from neugk_jax.training.loss_scheduler import (
     build_scheduler_dict,
     compute_multi_task_loss,
 )
-from neugk_jax.training.runner import BaseRunner, build_optimizer
+from neugk_jax.training.runner import BaseRunner, build_optimizer, train_update
 from neugk_jax.training.schedulers import warmup_cosine
 
 
@@ -80,9 +81,9 @@ class GyroSwinRunner(BaseRunner):
             min_lr=cfg.training.get("final_learning_rate", 1e-6),
         )
         opt = build_optimizer(self.schedule, cfg.training, self.model, decoupled=False, b2=0.95)
-        params, _ = eqx.partition(self.model, eqx.is_array)
         self.optimizer = opt
-        self.opt_state = opt.init(params)
+        self.trainable = trainable_mask(self.model)
+        self.opt_state = opt.init(eqx.filter(self.model, self.trainable))
         self.steps_per_epoch = steps_per_epoch
         # static weights (sum loss_weights + extra_loss_weights) and progress-based schedulers
         lw = dict(cfg.model.get("loss_weights") or {})
@@ -129,12 +130,7 @@ class GyroSwinRunner(BaseRunner):
                     loss = loss + w_dict["phi_cross"] * _mse(preds["phi"], jnp.abs(phi_p))
             return loss
 
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        params, static = eqx.partition(model, eqx.is_array)
-        g_params, _ = eqx.partition(grads, eqx.is_array)
-        updates, opt_state = self.optimizer.update(g_params, opt_state, params)
-        params = eqx.apply_updates(params, updates)
-        return eqx.combine(params, static), opt_state, loss
+        return train_update(model, opt_state, loss_fn, self.optimizer, self.trainable)
 
     def train_epoch(self, epoch: int, key) -> tuple[dict, dict]:
         cfg = self.cfg

@@ -22,7 +22,8 @@ from neugk_jax.diffusion.flow_matching import (
     fm_forward_loss,
 )
 from neugk_jax.diffusion.latents import load_precomputed_latents
-from neugk_jax.training.runner import BaseRunner, build_optimizer
+from neugk_jax.models.utils import trainable_mask
+from neugk_jax.training.runner import BaseRunner, build_optimizer, train_update
 from neugk_jax.training.schedulers import warmup_cosine
 from neugk_jax.translate import force_f32
 
@@ -141,8 +142,8 @@ class FlowMatchingRunner(BaseRunner):
             min_lr=cfg.training.get("final_learning_rate", 1e-6),
         )
         self.optimizer = build_optimizer(self.schedule, cfg.training, self.model, decoupled=True)
-        params, _ = eqx.partition(self.model, eqx.is_array)
-        self.opt_state = self.optimizer.init(params)
+        self.trainable = trainable_mask(self.model)
+        self.opt_state = self.optimizer.init(eqx.filter(self.model, self.trainable))
         self.use_ot = bool(cfg.model.get("minibatch_ot", True))
 
     @eqx.filter_jit
@@ -153,13 +154,7 @@ class FlowMatchingRunner(BaseRunner):
             return fm_forward_loss(fwd, latents, cond, key=key,
                                    latent_scale=self.latent_scale,
                                    use_ot=self.use_ot)
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        params, static = eqx.partition(model, eqx.is_array)
-        g_params, _ = eqx.partition(grads, eqx.is_array)
-        updates, opt_state = self.optimizer.update(g_params, opt_state, params)
-        params = eqx.apply_updates(params, updates)
-        model = eqx.combine(params, static)
-        return model, opt_state, loss
+        return train_update(model, opt_state, loss_fn, self.optimizer, self.trainable)
 
     def train_epoch(self, epoch: int, key) -> dict:
         cfg = self.cfg

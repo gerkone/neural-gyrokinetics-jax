@@ -51,11 +51,15 @@ def _sincos_nd(grid_size: Sequence[int], dim: int) -> jnp.ndarray:
 class APE(eqx.Module):
     """Absolute positional embedding broadcast-added to the last axis.
 
-    ``learnable=False`` keeps it frozen via stop_gradient.
+    ``learnable=False`` makes ``pos_embed`` a buffer (see ``trainable_mask``).
     """
 
     pos_embed: jax.Array
     learnable: bool = eqx.field(static=True)
+
+    @property
+    def buffer_fields(self):
+        return () if self.learnable else ("pos_embed",)
 
     def __init__(
         self,
@@ -97,6 +101,7 @@ class ContinuousConditionEmbed(eqx.Module):
 
     mlp: list  # [Linear]
     omega: jax.Array
+    buffer_fields = ("omega",)
     dim: int = eqx.field(static=True)
     n_cond: int = eqx.field(static=True)
     cond_dim: int = eqx.field(static=True)
@@ -129,7 +134,7 @@ class ContinuousConditionEmbed(eqx.Module):
         omega = 1.0 / (max_wavelength ** (
             jnp.arange(0, cond_per_wave, 2, dtype=jnp.float32) / cond_per_wave
         ))
-        self.omega = jax.lax.stop_gradient(omega.astype(jnp.float32))
+        self.omega = omega.astype(jnp.float32)
 
         self.cond_dim = 4 * dim
         self.mlp = [Linear(dim, self.cond_dim, key=key)]
@@ -204,6 +209,7 @@ class RPB(eqx.Module):
     cpb_mlp: MLP
     rpb: jax.Array
     rpb_idx: jax.Array
+    buffer_fields = ("rpb", "rpb_idx")
     num_heads: int = eqx.field(static=True)
     seq_len: int = eqx.field(static=True)
     space: int = eqx.field(static=True)
@@ -225,8 +231,8 @@ class RPB(eqx.Module):
             self.cpb_mlp,
             Linear(last.weight.shape[1], last.weight.shape[0], key=kw2, use_bias=False),
         )
-        self.rpb = jax.lax.stop_gradient(_build_rpb_table(window_size))
-        self.rpb_idx = jax.lax.stop_gradient(_build_rpb_idx(window_size))
+        self.rpb = _build_rpb_table(window_size)
+        self.rpb_idx = _build_rpb_idx(window_size)
         seq_len = 1
         for w in window_size:
             seq_len *= w

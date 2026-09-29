@@ -17,6 +17,7 @@ import equinox as eqx
 import jax
 import optax
 
+from neugk_jax.models.utils import trainable_mask
 from neugk_jax.training.checkpoint import (
     CheckpointState,
     load_checkpoint,
@@ -42,7 +43,7 @@ def weight_decay_mask(params, exclude):
 def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999):
     """Clip + Adam chain; ``decoupled`` picks torch AdamW over Adam's coupled L2 decay."""
     wd = tcfg.get("weight_decay", 0.0)
-    params, _ = eqx.partition(model, eqx.is_array)
+    params = eqx.filter(model, trainable_mask(model))
     mask = weight_decay_mask(params, tcfg.get("exclude_from_wd", []))
     clip = (optax.clip_by_global_norm(tcfg.get("clip_to", 1.0))
             if tcfg.get("clip_grad", True) else optax.identity())
@@ -53,6 +54,16 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
     # torch Adam adds wd * p to the gradient before the moment estimates
     return optax.chain(clip, optax.add_decayed_weights(wd, mask=mask),
                        optax.scale_by_adam(b2=b2), optax.scale_by_learning_rate(schedule))
+
+
+def train_update(model, opt_state, loss_fn, optimizer, mask, *, has_aux: bool = False):
+    """One optimizer step on the leaves ``mask`` marks trainable; buffers stay fixed."""
+    params, static = eqx.partition(model, mask)
+    out, grads = eqx.filter_value_and_grad(
+        lambda p: loss_fn(eqx.combine(p, static)), has_aux=has_aux)(params)
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    return eqx.combine(eqx.apply_updates(params, updates), static), opt_state, out
+
 
 class BaseRunner(ABC):
     cfg: Any

@@ -5,17 +5,16 @@ Delegates to the pure-JAX ``gerkone/gyaradax`` package. The API:
     from gyaradax.integrals import get_integrals
     phi, (pflux, eflux, vflux) = get_integrals(df, geometry, params=None, ...)
 
-Inputs are unbatched; we ``vmap`` over the batch axis. Physical
-quantities should run in ``float64`` — ``gyaradax`` sets
-``jax_enable_x64=True`` globally on import. We don't put the integrals on
-the training graph so the x64 promotion is contained to eval-only
-``jit`` blocks.
+Inputs are unbatched; we ``vmap`` over the batch axis. The public entry points
+run in float64 inside a local ``jax.enable_x64`` context; gyaradax's global x64
+switch on import is undone so the rest of the process stays fp32.
 
 ``gyaradax`` is electrostatic-only at the moment (no apar/bpar paths).
 """
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Optional
 
 import jax
@@ -31,12 +30,30 @@ _GEOMETRY_KEYS = (
 _PARAM_KEYS = ("adiabatic", "beta", "nlapar", "nlbpar")
 
 
+
+def _import_gyaradax():
+    """Import ``gyaradax.integrals`` without leaving its global x64 switch on."""
+    prev = jax.config.jax_enable_x64
+    import gyaradax.integrals  # noqa: F401
+    jax.config.update("jax_enable_x64", prev)
+
+
+def _x64(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        _import_gyaradax()
+        with jax.enable_x64(True):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 def _split_geom_and_params(geometry: dict[str, jnp.ndarray]):
     geom = {k: geometry[k] for k in _GEOMETRY_KEYS if k in geometry}
     params_dict = {k: geometry[k] for k in _PARAM_KEYS if k in geometry}
     return geom, params_dict
 
 
+@_x64
 def compute_integrals(
     df: jnp.ndarray,
     geometry: dict[str, jnp.ndarray],
@@ -59,6 +76,7 @@ def compute_integrals(
     return get_integrals(df, geom, params=p, adiabatic_electrons=adiabatic_electrons)
 
 
+@_x64
 def batched_integrals(
     df_batch: jnp.ndarray,
     geometry_batch: dict[str, jnp.ndarray],
@@ -70,6 +88,7 @@ def batched_integrals(
     return jax.vmap(one)(df_batch, geometry_batch)
 
 
+@_x64
 def gyaradax_flux_integrals(
     df_batch: jnp.ndarray,
     geometry_one: dict,
@@ -124,6 +143,7 @@ def gyaradax_flux_integrals(
     return np.asarray(phi), np.asarray(eflux)
 
 
+@_x64
 def gyaradax_spectral_fields(
     df_batch: jnp.ndarray,
     geometry_one: dict,
@@ -144,7 +164,6 @@ def gyaradax_spectral_fields(
 
     Applies the same ``parseval`` override as ``gyaradax_flux_integrals``.
     """
-    import gyaradax  # noqa: F401 — enables jax x64 before any array conversion
     df_batch = jnp.asarray(df_batch)
     # recombine_zf only applies to the separate-zf channel-of-4 layout
     df_rec = df_batch[:, :2] + df_batch[:, 2:] if df_batch.shape[1] == 4 else df_batch
