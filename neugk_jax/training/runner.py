@@ -66,6 +66,8 @@ def train_update(model, opt_state, loss_fn, optimizer, mask, *, has_aux: bool = 
 
 
 class BaseRunner(ABC):
+    # validation metrics that select best.eqx, first present wins (lower is better)
+    val_metrics: tuple[str, ...] = ("df", "df_mse")
     cfg: Any
     dist: DistributedInfo
     logger: Logger
@@ -119,7 +121,7 @@ class BaseRunner(ABC):
             self.model = state.model
             self.opt_state = state.opt_state
             self.start_epoch = state.epoch
-            self.best_val = state.loss
+            self.best_val = float((state.meta or {}).get("best_val", math.inf))
             if self.dist.is_rank0:
                 print(f"resumed from epoch {self.start_epoch} (val={self.best_val:.4e})")
 
@@ -133,8 +135,15 @@ class BaseRunner(ABC):
                 opt_state=self.opt_state,
                 epoch=epoch,
                 loss=val,
+                meta={"best_val": self.best_val},
             ),
         )
+
+    def _val_score(self, val_logs: dict) -> float:
+        for k in self.val_metrics:
+            if k in val_logs:
+                return float(val_logs[k])
+        raise KeyError(f"none of {self.val_metrics} in validation metrics {sorted(val_logs)}")
 
     def _current_lr(self, step: int) -> float | None:
         sched = getattr(self, "schedule", None)
@@ -146,9 +155,11 @@ class BaseRunner(ABC):
             return None
 
     def __call__(self) -> None:
-        key = jax.random.PRNGKey(getattr(self.cfg, "seed", 0))
+        base_key = jax.random.PRNGKey(getattr(self.cfg, "seed", 0))
+        val_every = getattr(self.cfg.validation, "validate_every_n_epochs", 1)
+        last_val = math.nan
         for epoch in range(self.start_epoch + 1, self.cfg.training.n_epochs + 1):
-            key, train_key = jax.random.split(key)
+            train_key = jax.random.fold_in(base_key, epoch)
             t0 = time.perf_counter()
             # train_epoch returns either loss_logs, or (loss_logs, info_dict)
             train_out = self.train_epoch(epoch, train_key)
@@ -159,7 +170,8 @@ class BaseRunner(ABC):
             t_train = time.perf_counter() - t0
 
             val_logs, val_plots = {}, {}
-            if epoch % getattr(self.cfg.validation, "validate_every_n_epochs", 1) == 0:
+            validating = epoch % val_every == 0 or epoch == 1
+            if validating:
                 val_out = self.evaluate(epoch)
                 if isinstance(val_out, tuple) and len(val_out) == 2:
                     val_logs, val_plots = val_out
@@ -183,13 +195,13 @@ class BaseRunner(ABC):
                 )
                 print(f"epoch {epoch:04d}  {core}  ({t_train:.1f}s)")
 
-            val = val_logs.get("df", val_logs.get("df_mse", loss_logs.get("loss", math.inf)))
-            if val < self.best_val:
-                self.best_val = val
-                self.save_checkpoint(epoch, val, "best.eqx")
-            # rolling checkpoint save cadence
+            if validating:
+                last_val = self._val_score(val_logs)
+                if last_val < self.best_val:
+                    self.best_val = last_val
+                    self.save_checkpoint(epoch, last_val, "best.eqx")
             save_every = getattr(self.cfg.training, "save_every_n_epochs", 1)
             if epoch % save_every == 0 or epoch == self.cfg.training.n_epochs:
-                self.save_checkpoint(epoch, val, "ckp.eqx")
+                self.save_checkpoint(epoch, last_val, "ckp.eqx")
 
         self.logger.finish()

@@ -28,70 +28,91 @@ def _tqdm(*args, **kwargs):
         return args[0] if args else iter(())
 
 
-def _cache_path(dataset, split: str, ae_tag: str) -> Path:
+def latent_cache_path(dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False,
+                      timestep_std_filter=None) -> Path:
+    """Torch-compatible cache file for a split's latents (``CycloneAEDataset.precompute_latents``).
+
+    ``<path>/diff_<split>_latents_offset<o>[_mu][_std<f>]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
+    where ``<run>`` is the last ``_`` field of the AE run directory (a checkpoint file resolves
+    to its directory).
+    """
     basenames = sorted(os.path.basename(f) for f in dataset.files)
-    h = hashlib.sha256("".join(basenames).encode()).hexdigest()[:12]
-    name = f"diff_{split}_latents_offset{dataset.offset}_{h}_{ae_tag}.pkl"
-    return Path(dataset.path) / name
+    file_hash = hashlib.sha256("".join(basenames).encode()).hexdigest()[:12]
+    run_dir = os.path.abspath(str(ae_checkpoint))
+    if os.path.isfile(run_dir):
+        run_dir = os.path.dirname(run_dir)
+    segments = [
+        "diff", f"{split}_latents", f"offset{dataset.offset}",
+        "mu" if decouple_mu else "",
+        f"std{timestep_std_filter}" if timestep_std_filter else "",
+        file_hash, "latents", "ae" + run_dir.split("_")[-1],
+    ]
+    return Path(dataset.path) / ("_".join(filter(None, segments)) + ".pkl")
+
+
+def _barrier(name: str) -> None:
+    import jax
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+        multihost_utils.sync_global_devices(name)
 
 
 def precompute_latents(
     dataset,
     *,
     encode_fn: Callable,
-    ae_tag: str,
+    cache_file: str | Path,
     batch_size: int = 4,
-    device=None,
     overwrite: bool = False,
 ) -> None:
-    """Encode the entire dataset through ``encode_fn`` and cache the result.
+    """Encode the dataset through ``encode_fn`` into ``cache_file`` (or load it if present).
 
-    ``encode_fn`` is called as ``encode_fn(df_batch, cond_batch) -> latent_batch``
-    where ``df_batch`` has shape ``(B, C, *resolution)`` and ``latent_batch``
-    has shape ``(B, *latent_grid, latent_channels)``. The dataset is mutated
-    in place: ``dataset.precomputed_latents`` is populated and the mode is
-    flipped to ``"diff"`` so subsequent ``__getitem__`` calls return cached
-    latents instead of raw df reads.
+    ``encode_fn(df_batch, cond_batch) -> latent_batch`` maps ``(B, C, *resolution)`` to
+    ``(B, *latent_grid, latent_channels)``. Entries follow the torch schema:
+    ``{(fid, t_idx): {"x", "phi", "flux", "timestep", <one raw scalar per condition>}}``.
+    Process 0 encodes and writes atomically; the others wait and load. The dataset is
+    switched to ``mode="diff"`` with ``precomputed_latents`` populated.
     """
-    cache_file = _cache_path(dataset, dataset.split, ae_tag)
-    if cache_file.exists() and not overwrite:
-        with open(cache_file, "rb") as f:
-            dataset.precomputed_latents = pickle.load(f)
-        dataset.mode = "diff"
-        _compute_latent_stats(dataset)
-        return
+    import jax
 
+    cache_file = Path(cache_file)
+    if (overwrite or not cache_file.exists()) and jax.process_index() == 0:
+        latents_dict = _encode_all(dataset, encode_fn, batch_size)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_file.with_name(cache_file.name + f".tmp{os.getpid()}")
+        with open(tmp, "wb") as f:
+            pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, cache_file)
+    _barrier(f"latents:{cache_file.name}")
+    with open(cache_file, "rb") as f:
+        dataset.precomputed_latents = pickle.load(f)
+    dataset.mode = "diff"
+    _compute_latent_stats(dataset)
+
+
+def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
     latents_dict: dict[tuple[int, int], dict] = {}
     n = len(dataset)
-    indices = list(range(n))
-    pbar = _tqdm(range(0, n, batch_size), desc=f"precompute {dataset.split} latents")
-    for start in pbar:
-        sl = indices[start : start + batch_size]
-        # gather a batch from the (currently mode='ae') dataset
-        samples = [dataset[i] for i in sl]
+    for start in _tqdm(range(0, n, batch_size), desc=f"precompute {dataset.split} latents"):
+        samples = [dataset[i] for i in range(start, min(start + batch_size, n))]
         df_batch = jnp.stack([jnp.asarray(s.df) for s in samples])
         cond_batch = None
         if samples[0].conditioning is not None:
             cond_batch = jnp.stack([jnp.asarray(s.conditioning) for s in samples])
-        z = encode_fn(df_batch, cond_batch)
-        z_np = np.asarray(z)
-        for i, s in zip(sl, samples):
-            fid = int(s.file_index)
-            t_idx = int(s.timestep_index)
-            latents_dict[(fid, t_idx)] = {
-                "x": z_np[sl.index(i)],
-                "flux": np.asarray(s.flux),
-                "timestep": np.asarray(s.timestep),
+        z_np = np.asarray(encode_fn(df_batch, cond_batch))
+        for b, s in enumerate(samples):
+            entry = {
+                "x": z_np[b],
                 "phi": np.asarray(s.phi) if s.phi is not None else None,
-                "conditioning": np.asarray(s.conditioning) if s.conditioning is not None else None,
+                "flux": np.asarray(s.flux, dtype=np.float32),
+                "timestep": np.asarray(s.timestep, dtype=np.float32),
             }
-
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_file, "wb") as f:
-        pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
-    dataset.precomputed_latents = latents_dict
-    dataset.mode = "diff"
-    _compute_latent_stats(dataset)
+            if s.conditioning is not None:
+                cond = np.asarray(s.conditioning, dtype=np.float32)
+                for k, name in enumerate(dataset.conditions):
+                    entry[name] = cond[k]
+            latents_dict[(int(s.file_index), int(s.timestep_index))] = entry
+    return latents_dict
 
 
 def load_precomputed_latents(

@@ -19,6 +19,10 @@ from neugk_jax.models.utils import LayerNorm, Linear, gelu
 from neugk_jax.models.vit import ViTLayer
 
 
+def _split(key, n):
+    return [None] * n if key is None else list(jr.split(key, n))
+
+
 class Swin5DAE(eqx.Module):
     """Wraps Swin5DUnet with a bottleneck projection."""
 
@@ -153,18 +157,20 @@ class Swin5DAE(eqx.Module):
         self.normalized_latent = normalized_latent
 
 
-    def encode(self, df: jnp.ndarray):
+    def encode(self, df: jnp.ndarray, *, key=None, inference: bool = True):
+        keys = _split(key, len(self.backbone.down_blocks) + 1)
         z, pad_axes = self.backbone.patch_encode(df)
-        for blk in self.backbone.down_blocks:
-            z = blk(z, return_skip=False)
-        z = self.middle_pre(z)
+        for blk, k in zip(self.backbone.down_blocks, keys):
+            z = blk(z, return_skip=False, key=k, inference=inference)
+        z = self.middle_pre(z, key=keys[-1], inference=inference)
         z = self.middle_downproj(z)
         if self.normalized_latent:
             z = self.pre_z_norm(z)
         return z, pad_axes
 
 
-    def decode(self, z: jnp.ndarray, pad_axes=None):
+    def decode(self, z: jnp.ndarray, pad_axes=None, *, key=None, inference: bool = True):
+        keys = _split(key, len(self.backbone.up_blocks) + 1)
         if pad_axes is None:
             # reconstruct pad_axes from the base resolution
             dummy = jnp.zeros((self.backbone.original_in_channels, *self.backbone.full_resolution))
@@ -172,18 +178,20 @@ class Swin5DAE(eqx.Module):
         if self.normalized_latent:
             z = self.post_z_norm(z)
         z = self.middle_upproj(z)
-        z = self.middle_post(z)
+        z = self.middle_post(z, key=keys[0], inference=inference)
         z = self.middle_upscale(z)
         # no skip connections in ae decoder
-        for blk in self.backbone.up_blocks:
-            z = blk(z, s=None)
+        for blk, k in zip(self.backbone.up_blocks, keys[1:]):
+            z = blk(z, s=None, key=k, inference=inference)
         df = self.backbone.patch_decode(z, pad_axes)
         return {"df": df}
 
 
-    def __call__(self, df: jnp.ndarray, return_latent: bool = False):
-        z, pad_axes = self.encode(df)
-        out = self.decode(z, pad_axes)
+    def __call__(self, df: jnp.ndarray, return_latent: bool = False, *, key=None,
+                 inference: bool = True):
+        k_enc, k_dec = _split(key, 2)
+        z, pad_axes = self.encode(df, key=k_enc, inference=inference)
+        out = self.decode(z, pad_axes, key=k_dec, inference=inference)
         if return_latent:
             out["latent"] = z
         return out

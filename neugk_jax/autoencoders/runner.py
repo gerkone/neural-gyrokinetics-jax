@@ -6,13 +6,14 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from tqdm import tqdm
 
 from neugk_jax.autoencoders.swin5d_ae import Swin5DAE
 from neugk_jax.dataset import CycloneDataset, KvikIOBackend, NumpyBackend
 from neugk_jax.losses import df_loss
 from neugk_jax.models.utils import trainable_mask
-from neugk_jax.training.ddp import data_sharding, replicated
+from neugk_jax.training.ddp import global_batch_size, process_batch_indices, replicate, shard_batch
 from neugk_jax.training.runner import BaseRunner, build_optimizer, train_update
 from neugk_jax.training.schedulers import warmup_cosine
 
@@ -52,7 +53,7 @@ class AERunner(BaseRunner):
         train_dtype = legacy or amp_dtype
         def _backend(dt: str | None):
             if getattr(cfg.dataset, "backend", "kvikio") == "kvikio":
-                return KvikIOBackend(rank=self.dist.process_id, prefer_dtype=dt)
+                return KvikIOBackend(rank=self.dist.local_rank, prefer_dtype=dt)
             return NumpyBackend(prefer_dtype=dt)
         train_backend = _backend(train_dtype)
         val_backend = _backend(None)
@@ -141,30 +142,26 @@ class AERunner(BaseRunner):
         self.trainable = trainable_mask(self.model)
         self.opt_state = optimizer.init(eqx.filter(self.model, self.trainable))
         self.steps_per_epoch = steps_per_epoch
-        # multi-device: replicate model+opt_state on the mesh, shard data on leading axis
-        if self.dist.local_device_count > 1:
-            rep = replicated(self.dist.mesh)
-            self.model = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, rep) if eqx.is_array(x) else x, self.model,
-            )
-            self.opt_state = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, rep) if eqx.is_array(x) else x, self.opt_state,
-            )
+        self.model = replicate(self.dist, self.model)
+        self.opt_state = replicate(self.dist, self.opt_state)
 
     @eqx.filter_jit
-    def _train_step(self, model, opt_state, batch):
+    def _train_step(self, model, opt_state, batch, key):
         sep_zf = bool(self.cfg.dataset.get("separate_zf", False))
+        keys = jr.split(key, batch.shape[0])
+
         def loss_fn(m):
-            pred = jax.vmap(lambda x: m(x)["df"])(batch)
+            pred = jax.vmap(lambda x, k: m(x, key=k, inference=False)["df"])(batch, keys)
             return df_loss(pred, batch, separate_zf=sep_zf)
 
         return train_update(model, opt_state, loss_fn, self.optimizer, self.trainable)
 
     def train_epoch(self, epoch: int, key) -> dict:
         cfg = self.cfg
-        bs = cfg.training.batch_size
+        bs = global_batch_size(self.dist, cfg.training.batch_size)
         n = len(self.train_ds)
-        idx = jr.permutation(key, n)
+        perm_key, step_key = jr.split(key)
+        idx = np.asarray(jr.permutation(perm_key, n))
         losses = []
         starts = list(range(0, n - bs + 1, bs))
         # single-threaded prefetch: load batch i+1 while jax is training on batch i
@@ -172,8 +169,8 @@ class AERunner(BaseRunner):
         from concurrent.futures import ThreadPoolExecutor
 
         def _load(start):
-            samples = [self.train_ds[int(idx[i])] for i in range(start, start + bs)]
-            return jnp.stack([jnp.asarray(s.df) for s in samples])
+            local = process_batch_indices(self.dist, idx[start:start + bs])
+            return np.stack([np.asarray(self.train_ds[int(i)].df) for i in local])
 
         ex = ThreadPoolExecutor(max_workers=1)
         pbar = starts
@@ -182,19 +179,16 @@ class AERunner(BaseRunner):
         future = ex.submit(_load, starts[0]) if starts else None
         t_data_ms = []
         t_step_ms = []
-        multi_dev = self.dist.local_device_count > 1
-        data_shard = data_sharding(self.dist.mesh) if multi_dev else None
         try:
             for i, start in enumerate(pbar):
                 _t = _time.perf_counter_ns()
-                df = future.result()
-                if multi_dev:
-                    df = jax.device_put(df, data_shard)
+                df = shard_batch(self.dist, jnp.asarray(future.result()))
                 t_data_ms.append((_time.perf_counter_ns() - _t) / 1e6)
                 if i + 1 < len(starts):
                     future = ex.submit(_load, starts[i + 1])
                 _t = _time.perf_counter_ns()
-                self.model, self.opt_state, loss = self._train_step(self.model, self.opt_state, df)
+                self.model, self.opt_state, loss = self._train_step(
+                    self.model, self.opt_state, df, jr.fold_in(step_key, i))
                 lf = float(loss)  # block on device
                 t_step_ms.append((_time.perf_counter_ns() - _t) / 1e6)
                 losses.append(lf)

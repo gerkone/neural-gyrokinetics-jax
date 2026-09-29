@@ -108,7 +108,7 @@ def test_ae_runner_constructs_and_steps(cyclone_dir):
     # one training step
     sample = r.train_ds[0]
     df = jnp.asarray(sample.df)[None]
-    r.model, r.opt_state, loss = r._train_step(r.model, r.opt_state, df)
+    r.model, r.opt_state, loss = r._train_step(r.model, r.opt_state, df, jr.PRNGKey(0))
     assert jnp.isfinite(loss)
 
 

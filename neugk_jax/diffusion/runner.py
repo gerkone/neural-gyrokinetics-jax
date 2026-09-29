@@ -21,17 +21,30 @@ from neugk_jax.diffusion.flow_matching import (
     euler_sample,
     fm_forward_loss,
 )
-from neugk_jax.diffusion.latents import load_precomputed_latents
+from neugk_jax.diffusion.latents import latent_cache_path, load_precomputed_latents
 from neugk_jax.models.utils import trainable_mask
+from neugk_jax.training.ddp import global_batch_size, process_batch_indices, replicate, shard_batch
 from neugk_jax.training.runner import BaseRunner, build_optimizer, train_update
 from neugk_jax.training.schedulers import warmup_cosine
 from neugk_jax.translate import force_f32
+
+
+def resolve_ae_checkpoint(path) -> Path:
+    """AE checkpoint file for a run directory (``best.eqx``, else ``best.pth``) or a file path."""
+    p = Path(path)
+    if p.is_dir():
+        for name in ("best.eqx", "best.pth"):
+            if (p / name).exists():
+                return p / name
+        raise FileNotFoundError(f"no best.eqx / best.pth in {p}")
+    return p
 
 
 class FlowMatchingRunner(BaseRunner):
     """Trains a DiT to model the latent distribution via flow matching."""
 
     dataset_cls = CycloneDataset
+    val_metrics = ("avg_flux_rmse", "fm_loss")
 
     def _dataset_kwargs(self) -> dict:
         return {}
@@ -48,15 +61,14 @@ class FlowMatchingRunner(BaseRunner):
         ae_path = cfg.ae_checkpoint
         if ae_path is None:
             raise ValueError("diffusion workflow requires ae_checkpoint")
-        # build the ae template + load translated weights
         from neugk_jax.translate import build_ae_from_config, load_or_translate
-        ae_cfg = Path(ae_path).parent / "config.yaml"
-        ae_template = build_ae_from_config(str(ae_cfg), key=jr.PRNGKey(0))
+        ae_file = resolve_ae_checkpoint(ae_path)
+        ae_template = build_ae_from_config(str(ae_file.parent / "config.yaml"), key=jr.PRNGKey(0))
         # .eqx loads directly; a torch .pth is translated on the fly
-        self.ae = load_or_translate(ae_template, ae_path)
+        self.ae = load_or_translate(ae_template, str(ae_file))
 
         backend = (
-            KvikIOBackend(rank=self.dist.process_id)
+            KvikIOBackend(rank=self.dist.local_rank)
             if cfg.dataset.get("backend", "numpy") == "kvikio"
             else NumpyBackend()
         )
@@ -91,10 +103,11 @@ class FlowMatchingRunner(BaseRunner):
         )
 
         # encode every sample once so training is just mse on cached latents
-        def encode_fn(df_batch, cond_batch):
-            return jax.vmap(lambda x: self.ae.encode(x)[0])(df_batch)
+        encode = eqx.filter_jit(lambda ae, df: jax.vmap(lambda x: ae.encode(x)[0])(df))
 
-        ae_tag = Path(ae_path).stem
+        def encode_fn(df_batch, cond_batch):
+            return encode(self.ae, df_batch)
+
         latent_shape = (*self.ae.bottleneck_grid_size, int(self.ae.bottleneck_dim))
         for ds, key in ((self.train_ds, "latents_cache_train"), (self.val_ds, "latents_cache_val")):
             path = cfg.dataset.get(key)
@@ -103,7 +116,11 @@ class FlowMatchingRunner(BaseRunner):
                 if self.dist.is_rank0:
                     print(f"loaded {len(ds.precomputed_latents)} {ds.split} latents from {path}")
             else:
-                precompute_latents(ds, encode_fn=encode_fn, ae_tag=ae_tag,
+                cache = latent_cache_path(
+                    ds, ds.split, ae_path, decouple_mu=cfg.dataset.get("norm_decouple_mu", False),
+                    timestep_std_filter=cfg.dataset.get("timestep_std_filter"),
+                )
+                precompute_latents(ds, encode_fn=encode_fn, cache_file=cache,
                                    batch_size=cfg.training.get("precompute_batch", 2))
 
         # 1 / sqrt(mean variance)
@@ -144,33 +161,40 @@ class FlowMatchingRunner(BaseRunner):
         self.optimizer = build_optimizer(self.schedule, cfg.training, self.model, decoupled=True)
         self.trainable = trainable_mask(self.model)
         self.opt_state = self.optimizer.init(eqx.filter(self.model, self.trainable))
+        self.model = replicate(self.dist, self.model)
+        self.opt_state = replicate(self.dist, self.opt_state)
         self.use_ot = bool(cfg.model.get("minibatch_ot", True))
 
     @eqx.filter_jit
     def _train_step(self, model, opt_state, latents, cond, key):
+        fm_key, drop_key = jr.split(key)
+
         def loss_fn(m):
-            def fwd(x, t, c):
-                return m(x, t, c)
-            return fm_forward_loss(fwd, latents, cond, key=key,
+            def fwd(x, t, *rest):
+                *c, k = rest
+                return m(x, t, c[0] if c else None, key=k, inference=False)
+            return fm_forward_loss(fwd, latents, cond, key=fm_key,
                                    latent_scale=self.latent_scale,
-                                   use_ot=self.use_ot)
+                                   use_ot=self.use_ot, dropout_key=drop_key)
         return train_update(model, opt_state, loss_fn, self.optimizer, self.trainable)
 
     def train_epoch(self, epoch: int, key) -> dict:
         cfg = self.cfg
-        bs = cfg.training.batch_size
+        bs = global_batch_size(self.dist, cfg.training.batch_size)
         n = len(self.train_ds)
         idx_key, key = jr.split(key)
-        idx = jr.permutation(idx_key, n)
+        idx = np.asarray(jr.permutation(idx_key, n))
         losses = []
         for start in range(0, n - bs + 1, bs):
-            samples = [self.train_ds[int(idx[i])] for i in range(start, start + bs)]
-            z = jnp.stack([jnp.asarray(s.df) for s in samples])
+            local = process_batch_indices(self.dist, idx[start:start + bs])
+            samples = [self.train_ds[int(i)] for i in local]
+            z = np.stack([np.asarray(s.df) for s in samples])
             cond = (
-                jnp.stack([jnp.asarray(s.conditioning) for s in samples])
+                np.stack([np.asarray(s.conditioning) for s in samples])
                 if samples[0].conditioning is not None
                 else None
             )
+            z, cond = shard_batch(self.dist, (z, cond))
             step_key, key = jr.split(key)
             self.model, self.opt_state, loss = self._train_step(
                 self.model, self.opt_state, z, cond, step_key,

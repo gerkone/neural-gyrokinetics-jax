@@ -152,3 +152,39 @@ def test_fm_e2e_train_eval(cyclone_dir, tmp_path):
     state = load_checkpoint(out / "ckp.eqx", runner.model)
     assert state.epoch == 1
     assert jnp.isfinite(jnp.asarray(state.loss))
+
+
+def test_ae_resume_keeps_best_and_continues(cyclone_dir, tmp_path):
+    from neugk_jax.autoencoders.runner import AERunner
+    from neugk_jax.training.checkpoint import load_checkpoint
+
+    path, resolution = cyclone_dir
+    out = tmp_path / "ae_resume"
+    cfg = _tiny_ae_cfg(path, resolution, out)
+    AERunner(cfg, output_path=cfg.output_path)()
+    first = load_checkpoint(out / "ckp.eqx", AERunner(cfg, output_path=cfg.output_path).model)
+    best_val = first.meta["best_val"]
+    assert np.isfinite(best_val)
+
+    cfg.training.n_epochs = 2
+    resumed = AERunner(cfg, output_path=cfg.output_path)
+    assert resumed.start_epoch == 1 and resumed.best_val == best_val
+    resumed()
+    assert load_checkpoint(out / "ckp.eqx", resumed.model).epoch == 2
+
+
+def test_resume_config_cli_wins(tmp_path):
+    import main as entry
+
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "ckp.eqx").write_bytes(b"")
+    OmegaConf.save(OmegaConf.create({"training": {"n_epochs": 5, "lr": 1.0}, "seed": 3}),
+                   run / "config.yaml")
+    saved = OmegaConf.load(run / "config.yaml")
+    entry._drop_cli_overridden(["training.n_epochs=9"], saved)
+    assert "n_epochs" not in saved.training and saved.training.lr == 1.0
+    cfg = OmegaConf.create({"output_path": str(run), "load_ckpt": True, "seed": 0,
+                            "training": {"n_epochs": 9, "lr": 2.0}})
+    merged = entry.resume_config(cfg)
+    assert merged.seed == 3 and merged.training.lr == 1.0 and merged.output_path == str(run)

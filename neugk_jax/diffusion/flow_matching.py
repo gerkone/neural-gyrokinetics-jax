@@ -73,11 +73,13 @@ def fm_forward_loss(
     loss_mask: Optional[jnp.ndarray] = None,
     aux_loss_fn: Optional[Callable] = None,
     time_fn: Optional[Callable] = None,
+    dropout_key=None,
 ) -> jnp.ndarray:
     """One flow-matching training step (returns the scalar loss).
 
     ``model_fn(xt, t_scalar, cond_per_sample)`` is the *per-sample* DiT
-    forward — caller vmaps the model over the batch.
+    forward — caller vmaps the model over the batch. With ``dropout_key`` it is called as
+    ``model_fn(xt, t, cond, key)`` with one key per sample.
 
     Optional hooks (all default off — the latent path is unchanged):
 
@@ -103,7 +105,10 @@ def fm_forward_loss(
     xt = t_b * x1 + (1.0 - t_b) * x0
     target_v = x1 - x0
     # vmap over the batch — model_fn is per-sample
-    pred = jax.vmap(model_fn)(xt, t, cond) if cond is not None else jax.vmap(model_fn)(xt, t)
+    args = (xt, t) if cond is None else (xt, t, cond)
+    if dropout_key is not None:
+        args = (*args, jr.split(dropout_key, bs))
+    pred = jax.vmap(model_fn)(*args)
     err = (pred - target_v) ** 2
     if loss_mask is None:
         loss = jnp.mean(err)

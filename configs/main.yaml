@@ -10,3 +10,4 @@ defaults:
 workflow: ae
 seed: 0
 output_path: null
+load_ckpt: false
