@@ -15,31 +15,25 @@ switch on import is undone so the rest of the process stays fp32.
 from __future__ import annotations
 
 import functools
-from typing import Any, Optional
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-
-_GEOMETRY_KEYS = (
-    "krho", "ints", "intmu", "intvp", "vpgr", "mugr",
-    "bn", "ffun", "efun", "rfun", "bt_frac", "parseval",
-    "mas", "tmp", "d2X", "signz", "signB", "de", "vthrat",
-    "kxrh", "little_g",
-)
-_PARAM_KEYS = ("adiabatic", "beta", "nlapar", "nlbpar")
-
-
 
 REQUIRED_GEOMETRY = ("krho", "kxrh", "ints", "intmu", "intvp", "vpgr", "mugr", "bn",
                      "efun", "rfun", "bt_frac", "little_g")
 
 
 def require_integrals(geometry: Optional[dict]) -> None:
-    """Raise unless flux integrals can run: gyaradax importable and geometry complete."""
     import importlib.util
     if importlib.util.find_spec("gyaradax") is None:
         raise ImportError("eval_integrals needs gyaradax (pip install -e '.[gyro]')")
+    require_geometry(geometry)
+
+
+def require_geometry(geometry: Optional[dict]) -> None:
+    """Raise unless ``geometry`` carries every field :func:`precompute_geometry` needs."""
     if geometry is None:
         raise ValueError("eval_integrals needs trajectory geometry in the metadata")
     missing = [k for k in REQUIRED_GEOMETRY if k not in geometry]
@@ -65,45 +59,12 @@ def _x64(fn):
     return wrapped
 
 
-def _split_geom_and_params(geometry: dict[str, jnp.ndarray]):
-    geom = {k: geometry[k] for k in _GEOMETRY_KEYS if k in geometry}
-    params_dict = {k: geometry[k] for k in _PARAM_KEYS if k in geometry}
-    return geom, params_dict
-
-
-@_x64
-def compute_integrals(
-    df: jnp.ndarray,
-    geometry: dict[str, jnp.ndarray],
-    *,
-    params: Optional[Any] = None,
-    adiabatic_electrons: bool = True,
-) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-    """Compute (phi, (pflux, eflux, vflux)) for one sample's distribution function.
-
-    ``df`` shape (with adiabatic electrons): ``(vpar, mu, s, x, y)`` or
-    ``(2, vpar, mu, s, x, y)`` for complex inputs (real / imag channels);
-    ``gyaradax.get_integrals`` accepts both layouts.
-    """
-    from gyaradax.integrals import get_integrals
-    geom, gparams = _split_geom_and_params(geometry)
-    p = params
-    if p is None and gparams:
-        # pass scalars as-is; gyaradax builds its params object or falls back to compute_geometry defaults
-        p = gparams
-    return get_integrals(df, geom, params=p, adiabatic_electrons=adiabatic_electrons)
-
-
-@_x64
-def batched_integrals(
-    df_batch: jnp.ndarray,
-    geometry_batch: dict[str, jnp.ndarray],
-    *,
-    adiabatic_electrons: bool = True,
-):
-    def one(df, geom_one):
-        return compute_integrals(df, geom_one, adiabatic_electrons=adiabatic_electrons)
-    return jax.vmap(one)(df_batch, geometry_batch)
+def _f64(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with jax.enable_x64(True):
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 @_x64
@@ -290,7 +251,7 @@ _SCALAR_DEFAULTS = {
 }
 
 
-@_x64
+@_f64
 def precompute_geometry(geometry: dict, dtype=np.float32) -> dict[str, np.ndarray]:
     """Broadcast-ready geometry tensors for :func:`flux_integral` (one trajectory).
 

@@ -5,11 +5,14 @@ directory, saves the resolved config and hands off to the workflow runner.
 Distributed setup reads SLURM / torchrun env vars
 (``neugk_jax.training.ddp.init_distributed``).
 
-Usage::
+Usage (one experiment preset per workflow, see ``configs/experiment``)::
 
-    python main.py workflow=ae training.n_epochs=1
-    python main.py workflow=diffusion ae_checkpoint=/path/to/ae_run_dir
+    python main.py                                   # ae (default preset)
+    python main.py experiment=diffusion ae_checkpoint=/path/to/ae_run_dir
+    python main.py experiment=gyroswin
+    python main.py experiment=ae training.n_epochs=1 logging=wandb
     python main.py load_ckpt=true output_path=/path/to/run_dir   # resume in place
+    torchrun --nproc_per_node=2 main.py experiment=ae   # batch_size is per device
 """
 
 from __future__ import annotations
@@ -27,19 +30,16 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 def dispatch_runner(cfg: DictConfig) -> None:
     """Workflow → runner dispatch."""
     workflow = cfg.get("workflow", "ae")
-    base = workflow.split("_")[0] if "_" in workflow else workflow
+    base = workflow.split("_")[0]
     if base in ("ae", "pinc"):
-        from neugk_jax.autoencoders.runner import AERunner
-        AERunner(cfg, output_path=cfg.output_path)()
+        from neugk_jax.autoencoders.runner import AERunner as Runner
     elif base == "diffusion":
-        from neugk_jax.diffusion.runner import FlowMatchingRunner
-        FlowMatchingRunner(cfg, output_path=cfg.output_path)()
+        from neugk_jax.diffusion.runner import FlowMatchingRunner as Runner
     elif base == "gyroswin":
-        from neugk_jax.gyroswin import GyroSwinRunner
-        GyroSwinRunner(cfg, output_path=cfg.output_path)()
+        from neugk_jax.gyroswin import GyroSwinRunner as Runner
     else:
         raise NotImplementedError(f"unknown workflow: {workflow}")
-
+    Runner(cfg, output_path=cfg.output_path)()
 
 
 def _drop_cli_overridden(cli: list[str], source: DictConfig, prefix: str = "") -> None:

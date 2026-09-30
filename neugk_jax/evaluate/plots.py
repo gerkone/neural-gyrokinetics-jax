@@ -63,14 +63,12 @@ def plot_nd(
 ):
     """Upper-triangular grid of 2D projections, one per axis pair.
 
-    ``x`` (and optional ``y``) are arrays with shape ``(C?, *spatial)``.
-    Each subplot in the upper triangle aggregates the non-displayed
-    spatial axes (default: mean) and shows the resulting 2D slice. When
-    ``y`` is provided each subplot becomes a side-by-side (pred | gt).
+    ``x`` (and optional ``y``) are arrays with shape ``(C?, *spatial)``, numpy or
+    device arrays. Each subplot in the upper triangle aggregates the non-displayed
+    spatial axes (default: mean) and shows the resulting 2D slice; only those
+    slices are brought to host. When ``y`` is provided each subplot becomes a
+    side-by-side (pred | gt).
     """
-    x = np.asarray(x)
-    if y is not None:
-        y = np.asarray(y)
 
     # detect spatial dims + optional leading channel
     if labels is not None:
@@ -87,9 +85,9 @@ def plot_nd(
     if ndim < 2:
         # 1D: just plot a line
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(x.ravel(), label="x")
+        ax.plot(np.asarray(x).ravel(), label="x")
         if y is not None:
-            ax.plot(y.ravel(), label="y", linestyle="--")
+            ax.plot(np.asarray(y).ravel(), label="y", linestyle="--")
             ax.legend()
         return _plt_to_wandb_image(fig) if to_wandb else fig
 
@@ -118,8 +116,9 @@ def plot_nd(
             res = d[tuple(slices)]
         else:
             res = d.mean(axis=other_dims)
+        res = np.asarray(res)
         if mark_bad:
-            s = d.std(axis=other_dims)
+            s = np.asarray(d.std(axis=other_dims))
             res = np.where(s == 0, np.nan, res)
         return res
 
@@ -174,8 +173,7 @@ def generate_val_plots(
     for key, cfg in field_configs.items():
         if key not in rollout or key not in gt:
             continue
-        x = np.asarray(rollout[key])
-        y = np.asarray(gt[key])
+        x, y = rollout[key], gt[key]
         if cfg["recombine"]:
             if y.shape[0] != 2:
                 y = _recombine_zf(y, axis=0)
@@ -184,7 +182,7 @@ def generate_val_plots(
                 x = _recombine_zf(x, axis=axis)
         if x.ndim == 7:
             x = x[0]
-        x = np.squeeze(x); y = np.squeeze(y)
+        x, y = x.squeeze(), y.squeeze()
         fig = plot_nd(x, y, cmap=cfg["cmap"])
         plots[cfg["name"]] = _plt_to_wandb_image(fig) if to_wandb else fig
     return plots

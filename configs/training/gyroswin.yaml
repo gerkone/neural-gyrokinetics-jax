@@ -9,3 +9,6 @@ exclude_from_wd: [cond, pos_embed]
 amp:
   enable: false
   dtype: bf16
+num_workers: 4  # sample-reading threads
+prefetch: 2     # batches loaded ahead of the step
+save_every_n_epochs: 1

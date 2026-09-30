@@ -131,6 +131,8 @@ def test_cross_losses_rejected(cyclone_dir):
 
 def test_weight_schedule_does_not_retrace(cyclone_dir, monkeypatch):
     import neugk_jax.gyroswin.runner as runner_mod
+    from neugk_jax.training.runner import train_step
+    from neugk_jax.utils import TRACE_COUNTS
 
     calls = []
     orig = runner_mod.gyroswin_loss
@@ -144,15 +146,35 @@ def test_weight_schedule_does_not_retrace(cyclone_dir, monkeypatch):
                      "start_fraction": 0.0, "end_fraction": 1.0}}
     cfg = _cfg(cyclone_dir, {"df": 1.0, "phi": 0.1}, scheduler=sched)
     r = runner_mod.GyroSwinRunner(cfg, output_path=cfg.output_path)
-    batch = r.load_batch(r.train_ds, [0, 1])
     losses = []
     for step, frac in enumerate((0.0, 0.5, 1.0)):
-        w = r.weights_at(int(frac * r.total_steps))
-        r.model, r.opt_state, (loss, _) = r._train_step(
-            r.model, r.opt_state, batch, w, jr.PRNGKey(step), r._shared_norm)
-        losses.append(float(loss))
-    assert len(calls) == 1
+        batch = r.load_batch(r.train_ds, [0, 1], r.loader.read)
+        batch.update(r.step_extras(int(frac * r.total_steps)))
+        r.model, r.opt_state, logs = train_step((batch, r.ctx, jr.PRNGKey(step)), r.model,
+                                                r.opt_state, r.spec)
+        losses.append(float(logs["total"]))
+    assert len(calls) == 1 and TRACE_COUNTS["train_step:GyroSwinRunner"] >= 1
     assert np.all(np.isfinite(losses))
+
+
+def test_gyroswin_epochs_do_not_retrace(cyclone_dir):
+    from neugk_jax.gyroswin.runner import GyroSwinRunner
+    from neugk_jax.utils import TRACE_COUNTS
+
+    cfg = _cfg(cyclone_dir, {"df": 1.0, "phi": 0.1, "flux": 1.0},
+               extra={"phi_int": 0.1, "flux_int": 0.1})
+    r = GyroSwinRunner(cfg, output_path=cfg.output_path)
+    # 3 val samples at batch 2: the last batch is padded
+    assert r.evaluator.plans[-1].mask.tolist() == [1.0, 0.0]
+    r.train_epoch(1, jr.PRNGKey(0))
+    first, _ = r.evaluate(1)
+    TRACE_COUNTS.clear()
+    r.train_epoch(2, jr.PRNGKey(1))
+    second, _ = r.evaluate(2)
+    assert TRACE_COUNTS["train_step:GyroSwinRunner"] == 0
+    assert TRACE_COUNTS["gyroswin_eval_step"] == 0
+    for k in ("df_rel_l2_x1", "phi_rel_l2_x2", "df_rel_l2", "flux_int_x1"):
+        assert np.isfinite(second[k]), k
 
 
 def test_drop_path_active_only_in_training(cyclone_dir):

@@ -1,9 +1,11 @@
-"""Distributed setup for jax.distributed (SLURM or torchrun) and data-parallel batch helpers.
+"""Distributed setup for jax.distributed (SLURM or torchrun) and data-parallel placement helpers.
 
-One global ``Mesh`` with a single data axis spans every device of every process. Batches
-are loaded per process (``process_batch_indices``) and assembled into global arrays
-(``shard_batch``); model and optimizer state are replicated (``replicate``).
-``training.batch_size`` is per device, so the global batch is ``batch_size * device_count``.
+One global ``Mesh`` with a single data axis spans every device of every process. Training
+batches are loaded per process (``process_batch_indices``) and assembled into global arrays
+(``shard_batch``); model and optimizer state are replicated (``replicate``). Evaluation runs
+per process on a local mesh (``local_view``, ``shard_local``) with batches assigned
+round-robin (``eval_batch_owner``). ``training.batch_size`` is per device, so the global
+batch is ``batch_size * device_count``.
 """
 
 from __future__ import annotations
@@ -32,6 +34,10 @@ class DistributedInfo:
     @property
     def device_count(self) -> int:
         return self.mesh.size
+
+    @property
+    def local_mesh(self) -> Mesh:
+        return Mesh(np.asarray(jax.local_devices()), self.mesh.axis_names)
 
 
 def _torchrun_env() -> dict | None:
@@ -70,49 +76,82 @@ def init_distributed(*, axis_name: str = "dp") -> DistributedInfo:
     )
 
 
-def data_sharding(mesh: Mesh, axis_name: str = "dp") -> NamedSharding:
-    return NamedSharding(mesh, P(axis_name))
-
-
-def replicated(mesh: Mesh) -> NamedSharding:
-    return NamedSharding(mesh, P())
-
-
 def global_batch_size(dist: DistributedInfo, per_device: int) -> int:
     return per_device * dist.device_count
 
 
 def process_batch_indices(dist: DistributedInfo, window: np.ndarray) -> np.ndarray:
-    """This process's contiguous share of one global batch window of sample indices."""
+    # contiguous per-process slice of one global batch window
     per_proc = len(window) // dist.num_processes
     return window[dist.process_id * per_proc:(dist.process_id + 1) * per_proc]
 
 
+def eval_batch_owner(dist: DistributedInfo, batch_idx: int) -> bool:
+    return batch_idx % dist.num_processes == dist.process_id
+
+
+def _is_array(x) -> bool:
+    return isinstance(x, jax.Array | np.ndarray | np.generic)
+
+
+def _assemble(x, sharding: NamedSharding, n_rows_global: int):
+    # per-device slices of the process-local rows, placed and stitched into one global array
+    shape = (n_rows_global, *x.shape[1:])
+    index_map = sharding.addressable_devices_indices_map(shape)
+    offset = min(idx[0].start or 0 for idx in index_map.values())
+    shards = []
+    for dev, idx in index_map.items():
+        lo, hi = (idx[0].start or 0) - offset, (idx[0].stop or n_rows_global) - offset
+        shards.append(jax.device_put(x[lo:hi], dev))
+    return jax.make_array_from_single_device_arrays(shape, sharding, shards)
+
+
+def _put_rows(tree, mesh: Mesh, n_procs: int):
+    if mesh.size == 1:
+        dev = mesh.devices.flat[0]
+        return jax.tree_util.tree_map(lambda x: jax.device_put(x, dev) if _is_array(x) else x, tree)
+    sharding = NamedSharding(mesh, P(mesh.axis_names[0]))
+    return jax.tree_util.tree_map(
+        lambda x: _assemble(x, sharding, x.shape[0] * n_procs) if _is_array(x) else x, tree)
+
+
 def shard_batch(dist: DistributedInfo, tree):
-    """Assemble per-process host batches into arrays sharded on the leading axis."""
-    if dist.device_count == 1:
-        return tree
-    sharding = data_sharding(dist.mesh)
+    return _put_rows(tree, dist.mesh, dist.num_processes)
 
-    def put(x):
-        if x is None:
-            return None
-        if dist.num_processes > 1:
-            return jax.make_array_from_process_local_data(sharding, np.asarray(x))
-        return jax.device_put(x, sharding)
 
-    return jax.tree_util.tree_map(put, tree)
+def shard_local(dist: DistributedInfo, tree):
+    return _put_rows(tree, dist.local_mesh, 1)
+
+
+def _replicated_sharding(mesh: Mesh):
+    if mesh.size == 1:
+        return jax.sharding.SingleDeviceSharding(mesh.devices.flat[0])
+    return NamedSharding(mesh, P())
 
 
 def replicate(dist: DistributedInfo, tree):
-    """Place every array leaf of ``tree`` fully replicated on the mesh."""
-    if dist.device_count == 1:
-        return tree
-    rep = replicated(dist.mesh)
-    return jax.tree_util.tree_map(
-        lambda x: jax.device_put(x, rep) if isinstance(x, jax.Array | np.ndarray) else x, tree)
+    rep = _replicated_sharding(dist.mesh)
+    if dist.num_processes > 1:
+        tree = jax.device_get(tree)
+    return jax.tree_util.tree_map(lambda x: jax.device_put(x, rep) if _is_array(x) else x, tree)
 
 
-def eval_batch_owner(dist: DistributedInfo, batch_idx: int) -> bool:
-    """Round-robin assignment of evaluation batches to processes."""
-    return batch_idx % dist.num_processes == dist.process_id
+def replicate_local(dist: DistributedInfo, tree):
+    rep = _replicated_sharding(dist.local_mesh)
+    return jax.tree_util.tree_map(lambda x: jax.device_put(x, rep) if _is_array(x) else x, tree)
+
+
+def local_view(dist: DistributedInfo, tree):
+    """Process-local replicated view of globally replicated arrays (no copy of the shards)."""
+    mesh = dist.local_mesh
+    rep = _replicated_sharding(mesh)
+
+    def view(x):
+        if not isinstance(x, jax.Array) or x.sharding.device_set == set(mesh.devices.flat):
+            return x
+        shards = [s.data for s in x.addressable_shards]
+        if mesh.size == 1:
+            return shards[0]
+        return jax.make_array_from_single_device_arrays(x.shape, rep, shards)
+
+    return jax.tree_util.tree_map(view, tree)

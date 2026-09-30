@@ -95,10 +95,12 @@ def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
     n = len(dataset)
     for start in _tqdm(range(0, n, batch_size), desc=f"precompute {dataset.split} latents"):
         samples = [dataset[i] for i in range(start, min(start + batch_size, n))]
-        df_batch = jnp.stack([jnp.asarray(s.df) for s in samples])
+        # pad the tail so the encoder sees one batch shape
+        padded = samples + [samples[-1]] * (batch_size - len(samples))
+        df_batch = jnp.stack([jnp.asarray(s.df) for s in padded])
         cond_batch = None
         if samples[0].conditioning is not None:
-            cond_batch = jnp.stack([jnp.asarray(s.conditioning) for s in samples])
+            cond_batch = jnp.stack([jnp.asarray(s.conditioning) for s in padded])
         z_np = np.asarray(encode_fn(df_batch, cond_batch))
         for b, s in enumerate(samples):
             entry = {
@@ -113,6 +115,16 @@ def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
                     entry[name] = cond[k]
             latents_dict[(int(s.file_index), int(s.timestep_index))] = entry
     return latents_dict
+
+
+def latent_arrays(dataset) -> tuple[np.ndarray, np.ndarray | None]:
+    """Latents ``(N, *latent_shape)`` and conditioning ``(N, n_cond)`` in flat-index order."""
+    n = len(dataset)
+    keys = [dataset.flat_index_to_file_and_tstep[i] for i in range(n)]
+    z = np.stack([np.asarray(dataset.precomputed_latents[k]["x"], np.float32) for k in keys])
+    if not dataset.conditions:
+        return z, None
+    return z, np.stack([np.asarray(dataset[i].conditioning, np.float32) for i in range(n)])
 
 
 def load_precomputed_latents(

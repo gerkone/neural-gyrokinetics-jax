@@ -94,11 +94,6 @@ def _quantized_sibling(fp32_path: str, dtype: str) -> str:
     return fp32_path[:-4] + suf if fp32_path.endswith(".bin") else fp32_path + suf
 
 
-# kept for back-compat; new code uses ``_quantized_sibling``
-def _bf16_sibling(fp32_path: str) -> str:
-    return _quantized_sibling(fp32_path, "bf16")
-
-
 def _quantize_roundtrip(arr_f32: np.ndarray, dtype: str) -> np.ndarray:
     from neugk_jax.dataset.preprocess import dequantize_array, quantize_array
     payload, scale = quantize_array(arr_f32, dtype)
@@ -171,26 +166,19 @@ class NumpyBackend(DataBackend):
         └── data/
             ├── timestep_00000.bin
             ├── timestep_00001.bin
-            ├── timestep_00000.bf16.bin  (optional, ``scripts/quantize_bf16.py``)
+            ├── timestep_00000.bf16.bin  (optional, ``preprocess --mode=quantize``)
             ├── poten_00000.bin
             └── ...
 
-    ``prefer_bf16=True`` reads the ``.bf16.bin`` sibling when present and
-    falls back to fp32 silently when it isn't (graceful regression).
+    ``prefer_dtype`` (``fp16``/``bf16``/``i8``/``i4``) reads the quantized sibling
+    when present and otherwise the fp32 shard (round-tripped through the preferred
+    dtype when ``quantize_fallback``).
     """
 
-    def __init__(
-        self, *, prefer_dtype: str | None = None,
-        quantize_fallback: bool = True, prefer_bf16: bool = False,
-    ):
-        # back-compat: prefer_bf16=True → prefer_dtype="bf16"
-        if prefer_bf16 and not prefer_dtype:
-            prefer_dtype = "bf16"
+    def __init__(self, *, prefer_dtype: str | None = None, quantize_fallback: bool = True):
         self.prefer_dtype = prefer_dtype or "fp32"
         # if true and the preferred sibling is missing, read fp32 and round-trip through the preferred dtype on-the-fly
         self.quantize_fallback = quantize_fallback
-        # keep the legacy attribute name for any code still reading it
-        self.prefer_bf16 = (self.prefer_dtype == "bf16")
 
     def _strip_h5(self, path: str) -> str:
         return path.removesuffix("/").removesuffix(".h5")
@@ -235,11 +223,6 @@ class NumpyBackend(DataBackend):
                 drop = {"df_min", "df_max", "df_var", "df_mean", "df_std",
                         "phi_min", "phi_max", "phi_var"}
                 meta = {k: v for k, v in meta.items() if k not in drop}
-                # opportunistically cache the light variant next to the full one
-                try:
-                    save_meta(light_base, meta, _meta_ext(full_base))
-                except OSError:
-                    pass
         # fill in missing geometry scalars with safe defaults
         if "geometry" in meta:
             g = meta["geometry"]
@@ -325,9 +308,8 @@ class KvikIOBackend(NumpyBackend):
         use_kvikio: bool = True,
         return_jax: bool = True,
         prefer_dtype: str | None = None,
-        prefer_bf16: bool = False,
     ):
-        super().__init__(prefer_dtype=prefer_dtype, prefer_bf16=prefer_bf16)
+        super().__init__(prefer_dtype=prefer_dtype)
         self.rank = rank
         self.use_kvikio = use_kvikio
         self.return_jax = return_jax

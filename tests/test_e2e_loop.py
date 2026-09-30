@@ -92,7 +92,6 @@ def _tiny_ae_cfg(path, resolution, out_path):
             "eval_sampling": False,
         },
         "logging": {"mode": "disabled", "tqdm": False},
-        "distributed": {"enable": False, "n_nodes": 1},
     })
 
 

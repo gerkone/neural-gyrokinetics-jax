@@ -11,6 +11,7 @@ JAX consumes them via ``jnp.asarray`` when the dataloader stacks a batch.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import os
 import pickle
@@ -452,6 +453,32 @@ class CycloneDataset:
         if self.mode == "next":
             return self._get_next_sample(int(fid), int(t_idx), normalized=normalized)
         return self._get_ae_sample(int(fid), int(t_idx))
+
+    def with_mode(self, mode: str) -> "CycloneDataset":
+        view = copy.copy(self)
+        view.mode = mode
+        return view
+
+    def get_target(self, fid: int, t_idx: int) -> dict[str, np.ndarray]:
+        """Normalized next-step targets ``y_*`` of ``(fid, t_idx)`` without reading the input."""
+        fid, t_idx = int(fid), int(t_idx)
+        meta = self.metadata[fid]
+        gt_t = t_idx + self.offset + self.bundle_seq_length
+        out: dict[str, np.ndarray] = {}
+        with self.backend.open(self.files[fid]) as handle:
+            gt_str = str(gt_t).zfill(5)
+            if "df" in self.fields_to_load:
+                y_df = self.backend.read_df(handle, gt_str, self.df_shape, [0, 1])
+                if self.separate_zf:
+                    y_df = separate_zf_fn(y_df, axis=0)
+                out["df"] = y_df
+            if "phi" in self.fields_to_load:
+                out["phi"] = self.backend.read_phi(handle, gt_str, self.phi_resolution)
+        out["flux"] = np.asarray(meta["flux"][gt_t], dtype=np.float32)
+        out["fluxavg"] = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
+        if self.normalization is not None:
+            out = {k: self.normalize(fid, **{k: v}) for k, v in out.items()}
+        return {k: _f32(v) for k, v in out.items()}
 
     def num_ts(self, fid: int) -> int:
         return self.file_num_timesteps[int(fid)]

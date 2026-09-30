@@ -99,3 +99,73 @@ def test_layers_forward_legacy_flag():
     ]
     for layer in layers:
         assert all(b.legacy_double_shortcut for b in layer.blocks), type(layer).__name__
+
+
+def test_layers_reject_unknown_kwargs():
+    from neugk_jax.models.swin import DiTSwinLayer, FilmSwinLayer, SwinLayer
+    from neugk_jax.models.vit import DiTLayer, FilmViTLayer, ViTLayer
+
+    common = dict(key=jr.PRNGKey(0), rms_nrom=True)
+    with pytest.raises(TypeError):
+        SwinLayer(2, 8, depth=1, num_heads=2, grid_size=(4, 4), window_size=(2, 2), **common)
+    with pytest.raises(TypeError):
+        DiTSwinLayer(2, 8, depth=1, num_heads=2, grid_size=(4, 4), window_size=(2, 2),
+                     cond_dim=4, **common)
+    with pytest.raises(TypeError):
+        FilmSwinLayer(2, 8, depth=1, num_heads=2, grid_size=(4, 4), window_size=(2, 2),
+                      cond_dim=4, **common)
+    with pytest.raises(TypeError):
+        ViTLayer(2, 8, depth=1, num_heads=2, grid_size=(4, 4), **common)
+    with pytest.raises(TypeError):
+        DiTLayer(2, 8, depth=1, num_heads=2, grid_size=(4, 4), cond_dim=4, **common)
+    with pytest.raises(TypeError):
+        FilmViTLayer(2, 8, depth=1, num_heads=2, grid_size=(4, 4), cond_dim=4, **common)
+
+
+def test_ae_backbone_has_no_dead_middle():
+    from neugk_jax.autoencoders import Swin5DAE
+
+    ae = Swin5DAE(decouple_mu=True, dim=8, base_resolution=[4, 4, 4, 16, 8], in_channels=2,
+                  out_channels=2, patch_size=[2, 0, 2, 4, 2], window_size=[2, 0, 2, 2, 2],
+                  depth=[1], num_heads=[2], num_layers=1, bottleneck_dim=8,
+                  bottleneck_depth=1, bottleneck_num_heads=2, c_multiplier=1,
+                  key=jr.PRNGKey(0))
+    assert ae.backbone.middle is None and ae.backbone.middle_upscale is None
+    assert ae(jnp.zeros((2, 4, 4, 4, 16, 8)))["df"].shape == (2, 4, 4, 4, 16, 8)
+
+
+def test_ae_dit_builders_accept_mappings(tmp_path):
+    import yaml
+
+    from neugk_jax.translate import build_ae_from_config, build_dit_from_config
+
+    ae_cfg = {"model": {"latent_dim": 8, "num_layers": 1, "decouple_mu": True,
+                        "patch": {"patch_size": [2, 0, 2, 4, 2], "window_size": [2, 0, 2, 2, 2],
+                                  "c_multiplier": 1, "merging_depth": 1, "unmerging_depth": 1},
+                        "vit": {"num_heads": [2], "depth": [1], "drop_path": 0.3},
+                        "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2}},
+              "dataset": {"separate_zf": False, "resolution": [4, 4, 4, 16, 8]}}
+    path = tmp_path / "ae.yaml"
+    path.write_text(yaml.safe_dump(ae_cfg))
+    ae_path = build_ae_from_config(str(path), key=jr.PRNGKey(0))
+    ae = build_ae_from_config(OmegaConf.create(ae_cfg), key=jr.PRNGKey(0))
+    assert jax.tree_util.tree_structure(ae) == jax.tree_util.tree_structure(ae_path)
+    assert ae.middle_pre.drop_path == 0.3
+    dit_cfg = {"model": {"latent_dim": 16, "conditioning": ["itg", "dg"],
+                         "vit": {"num_heads": 2, "depth": 1}}}
+    dit = build_dit_from_config(dit_cfg, ae, key=jr.PRNGKey(0))
+    assert dit.backbone.mlp_ratio == 2.0 and dit.backbone.drop_path == 0.1
+    assert dit.cond_embed is not None
+
+
+def test_conditioning_slots_follow_sorted_names():
+    import numpy as np
+
+    from neugk_jax.training.runner import conditioning_slots
+
+    ds_conds = sorted(["itg", "dg", "s_hat", "q", "timestep"])
+    for order in (["itg", "dg", "s_hat", "q"], ["q", "s_hat", "dg", "itg"]):
+        slots = conditioning_slots(ds_conds, order)
+        assert [ds_conds[i] for i in slots] == ["dg", "itg", "q", "s_hat"]
+    assert conditioning_slots(ds_conds, []) is None
+    assert np.asarray(conditioning_slots(ds_conds, ["timestep"])).tolist() == [4]

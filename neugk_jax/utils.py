@@ -1,19 +1,30 @@
-"""Generic utilities: seeding, separate/recombine zonal flow, running stats."""
+"""Generic utilities: config conversion, trace counting, separate/recombine zonal flow, running stats."""
 
 from __future__ import annotations
 
 import math
-import random
+from collections import Counter
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import numpy as np
+from omegaconf import OmegaConf
+
+# number of times each named jitted function has been traced
+TRACE_COUNTS: Counter = Counter()
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
+def count_trace(name: str) -> None:
+    TRACE_COUNTS[name] += 1
+
+
+def config_dict(cfg) -> dict:
+    """Plain resolved container of an OmegaConf node or mapping (``{}`` for None)."""
+    if cfg is None:
+        return {}
+    if OmegaConf.is_config(cfg):
+        return OmegaConf.to_container(cfg, resolve=True)
+    return dict(cfg)
 
 
 def separate_zf(x, axis: int = 0):
@@ -42,10 +53,6 @@ def recombine_zf(x, axis: int = 0):
     else:
         zf, non_zf = np.split(x, 2, axis=axis)
     return zf + non_zf
-
-
-def remaining_progress(step: float, total: float) -> float:
-    return min(max(step / max(total, 1.0), 0.0), 1.0)
 
 
 @dataclass
@@ -88,31 +95,3 @@ class RunningMeanStd:
         self.min = np.minimum(self.min, mn)
         self.max = np.maximum(self.max, mx)
         self.count = new_count
-
-    def combine(self, other: "RunningMeanStd") -> None:
-        if other.count == 0:
-            return
-        if self.count == 0:
-            self.mean = other.mean
-            self.var = other.var
-            self.min = other.min
-            self.max = other.max
-            self.count = other.count
-            return
-        self.update(other.mean, other.var, other.min, other.max, int(other.count))
-
-
-def expand_as(x: np.ndarray | jnp.ndarray, ref: np.ndarray | jnp.ndarray):
-    # insert leading singleton axes until x.ndim == ref.ndim
-    x = jnp.asarray(x) if isinstance(ref, jnp.ndarray) else np.asarray(x)
-    while x.ndim < ref.ndim:
-        x = x[None, ...] if isinstance(x, np.ndarray) else jnp.expand_dims(x, 0)
-    return jnp.broadcast_to(x, ref.shape) if isinstance(ref, jnp.ndarray) else np.broadcast_to(x, ref.shape)
-
-
-def split_keys(key: jax.Array, n: int) -> list[jax.Array]:
-    return list(jax.random.split(key, n))
-
-
-def stop_grad(x):
-    return jax.lax.stop_gradient(x)

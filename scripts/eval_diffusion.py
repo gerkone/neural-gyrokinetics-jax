@@ -40,7 +40,7 @@ def main():
     p.add_argument("--steps", type=int, default=50, help="euler sampling steps")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--subsample", type=int, default=1,
-                   help="stride over val samples (upstream val_subsample; the paper uses 10)")
+                   help="stride over val samples (the paper uses 10)")
     p.add_argument("--latent-scale", type=float, default=None,
                    help="latent_scale the DiT was TRAINED with (the runner prints it). "
                         "Omitted → estimated from this split, which mis-scales the sampler.")
@@ -53,43 +53,30 @@ def main():
     import jax.numpy as jnp
     import jax.random as jr
     import numpy as np
-    import yaml
+    from omegaconf import OmegaConf
 
-    from neugk_jax.dataset import CycloneDataset, NumpyBackend
-    from neugk_jax.diffusion.flow_matching import euler_sample
+    from neugk_jax.dataset.factory import build_dataset
+    from neugk_jax.diffusion.runner import encode_batch
     from neugk_jax.evaluate import DiffusionEvaluator
+    from neugk_jax.training.runner import conditioning_slots
     from neugk_jax.translate import (
         build_ae_from_config,
         build_dit_from_config,
         load_or_translate,
     )
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-    dcfg = cfg.get("dataset", {}) or {}
+    cfg = OmegaConf.load(args.config)
+    dcfg = cfg.get("dataset") or OmegaConf.create({})
+    with OmegaConf.read_write(dcfg):
+        dcfg.path = args.data_path
+        dcfg.backend = "numpy"
 
-    # ae config lives next to the ae checkpoint — same convention as FlowMatchingRunner
+    # ae config lives next to the ae checkpoint, same convention as FlowMatchingRunner
     ae_cfg = os.path.join(os.path.dirname(args.ae_ckpt), "config.yaml")
     ae = load_or_translate(build_ae_from_config(ae_cfg, key=jr.PRNGKey(0)), args.ae_ckpt)
     dit = load_or_translate(build_dit_from_config(args.config, ae, key=jr.PRNGKey(0)), args.dit_ckpt)
-    latent_shape = tuple(dit.latent_shape)
-    print(f"loaded AE + DiT: latent_shape={latent_shape}")
+    print(f"loaded AE + DiT: latent_shape={tuple(dit.latent_shape)}")
 
-    common = dict(
-        path=args.data_path,
-        split="val",
-        fields_to_load=tuple(dcfg.get("input_fields", ("df",))),
-        conditions=tuple(dcfg.get("conditions", ("itg", "dg", "s_hat", "q"))),
-        mode="diff",
-        backend=NumpyBackend(),
-        separate_zf=dcfg.get("separate_zf", False),
-        normalization=dcfg.get("normalization"),
-        normalization_scope=dcfg.get("normalization_scope", "dataset"),
-        normalization_stats=dcfg.get("normalization_stats"),
-        offset=dcfg.get("offset", 0),
-        lightweight_metadata=dcfg.get("lightweight_metadata", False),
-        cond_filters=dcfg.get("eval_cond_filters"),
-    )
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
     unknown = [s for s in splits if s not in SPLIT_TRAJECTORIES]
     if unknown:
@@ -97,7 +84,9 @@ def main():
 
     latent_scale = None
     for split in splits:
-        ds = CycloneDataset(trajectories=SPLIT_TRAJECTORIES[split], **common)
+        with OmegaConf.read_write(dcfg):
+            dcfg.validation_trajectories = SPLIT_TRAJECTORIES[split]
+        ds = build_dataset(dcfg, split="val", mode="ae")
         print(f"[{split}] {len(ds.files)} trajectories, {len(ds)} samples")
 
         if latent_scale is None:
@@ -107,32 +96,18 @@ def main():
             else:
                 # 1 / std of the ae latents, estimated from a few samples of this split
                 idx = np.linspace(0, len(ds) - 1, num=min(8, len(ds)), dtype=int)
-                z = jax.vmap(lambda x: ae.encode(x)[0])(
-                    jnp.stack([jnp.asarray(ds[int(i)].df) for i in idx])
-                )
-                latent_scale = float(1.0 / np.sqrt(max(float(np.var(np.asarray(z))), 1e-12)))
-                print(f"latent_scale = {latent_scale:.4f} (ESTIMATED from this split — pass "
+                z = encode_batch(ae, jnp.stack([jnp.asarray(ds[int(i)].df) for i in idx]))
+                latent_scale = float(1.0 / np.sqrt(max(float(jax.numpy.var(z)), 1e-12)))
+                print(f"latent_scale = {latent_scale:.4f} (ESTIMATED from this split; pass "
                       "--latent-scale to match training)")
 
-        def sample_fn(*, key, batch, cond=None, steps=50):
-            # euler-integrate the DiT velocity field, then decode — FlowMatchingRunner.sample
-            latents = euler_sample(
-                lambda x, t, c: dit(x, t, c),
-                key=key, shape=(batch, *latent_shape),
-                cond=cond, steps=steps, latent_scale=latent_scale,
-            )
-            return jax.vmap(ae.decode)(latents)
-
         evaluator = DiffusionEvaluator(
-            cfg, val_ds=ds, autoencoder=ae, sample_fn=sample_fn, is_rank0=True,
+            cfg, val_ds=ds, autoencoder=ae, latent_scale=latent_scale,
+            cond_slots=conditioning_slots(ds.conditions, list(cfg.model.get("conditioning") or [])),
+            batch_size=args.batch_size, steps=args.steps, n_samples=args.n_samples,
+            subsample=args.subsample,
         )
-        metrics, plots = evaluator(
-            dit, epoch=0,
-            batch_size=args.batch_size,
-            n_steps=args.steps,
-            n_samples_per_traj=args.n_samples,
-            val_subsample=args.subsample,
-        )
+        metrics, plots = evaluator(dit, epoch=0)
 
         out_dir = os.path.join(args.output, split)
         os.makedirs(out_dir, exist_ok=True)

@@ -1,13 +1,6 @@
-from neugk_jax.evaluate.base import BaseEvaluator, validation_metrics
-from neugk_jax.evaluate.integrals import compute_integrals
+from neugk_jax.evaluate.base import BaseEvaluator
 
-__all__ = [
-    "BaseEvaluator",
-    "validation_metrics",
-    "AEEvaluator",
-    "DiffusionEvaluator",
-    "compute_integrals",
-]
+__all__ = ["BaseEvaluator", "AEEvaluator", "DiffusionEvaluator", "GyroSwinEvaluator"]
 
 
 def __getattr__(name):
@@ -18,4 +11,7 @@ def __getattr__(name):
     if name == "DiffusionEvaluator":
         from neugk_jax.diffusion.eval import DiffusionEvaluator
         return DiffusionEvaluator
+    if name == "GyroSwinEvaluator":
+        from neugk_jax.gyroswin.eval import GyroSwinEvaluator
+        return GyroSwinEvaluator
     raise AttributeError(name)

@@ -57,7 +57,6 @@ LIGHT_DROP_KEYS = ("df_min", "df_max", "df_var", "df_mean", "df_std", "phi_min",
                    "phi_var")
 PHI_STAT_KEYS = ("phi_mean", "phi_var", "phi_std", "phi_min", "phi_max")
 
-# ---------- file naming -------------------------------------------------
 _DTYPE_SUFFIX = {
     "fp16": ".fp16.bin",
     "bf16": ".bf16.bin",
@@ -73,7 +72,6 @@ def quantized_sibling(fp32_path: str, bits: str) -> str:
     return fp32_path[:-4] + _DTYPE_SUFFIX[bits]
 
 
-# ---------- quantize / dequantize core ---------------------------------
 def quantize_array(arr_f32: np.ndarray, bits: str) -> tuple[np.ndarray, np.float32 | None]:
     """Quantize a flat fp32 array to ``bits`` precision.
 
@@ -129,7 +127,6 @@ def dequantize_array(payload: np.ndarray, scale: np.float32 | None, bits: str, n
     raise ValueError(f"unknown bits={bits!r}")
 
 
-# ---------- on-disk I/O ------------------------------------------------
 def write_quantized(dst: str, payload: np.ndarray, scale: np.float32 | None) -> int:
     """Atomic-ish write of one quantized shard. Returns bytes written."""
     tmp = dst + ".tmp"
@@ -168,7 +165,6 @@ def read_quantized(path: str, bits: str, n_elems: int, *, return_raw: bool = Fal
     return dequantize_array(payload, scale, bits, n_elems)
 
 
-# ---------- traversal --------------------------------------------------
 def expand_spec(spec) -> list[str]:
     """Expand one brace pattern (``iteration_{0-3,7}``) or pass an explicit list through."""
     if isinstance(spec, (list, tuple)) and len(spec) != 1:
@@ -276,7 +272,6 @@ def run_quantize(
     )
 
 
-# ---------- raw GKW readers --------------------------------------------
 def parse_input_dat(file_path: str) -> dict:
     """Parse a GKW ``input.dat`` namelist into ``{section: {param: value}}``."""
     parsed = {}
@@ -415,7 +410,7 @@ def load_geometry(directory: str) -> dict[str, np.ndarray]:
 
 
 def k_files(directory: str) -> list[str]:
-    """Distribution dumps of a GKW run: ``K*`` files (sorted) then numeric names (by value)."""
+    # k* dumps sorted, then numeric names by value
     files = os.listdir(directory)
     digits = sorted((f for f in files if f.isdigit()), key=int)
     ks = sorted(f for f in files if f.startswith("K") and not f.endswith(".dat"))
@@ -423,7 +418,6 @@ def k_files(directory: str) -> list[str]:
 
 
 def poten_files(directory: str) -> tuple[list[str], np.ndarray]:
-    """``Poten*`` dumps of a GKW run and their zero-based timestep slices."""
     pots = sorted(f for f in os.listdir(directory) if f.startswith("Poten"))
     return pots, np.array([int(f.replace("Poten", "")) for f in pots]) - 1
 
@@ -438,14 +432,12 @@ def read_dump_time(dat_path: str) -> float:
 
 
 def load_k_dump(path: str, resolution: tuple) -> np.ndarray:
-    """Spectral K-file dump as fp32 ``(2, vpar, mu, s, kx, ky)`` (kx zero-centred)."""
+    # fp32 (2, vpar, mu, s, kx, ky), kx zero-centred
     ff = np.fromfile(path, dtype=np.float64)
     return np.reshape(ff, (2, *resolution), order="F").astype("float32").copy()
 
 
-# ---------- spectral transforms ----------------------------------------
 def do_ifft(knth: np.ndarray) -> np.ndarray:
-    """Complex spectral df (kx/ky on axes 3/4) to fp32 real/imag channels in real space."""
     knth = np.fft.ifftn(knth, axes=(3, 4), norm="forward")
     return np.stack([knth.real, knth.imag]).squeeze().astype("float32")
 
@@ -502,10 +494,7 @@ def phi_fft_to_real(fft: np.ndarray, out_shape, norm: str = "forward") -> np.nda
 
 
 def solver_df_to_realspace(df_spec: np.ndarray) -> np.ndarray:
-    """gyaradax spectral df ``(vpar, mu, s, kx, ky)`` to real-space ``(2, vpar, mu, s, x, y)`` fp32.
-
-    Inverse of :func:`realspace_to_solver_df`; the df amplitude is left unscaled.
-    """
+    # inverse of the solver-side fftshift + spatial fft
     un = np.fft.fftshift(df_spec, axes=(3,))
     phys = np.fft.ifftn(un, axes=(3, 4), norm="forward")
     return np.stack([phys.real, phys.imag]).astype("float32")
@@ -516,7 +505,6 @@ def realspace_to_solver_df(df: np.ndarray) -> np.ndarray:
     return np.fft.ifftshift(spec, axes=(3,)).astype(np.complex64)
 
 
-# ---------- field solve ------------------------------------------------
 def _numeric_geometry(geometry: dict) -> dict:
     return {k: np.asarray(v) for k, v in geometry.items()
             if np.asarray(v).dtype.kind in "fiub"}
@@ -583,11 +571,9 @@ class FieldSolver:
 
 
 def field_solve_phi(df: np.ndarray, geometry: dict, x64: bool = True) -> np.ndarray:
-    """Real-space potential ``(x, s, y)`` solved from a real-space df."""
     return FieldSolver(geometry, x64=x64)(df)[0]
 
 
-# ---------- statistics and writers -------------------------------------
 class StreamStats:
     """Elementwise running mean/var/min/max over single samples, updated in place in float64.
 
@@ -650,7 +636,6 @@ def _save_meta_atomic(base: str, meta: dict, ext: str = ".pkl") -> None:
 
 
 def write_metadata(traj_dir: str, metadata: dict) -> None:
-    """Write ``metadata.pkl`` and its ``metadata_light.pkl`` subset."""
     _save_meta_atomic(os.path.join(traj_dir, "metadata"), metadata)
     light = {k: v for k, v in metadata.items() if k not in LIGHT_DROP_KEYS}
     _save_meta_atomic(os.path.join(traj_dir, "metadata_light"), light)
@@ -678,7 +663,6 @@ def _progress(it, show: bool, **kwargs):
     return tqdm(it, **kwargs)
 
 
-# ---------- raw GKW -> kvikio ------------------------------------------
 def preprocess(
     filename: str,
     backend=None,
@@ -839,7 +823,6 @@ def _split_modes(knth: np.ndarray, split_into_bands: Optional[int]) -> list[np.n
     return out
 
 
-# ---------- potential rewrite ------------------------------------------
 def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
     """Overwrite ``poten_*.bin`` of a preprocessed trajectory with the field solve of its df.
 
@@ -889,7 +872,6 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
     return f"{name}: rewrote {len(potens)} potentials"
 
 
-# ---------- gyaradax -> kvikio -----------------------------------------
 def preprocess_gyaradax(
     traj_dir: str,
     backend=None,
@@ -932,7 +914,7 @@ def preprocess_gyaradax(
     ns = len(ints)
     resolution = (len(np.asarray(np_geom["intvp"])), len(np.asarray(np_geom["intmu"])), ns,
                   len(np.asarray(np_geom["kxrh"])), len(np.asarray(np_geom["krho"])))
-    # gyaradax ky weights [1, 2, 2, ...] -> GKW convention [1, 2ns, 2ns, ...]
+    # gyaradax ky weights [1, 2, 2, ...] -> gkw convention [1, 2ns, 2ns, ...]
     parseval = np.asarray(np_geom["parseval"], dtype=np.float64).copy()
     parseval[1:] *= float(ns)
     np_geom["parseval"] = parseval
@@ -988,7 +970,6 @@ def preprocess_gyaradax(
     return out_path
 
 
-# ---------- cli --------------------------------------------------------
 def _gkw_datasets(args) -> list[str]:
     if args.trajs_file:
         with open(args.trajs_file) as fh:

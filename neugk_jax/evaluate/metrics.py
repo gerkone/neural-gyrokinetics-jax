@@ -5,7 +5,7 @@ Numpy implementation built on top of the gyaradax integrals adapter.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -89,14 +89,12 @@ def diagnostics(
 def spectral_diagnostics(
     df_batch: np.ndarray, geom: Dict[str, np.ndarray], ds: float
 ) -> List[Dict[str, np.ndarray]]:
-    """Turbulence spectra (kxspec/kyspec/qspec) + zonal profiles per snapshot.
-
-    ``df_batch`` is the (already denormalised) spatial df ``(B, 4, vp, mu, s,
-    x, y)``; ``geom`` is a single-trajectory geometry dict. Returns one dict
-    per batch element.
-    """
     from neugk_jax.evaluate.integrals import gyaradax_spectral_fields
     phi_spec, eflux = gyaradax_spectral_fields(df_batch, geom)
+    return _diagnostics_from_fields(phi_spec, eflux, geom, ds)
+
+
+def _diagnostics_from_fields(phi_spec, eflux, geom, ds) -> List[Dict[str, np.ndarray]]:
     out: List[Dict[str, np.ndarray]] = []
     for b in range(phi_spec.shape[0]):
         d = diagnostics(phi_spec[b], eflux[b], ds=ds)
@@ -138,65 +136,36 @@ def time_averaged_spectral_metrics(
     return out
 
 
-# direction of improvement, for table formatting downstream
-DIRECTION = {
-    "l1": "min",
-    "mse": "min",
-    "psnr": "max",
-    "bpp": "min",
-    "cr": "max",
-    "phi_l1": "min",
-    "phi_psnr": "max",
-    "eflux_l1": "min",
-    "endpoint": "min",
-    "kyspec_pc": "max",
-    "qspec_pc": "max",
-    "kyspec_sc": "max",
-    "qspec_sc": "max",
-    "kyspec_l1": "min",
-    "qspec_l1": "min",
-    "kyspec_wd": "min",
-    "qspec_wd": "min",
-    "kyspec_rl2": "min",
-    "qspec_rl2": "min",
-    "kyspec_rl1": "min",
-    "qspec_rl1": "min",
-    "density_l1": "min",
-    "momentum_l1": "min",
-    "energy_l1": "min",
-    "free_energy_err": "min",
-    "zfphi_rl2": "min",
-    "zfflow_rl2": "min",
-    "zfshear_rl2": "min",
-    "zf_energy_err": "min",
-}
-
-
 # evaluator glue — shared between the ae and diffusion evaluators
 def accumulate_spectral_diagnostics(
     store: Dict[int, tuple],
-    df_pred: np.ndarray,
-    df_tgt: np.ndarray,
+    df_pred,
+    df_tgt,
     file_idx: np.ndarray,
     val_ds: Any,
+    valid: Optional[np.ndarray] = None,
 ) -> bool:
     """Append per-snapshot pred/gt diagnostics to ``store``, grouped by trajectory.
 
-    ``df_pred``/``df_tgt`` must already be denormalised. Returns ``False``
-    (without touching ``store``) when the dataset metadata carries no ``ds``
-    so the caller can warn once and stop asking.
+    ``df_pred``/``df_tgt`` are denormalised batches (host or device); the spectral
+    fields are computed for the whole batch with each trajectory's geometry, so the
+    batch shape stays fixed, and only the small fields come to host. Rows where
+    ``valid`` is False are skipped. Returns ``False`` (without touching ``store``)
+    when the dataset metadata carries no ``ds`` so the caller can warn once.
     """
+    from neugk_jax.evaluate.integrals import gyaradax_spectral_fields
     file_idx = np.asarray(file_idx)
-    for fid in np.unique(file_idx):
+    valid = np.ones(len(file_idx), bool) if valid is None else np.asarray(valid, bool)
+    for fid in np.unique(file_idx[valid]):
         ds_val = val_ds.get_ds(int(fid))
         if ds_val is None:
             return False
-        idx = np.where(file_idx == fid)[0]
-        # single-trajectory geometry (strip the batch axis get_batch_geometry adds)
-        geom = {k: np.asarray(v)[0] for k, v in val_ds.get_batch_geometry(np.asarray([fid])).items()}
+        idx = np.where((file_idx == fid) & valid)[0]
+        geom = {k: np.asarray(v) for k, v in val_ds.metadata[int(fid)]["geometry"].items()}
         p_list, g_list = store.setdefault(int(fid), ([], []))
-        p_list.extend(spectral_diagnostics(df_pred[idx], geom, ds_val))
-        g_list.extend(spectral_diagnostics(df_tgt[idx], geom, ds_val))
+        for src, dst in ((df_pred, p_list), (df_tgt, g_list)):
+            phi_spec, eflux = gyaradax_spectral_fields(src, geom)
+            dst.extend(_diagnostics_from_fields(phi_spec[idx], eflux[idx], geom, ds_val))
     return True
 
 

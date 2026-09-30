@@ -1,3 +1,9 @@
+# entry point: python main.py [experiment=ae|diffusion|gyroswin] [key=value ...]
+#   python main.py                                                  # ae preset
+#   python main.py experiment=diffusion ae_checkpoint=<ae_run_dir>  # latent flow matching
+#   python main.py experiment=gyroswin                              # next-step gyroswin
+#   python main.py load_ckpt=true output_path=<run_dir>             # resume a run in place
+# the experiment presets (configs/experiment) pick the model/dataset/training groups per workflow.
 defaults:
   - _self_
   - model: ae/swin5d_ae
@@ -5,9 +11,13 @@ defaults:
   - training: ae
   - validation: default
   - logging: none
-  - distributed: single
+  - experiment: ae
 
 workflow: ae
 seed: 0
 output_path: null
 load_ckpt: false
+# trained ae run directory (or checkpoint file) for workflow=diffusion
+ae_checkpoint: null
+# persistent xla compilation cache directory; null disables it
+jax_compilation_cache_dir: null

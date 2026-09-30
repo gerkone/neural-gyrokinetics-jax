@@ -8,10 +8,6 @@ import jax
 import jax.numpy as jnp
 
 
-def mse_df(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-    return jnp.mean((pred - target) ** 2)
-
-
 def relative_norm_mse(pred: jnp.ndarray, target: jnp.ndarray, eps: float = 1e-4) -> jnp.ndarray:
     """``mean_b ||pred - target||² / (||target||² + eps)``.
 
@@ -42,11 +38,6 @@ def df_loss(pred: jnp.ndarray, target: jnp.ndarray, *, separate_zf: bool = False
 
 def l1(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
     return jnp.mean(jnp.abs(pred - target.reshape(pred.shape)))
-
-
-def per_sample_mse(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
-    diff = (pred - target) ** 2
-    return diff.reshape(diff.shape[0], -1).mean(axis=-1)
 
 
 def integral_losses(

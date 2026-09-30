@@ -4,10 +4,10 @@ Uses a synthetic dataset directory (same as ``test_dataset_parity``) and
 the small Swin5DAE / DiT shape configs from ``test_models_shapes``. The
 goal is to verify that:
 
-* configs compose cleanly through Hydra,
-* ``AERunner`` constructs and ``_train_step`` runs (forward + backward),
+* ``AERunner`` constructs and one jitted train step runs (forward + backward),
 * ``FlowMatchingRunner`` constructs, ``precompute_latents`` writes the
-  cache, and one FM training step runs.
+  cache, and one FM step runs on latents gathered from the device table,
+* each Hydra experiment preset composes.
 """
 
 from __future__ import annotations
@@ -94,7 +94,6 @@ def _tiny_ae_cfg(path, resolution):
         },
         "validation": {"validate_every_n_epochs": 1},
         "logging": {"mode": "disabled", "tqdm": False},
-        "distributed": {"enable": False, "n_nodes": 1},
     })
 
 
@@ -105,11 +104,11 @@ def test_ae_runner_constructs_and_steps(cyclone_dir):
     r = AERunner(cfg, output_path=cfg.output_path)
     assert len(r.train_ds) > 0
     assert r.opt_state is not None
-    # one training step
-    sample = r.train_ds[0]
-    df = jnp.asarray(sample.df)[None]
-    r.model, r.opt_state, loss = r._train_step(r.model, r.opt_state, df, jr.PRNGKey(0))
-    assert jnp.isfinite(loss)
+    from neugk_jax.training.runner import train_step
+    batch = r.load_batch(r.train_ds, [0], r.loader.read)
+    r.model, r.opt_state, logs = train_step((batch, r.ctx, jr.PRNGKey(0)), r.model,
+                                            r.opt_state, r.spec)
+    assert jnp.isfinite(logs["total"])
 
 
 def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
@@ -148,10 +147,28 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     r = FlowMatchingRunner(fm_cfg, output_path=fm_cfg.output_path)
     assert len(r.train_ds) > 0
     assert r.latent_shape == (*r.ae.bottleneck_grid_size, r.ae.bottleneck_dim)
-    # one training step
-    sample0 = r.train_ds[0]
-    sample1 = r.train_ds[1]
-    z = jnp.stack([jnp.asarray(sample0.df), jnp.asarray(sample1.df)])
-    cond = jnp.stack([jnp.asarray(sample0.conditioning), jnp.asarray(sample1.conditioning)])
-    r.model, r.opt_state, loss = r._train_step(r.model, r.opt_state, z, cond, jr.PRNGKey(0))
-    assert jnp.isfinite(loss)
+    # the latent table is device resident and matches the dataset's cached latents
+    assert r.ctx["latents"].shape == (len(r.train_ds), *r.latent_shape)
+    assert np.allclose(np.asarray(r.ctx["latents"][1]), r.train_ds[1].df)
+    from neugk_jax.training.runner import train_step
+    batch = r.load_batch(r.train_ds, [0, 1], r.loader.read)
+    assert set(batch) == {"idx"}
+    r.model, r.opt_state, logs = train_step((batch, r.ctx, jr.PRNGKey(0)), r.model,
+                                            r.opt_state, r.spec)
+    assert jnp.isfinite(logs["fm_loss"])
+
+
+@pytest.mark.parametrize("experiment", ["ae", "diffusion", "gyroswin"])
+def test_experiment_presets_compose(experiment):
+    from hydra import compose, initialize_config_dir
+
+    cfg_dir = str(Path(__file__).resolve().parents[1] / "configs")
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        cfg = compose(config_name="main", overrides=[f"experiment={experiment}"])
+    assert cfg.workflow == experiment
+    assert cfg.training.num_workers > 0 and "logging" in cfg
+    if experiment == "diffusion":
+        assert list(cfg.model.conditioning) == ["itg", "dg", "s_hat", "q"]
+        assert cfg.ae_checkpoint is not None
+    stats = cfg.dataset.get("normalization_stats")
+    assert stats is None or stats.endswith("_stats.pkl")

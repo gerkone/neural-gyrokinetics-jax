@@ -1,27 +1,34 @@
-"""Diffusion evaluator: sample → integrals → per-trajectory flux RMSE.
+"""Diffusion evaluator: sample latents, decode, integrate, per-trajectory flux RMSE.
 
-* draw ``n_samples`` per validation example (stochastic eval)
-* integrate via gyaradax to get ``eflux`` from the decoded df
-* aggregate predicted fluxes per ``iteration_<id>`` trajectory across all
-  samples to get a mean ± std
-* compare to the trajectory's ground-truth ``avg_flux`` to report
-  ``avg_flux_rmse``
-* emit the cross-section ``df`` / ``phi`` plots and the ``avg_flux_UQ``
-  scatter for wandb logging
+* draw ``eval_n_samples`` flow-matching samples per validation condition
+* decode and denormalize on device, integrate the heat flux of every sample
+* compare against the df-mode target snapshot (``df_mse``, ``df_rel_l2``)
+* aggregate the sampled fluxes per ``iteration_<id>`` trajectory (mean ± std) against the
+  trajectory's ``avg_flux``: ``avg_flux_rmse``, ``avg_flux_rel_err`` and per-trajectory values
+* emit the cross-section ``df`` plot and the ``avg_flux_UQ`` scatter
 """
 
 from __future__ import annotations
 
 import re
-from collections import defaultdict
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
-import jax.numpy as jnp
+import equinox as eqx
+import jax
 import jax.random as jr
 import numpy as np
 
-from neugk_jax.evaluate.base import BaseEvaluator, validation_metrics
-from neugk_jax.evaluate.plots import avg_flux_confidence, generate_val_plots
+from neugk_jax.diffusion.flow_matching import euler_sample
+from neugk_jax.evaluate.base import (
+    BaseEvaluator,
+    accumulate,
+    integrate,
+    per_sample_mse,
+    per_sample_rel_l2,
+)
+from neugk_jax.training.data import stack_fields
+from neugk_jax.training.ddp import replicate_local
+from neugk_jax.utils import count_trace, recombine_zf
 
 _TRAJ_RE = re.compile(r"iteration_\d+")
 
@@ -31,205 +38,145 @@ def _traj_id(path: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def _sample_decode(dit, ae, key, cond, n, steps, latent_scale, method):
+    z = euler_sample(lambda x, t, c=None: dit(x, t, c), key=key, shape=(n, *dit.latent_shape),
+                     cond=cond, steps=steps, latent_scale=latent_scale, method=method)
+    return jax.vmap(lambda zi: ae.decode(zi)["df"])(z)
+
+
+@eqx.filter_jit
+def sample_and_decode(dit, ae, key, cond, n: int, steps: int = 50, latent_scale: float = 1.0,
+                      method: str = "euler"):
+    count_trace("sample_and_decode")
+    return _sample_decode(dit, ae, key, cond, n, steps, latent_scale, method)
+
+
+@eqx.filter_jit
+def diffusion_eval_step(dit, ae, key, batch, acc, denorm, geom, steps: int, latent_scale: float,
+                        method: str):
+    count_trace("diffusion_eval_step")
+    x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
+    pred = _sample_decode(dit, ae, key, batch.get("cond"), x.shape[0], steps, latent_scale, method)
+    pred_d, tgt_d = denorm("df", pred, fids), denorm("df", x, fids)
+    values = {
+        "df_mse": per_sample_mse(pred, x),
+        "df_rel_l2": per_sample_rel_l2(recombine_zf(pred_d, axis=1), recombine_zf(tgt_d, axis=1)),
+    }
+    eflux = None
+    if geom is not None:
+        _, (_, eflux, _) = integrate(geom, fids, pred_d)
+    return accumulate(acc, values, mask), eflux, pred_d, tgt_d
+
+
 class DiffusionEvaluator(BaseEvaluator):
-    """Sampling-based evaluator with per-trajectory flux UQ."""
+    """Sampling-based evaluator with per-trajectory flux UQ.
 
-    def __init__(
-        self,
-        cfg: Any,
-        *,
-        val_ds: Any,
-        autoencoder: Any,
-        sample_fn: Callable,
-        is_rank0: bool = True,
-        cond_field: str = "conditioning",
-    ):
-        super().__init__(cfg, val_ds=val_ds, is_rank0=is_rank0)
-        self.autoencoder = autoencoder
-        self.sample_fn = sample_fn
-        # which CycloneSample field carries the conditioning ("linear" for LinearCondDiT)
-        self.cond_field = cond_field
+    ``val_ds`` serves df targets (mode "ae"); ``cond_slots`` selects the DiT conditioning
+    from the dataset's condition vector. ``steps``, ``n_samples``, ``subsample`` and
+    ``max_batches`` default to ``validation.eval_sample_steps`` / ``eval_n_samples`` /
+    ``val_subsample`` / ``eval_max_batches``.
+    """
 
-    def __call__(
-        self,
-        model: Any,
-        *,
-        epoch: int,
-        batch_size: int = 1,
-        n_steps: int = 50,
-        n_samples_per_traj: int = 1,
-        eval_integrals: bool = True,
-        eval_spectra: bool = False,
-        max_batches: Optional[int] = None,
-        val_subsample: int = 1,
-        **kwargs,
-    ) -> tuple[dict[str, float], dict[str, Any]]:
-        """Run the FM sampler over the val set linearly.
+    def __init__(self, cfg: Any, *, val_ds: Any, autoencoder: Any, latent_scale: float,
+                 cond_slots: Optional[np.ndarray] = None, steps: Optional[int] = None,
+                 n_samples: Optional[int] = None, subsample: Optional[int] = None,
+                 max_batches: Optional[int] = None, method: str = "euler", **kwargs):
+        vcfg = (cfg.get("validation") if hasattr(cfg, "get") else None) or {}
+        subsample = int(subsample or vcfg.get("val_subsample", 1))
+        max_batches = max_batches if max_batches is not None else vcfg.get("eval_max_batches")
+        super().__init__(cfg, val_ds=val_ds, indices=range(0, len(val_ds), subsample),
+                         max_batches=max_batches, **kwargs)
+        self.ae = replicate_local(self.dist, autoencoder)
+        self.latent_scale = float(latent_scale)
+        self.cond_slots = cond_slots
+        self.steps = int(steps or self.vcfg.get("eval_sample_steps", 50))
+        self.n_samples = int(n_samples or self.vcfg.get("eval_n_samples", 1))
+        self.method = method
+        self.eval_integrals = bool(self.vcfg.get("eval_integrals", True))
+        self.eval_spectra = bool(self.vcfg.get("eval_spectra", False))
+        self.metric_keys = ("df_mse", "df_rel_l2")
+        self.traj_ids = [_traj_id(f) for f in val_ds.files]
 
-        Iterates the dataset with stride ``val_subsample``. Each batch
-        produces one diffusion sample → eflux. After the loop, predicted
-        instantaneous fluxes are grouped by ``iteration_N`` trajectory id,
-        averaged, and compared to ``tgt_avg_flux`` per trajectory.
-        """
-        ds = self.val_ds
-        n = len(ds)
-        # build the strided index list: [0, stride, 2*stride, ...] within bounds
-        if val_subsample > 1:
-            indices = list(range(0, n, val_subsample))
-        else:
-            indices = list(range(n))
-        n_iter = (len(indices) + batch_size - 1) // batch_size
-        if max_batches is not None:
-            n_iter = min(n_iter, max_batches)
+    def load(self, ds, indices, read):
+        batch = stack_fields(read(ds, indices), ("df", "file_index", "timestep", "conditioning"))
+        cond = batch.pop("conditioning", None)
+        if self.cond_slots is not None:
+            batch["cond"] = np.asarray(cond)[:, self.cond_slots]
+        return batch
 
-        running: dict[str, float] = {}
-        n_acc = 0.0
-        per_traj_pred = defaultdict(list)
-        per_traj_tgt: dict[str, float] = {}
-        # per-trajectory spectral diagnostics (zonal flow + ky/Q spectra)
-        spectra_store: dict[int, tuple] = {}
-        val_plots: dict[str, Any] = {}
+    def __call__(self, model: Any, *, epoch: int) -> tuple[dict[str, float], dict[str, Any]]:
+        from neugk_jax.evaluate.plots import avg_flux_confidence, generate_val_plots
+        model = self.local_model(model)
+        geom = self.geometry if self.eval_integrals else None
+        acc = self.zeros((*self.metric_keys, "_n"))
         key = jr.PRNGKey(epoch)
-
-        import time
-        _t_start = time.time()
-        for batch_idx in range(n_iter):
-            start = batch_idx * batch_size
-            sel = indices[start:start + batch_size]
-            # pad last batch by repeating the final index to keep the jit'd batch shape
-            while len(sel) < batch_size:
-                sel.append(sel[-1])
-            samples = [ds[i] for i in sel]
-            cond_vals = [getattr(s, self.cond_field) for s in samples]
-            cond = jnp.stack([jnp.asarray(c) for c in cond_vals]) if cond_vals[0] is not None else None
-            df_tgt = jnp.stack([jnp.asarray(s.df) for s in samples])
-            tgt_avg_flux = np.asarray([float(s.avg_flux) for s in samples])
-            file_idx = np.asarray([int(s.file_index) for s in samples])
-            traj_ids = [_traj_id(ds.files[fi]) for fi in file_idx]
-
-            # multiple stochastic samples per condition
-            for _ in range(n_samples_per_traj):
-                step_key, key = jr.split(key)
-                out = self.sample_fn(key=step_key, batch=batch_size, cond=cond, steps=n_steps)
-                df_pred = out["df"] if isinstance(out, dict) else out
-
-                metrics, _ = validation_metrics(
-                    preds={"df": df_pred},
-                    tgts={"df": df_tgt, "flux": jnp.asarray(tgt_avg_flux)},
-                    eval_integrals=False,  # computed via gyaradax below instead
-                    geometry=None,
-                )
-                running, n_acc = self._accumulate(running, metrics, n_acc, n_new=batch_size)
-
-                # route through gyaradax; parseval corrected; denorm before integral
-                if eval_integrals and hasattr(ds, "get_batch_geometry"):
-                    from neugk_jax.evaluate.integrals import gyaradax_flux_integrals
-                    df_pred_np = np.asarray(df_pred)
-                    if ds.normalization is not None and hasattr(ds, "denormalize"):
-                        df_pred_np = np.stack([
-                            np.asarray(ds.denormalize(int(file_idx[b]),
-                                                      df=df_pred_np[b]))
-                            for b in range(batch_size)
-                        ])
-                    # use per-file geometry; whole batch from same trajectory avoids per-sample broadcast
-                    geom = ds.get_batch_geometry(file_idx)
-                    unique_fids = np.unique(file_idx)
-                    if len(unique_fids) == 1:
-                        # fast path: whole batch from one trajectory
-                        geom_one = {k: np.asarray(v[0]) for k, v in geom.items()}
-                        _, eflux_b = gyaradax_flux_integrals(df_pred_np, geom_one)
-                        eflux = np.asarray(eflux_b).reshape(batch_size, -1).sum(axis=-1)
-                    else:
-                        # mixed-trajectory batch (boundary) — split + integrate
-                        eflux = np.zeros((batch_size,), dtype=np.float64)
-                        for fi in unique_fids:
-                            mask = (file_idx == fi)
-                            idx_b = np.where(mask)[0]
-                            df_sub = df_pred_np[idx_b]
-                            geom_sub = {k: np.asarray(v[idx_b[0]]) for k, v in geom.items()}
-                            _, e_sub = gyaradax_flux_integrals(df_sub, geom_sub)
-                            e_sub = np.asarray(e_sub).reshape(len(idx_b), -1).sum(axis=-1)
-                            eflux[idx_b] = e_sub
-                    for b, tid in enumerate(traj_ids):
-                        if tid is None:
-                            continue
-                        per_traj_pred[tid].append(float(eflux[b]))
-                        per_traj_tgt[tid] = float(tgt_avg_flux[b])
-                    # spectral diagnostics on the denormalized pred/tgt df
-                    if eval_spectra:
-                        from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-                        df_tgt_np = np.asarray(df_tgt)
-                        if ds.normalization is not None and hasattr(ds, "denormalize"):
-                            df_tgt_np = np.stack([
-                                np.asarray(ds.denormalize(int(file_idx[b]),
-                                                          df=df_tgt_np[b]))
-                                for b in range(batch_size)
-                            ])
-                        if not accumulate_spectral_diagnostics(
-                            spectra_store, df_pred_np, df_tgt_np, file_idx, ds,
-                        ):
-                            if self.is_rank0:
-                                print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
-                            eval_spectra = False
-
-            if self.is_rank0 and (batch_idx + 1) % 25 == 0:
-                _el = time.time() - _t_start
-                _it_s = (batch_idx + 1) / max(_el, 1e-6)
-                print(f"  [eval] {batch_idx + 1}/{n_iter} batches "
-                      f"({_it_s:.2f} batch/s, {_el:.1f}s elapsed)", flush=True)
-
-            # emit the per-batch cross-section plot once for context
-            if batch_idx == 0 and self.is_rank0:
-                if hasattr(ds, "denormalize") and ds.normalization is not None:
-                    df_pred_d = np.asarray(ds.denormalize(int(file_idx[0]), df=np.asarray(df_pred)))
-                    df_tgt_d = np.asarray(ds.denormalize(int(file_idx[0]), df=np.asarray(df_tgt)))
-                else:
-                    df_pred_d = np.asarray(df_pred)
-                    df_tgt_d = np.asarray(df_tgt)
-                ts_arr = np.asarray([float(samples[0].timestep)])
-                val_plots.update(
-                    generate_val_plots(
-                        rollout={"df": df_pred_d[0]},
-                        gt={"df": df_tgt_d[0]},
-                        phase="val sample",
-                        ts=ts_arr,
-                        to_wandb=True,
-                    )
-                )
-
-        running, n_acc = self._sync(running, n_acc)
-        metrics = self._finalize(running, n_acc)
-
-        # time-averaged spectral metrics, mean over trajectories
-        if spectra_store:
+        fluxes, plots, spectra = [], {}, {}
+        for plan, batch, _ in self.loader.iterate(self.ds, self.plans, self.load, self.place):
+            fids = np.asarray([self.ds.flat_index_to_file_and_tstep[int(i)][0] for i in plan.indices])
+            for s in range(self.n_samples):
+                k = jr.fold_in(jr.fold_in(key, plan.number), s)
+                acc, eflux, pred_d, tgt_d = diffusion_eval_step(
+                    model, self.ae, k, batch, acc, self.denorm, geom, self.steps,
+                    self.latent_scale, self.method)
+                if eflux is not None:
+                    fluxes.append((fids, plan.mask, eflux))
+                if self.eval_spectra:
+                    self._spectra(spectra, pred_d, tgt_d, fids, plan.mask)
+            if plan.number == 0 and self.is_rank0:
+                ts = np.asarray(jax.device_get(batch["timestep"][:1])).reshape(-1)
+                plots.update(generate_val_plots(rollout={"df": pred_d[0]}, gt={"df": tgt_d[0]},
+                                                phase="val sample", ts=ts))
+        sums = self.reduce({**acc, **self._traj_sums(fluxes)})
+        metrics = {k: sums[k] / max(sums["_n"], 1.0) for k in self.metric_keys}
+        if spectra:
             from neugk_jax.evaluate.metrics import merged_spectral_metrics
-            metrics.update(merged_spectral_metrics(spectra_store))
+            metrics.update(merged_spectral_metrics(spectra))
+        if self.eval_integrals:
+            metrics.update(self._flux_metrics(sums, plots, avg_flux_confidence))
+        return metrics, plots
 
-        # per-trajectory flux rmse + uq scatter
-        if per_traj_pred and self.is_rank0:
-            traj_ids_sorted = sorted(per_traj_pred.keys())
-            pred_means = np.array([np.mean(per_traj_pred[t]) for t in traj_ids_sorted])
-            pred_stds = np.array([np.std(per_traj_pred[t]) for t in traj_ids_sorted])
-            tgt_vals = np.array([per_traj_tgt[t] for t in traj_ids_sorted])
-            metrics["avg_flux_rmse"] = float(
-                np.sqrt(np.mean((pred_means - tgt_vals) ** 2))
-            )
-            # also emit per-trajectory values as scalar metrics
-            for t, pm, ps, gt in zip(traj_ids_sorted, pred_means, pred_stds, tgt_vals):
-                metrics[f"avg_flux_pred/{t}"] = float(pm)
-                metrics[f"avg_flux_std/{t}"] = float(ps)
-                metrics[f"avg_flux_gt/{t}"] = float(gt)
-            if len(tgt_vals) > 2:
-                # report the regression slope of predicted vs target means
-                c = float(np.corrcoef(pred_means, tgt_vals)[0, 1])
-                var = float(np.var(pred_means))
-                metrics["avg_flux_corr"] = c
-                metrics["avg_flux_slope"] = float(
-                    np.cov(pred_means, tgt_vals)[0, 1] / var) if var > 0 else float("nan")
-                metrics["avg_flux_rel_mae"] = float(
-                    np.mean(np.abs(pred_means - tgt_vals) / np.maximum(tgt_vals, 1e-9)))
-            val_plots["avg_flux_UQ"] = avg_flux_confidence(
-                pred_means, pred_stds, tgt_vals, traj_ids_sorted, to_wandb=True,
-            )
+    def _traj_sums(self, fluxes) -> dict:
+        # per-trajectory sum, square sum and count of the sampled fluxes, one fixed key per val file
+        if not self.eval_integrals:
+            return {}
+        out = {}
+        host = jax.device_get([e for _, _, e in fluxes])
+        for f in range(len(self.ds.files)):
+            vals = np.concatenate([np.asarray(e)[(fids == f) & (m > 0)]
+                                   for (fids, m, _), e in zip(fluxes, host)] or [np.zeros(0)])
+            vals = vals.astype(np.float64)
+            out[f"_flux_sum/{f}"] = float(vals.sum())
+            out[f"_flux_sq/{f}"] = float((vals**2).sum())
+            out[f"_flux_n/{f}"] = float(len(vals))
+        return out
 
-        return metrics, val_plots
+    def _flux_metrics(self, sums, plots, confidence_plot) -> dict:
+        fids = [f for f in range(len(self.ds.files)) if sums.get(f"_flux_n/{f}", 0) > 0]
+        if not fids:
+            return {}
+        n = np.asarray([sums[f"_flux_n/{f}"] for f in fids])
+        mean = np.asarray([sums[f"_flux_sum/{f}"] for f in fids]) / n
+        std = np.sqrt(np.maximum(np.asarray([sums[f"_flux_sq/{f}"] for f in fids]) / n - mean**2, 0))
+        tgt = np.asarray([self.ds.get_avg_flux(f) for f in fids])
+        names = [self.traj_ids[f] or str(f) for f in fids]
+        out = {
+            "avg_flux_rmse": float(np.sqrt(np.mean((mean - tgt) ** 2))),
+            "avg_flux_rel_err": float(np.mean(np.abs(mean - tgt) / np.maximum(np.abs(tgt), 1e-9))),
+        }
+        for t, pm, ps, gt in zip(names, mean, std, tgt):
+            out[f"avg_flux_pred/{t}"], out[f"avg_flux_std/{t}"] = float(pm), float(ps)
+            out[f"avg_flux_gt/{t}"] = float(gt)
+        if len(tgt) > 2:
+            var = float(np.var(mean))
+            out["avg_flux_corr"] = float(np.corrcoef(mean, tgt)[0, 1])
+            out["avg_flux_slope"] = float(np.cov(mean, tgt)[0, 1] / var) if var > 0 else float("nan")
+        if self.is_rank0:
+            plots["avg_flux_UQ"] = confidence_plot(mean, std, tgt, names)
+        return out
+
+    def _spectra(self, store, pred_d, tgt_d, fids, mask) -> None:
+        from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
+        if not accumulate_spectral_diagnostics(store, pred_d, tgt_d, fids, self.ds, valid=mask > 0):
+            if self.is_rank0:
+                print("[evaluate] eval_spectra requested but metadata has no 'ds'; skipping spectral metrics")
+            self.eval_spectra = False
