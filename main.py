@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import os
 import random
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -44,9 +43,6 @@ def dispatch_runner(cfg: DictConfig) -> None:
     elif base == "gyroswin":
         from neugk_jax.gyroswin import GyroSwinRunner
         GyroSwinRunner(cfg, output_path=cfg.output_path)()
-    elif base == "gyrosplat":
-        from neugk_jax.gyrosplats.runner import GyrosplatFMRunner
-        GyrosplatFMRunner(cfg, output_path=cfg.output_path)()
     elif base == "gyrowave":
         if workflow == "gyrowave_fixed":            # Approach A: fixed shared support S*
             from neugk_jax.gyrowave.runner_fixed import GyrowaveFixedSupportRunner

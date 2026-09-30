@@ -1,4 +1,4 @@
-"""gyrowave — wavelet/HL-moment diffusion for gyrokinetic fields (companion to gyrosplats).
+"""gyrowave — wavelet/HL-moment diffusion for gyrokinetic fields.
 
 compress/  : linear transform + physics solves + per-trajectory processor (HL velocity
              moments x (s,x) wavelet, flux-GN + phi-aware, token cache).
