@@ -8,8 +8,9 @@ import glob
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, "/system/user/publicwork/galletti/git/neural-gyrokinetics-gitlab")  # torch repo
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _ROOT)
+sys.path.append(os.environ.get("NEUGK_TORCH_REPO", os.path.dirname(_ROOT)))
 
 import jax.numpy as jnp
 import jax.random as jr

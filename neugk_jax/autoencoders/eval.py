@@ -119,7 +119,6 @@ class AEEvaluator(BaseEvaluator):
                     plot_drawn = True
 
         running, n_acc = self._sync(running, n_acc)
-        # rename to torch's canonical keys
         finalized = self._finalize(running, n_acc)
         # rename to canonical metric keys
         renamed = {

@@ -1,7 +1,6 @@
 """Progress-based loss-weight schedules + multi-task loss builder.
 
-Port of ``neugk/utils.py``'s scheduler helpers and of the upstream
-``LossWrapper`` training-mode terms used by GyroSwin: ``df``, ``phi``,
+Training-mode loss terms used by GyroSwin: ``df``, ``phi``,
 ``flux``/``fluxavg`` and the physics-integral losses ``phi_int``/``flux_int``.
 """
 
@@ -55,7 +54,7 @@ def _truthy(sched_cfg: Any, key: str) -> bool:
 
 
 class LossConfig:
-    """Resolved multi-task loss setup (upstream ``setup_common_losses`` + ``LossWrapper``).
+    """Resolved multi-task loss setup.
 
     ``weights`` merges ``loss_weights`` and ``extra_loss_weights``; ``active`` are
     the keys whose weight is positive or that carry a schedule (the static term
@@ -78,7 +77,7 @@ class LossConfig:
                             if self.weights[k] > 0.0 or k in self.schedulers)
         removed = [k for k in self.active if k in REMOVED_LOSSES]
         if removed:
-            raise ValueError(f"cross losses {removed} were removed upstream; set their weight to 0")
+            raise ValueError(f"cross losses {removed} are not supported; set their weight to 0")
         self.outputs = tuple(k for k in lw if lw[k] > 0.0 or _truthy(loss_scheduler, k))
         if len([k for k in self.outputs if k.startswith("flux")]) > 1:
             raise ValueError("cannot predict both flux and fluxavg")
@@ -101,7 +100,7 @@ def compute_multi_task_loss(
     extra: Optional[Mapping[str, jnp.ndarray]] = None,
     separate_zf_loss: bool = False,
 ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-    """Weighted sum over the static ``active`` terms (upstream ``LossWrapper`` training mode).
+    """Weighted sum over the static ``active`` terms.
 
     ``df``/``phi`` use relative-norm MSE (``df`` optionally with the zonal-flow
     MSE split), ``flux``/``fluxavg`` L1; ``extra`` carries precomputed terms such
@@ -124,7 +123,7 @@ def compute_multi_task_loss(
 
 
 def build_scheduler_dict(loss_scheduler_cfg: Any) -> dict[str, Callable[[float], float]]:
-    """Translate the upstream ``loss_scheduler`` config into a name → fn dict.
+    """Translate the ``loss_scheduler`` config into a name → fn dict.
 
     Skips keys whose value is ``None`` / ``{}`` (i.e. constant weight).
     """

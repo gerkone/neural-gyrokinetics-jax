@@ -36,7 +36,7 @@ def _f32(x):
 
 
 class _StatsUnpickler(pickle.Unpickler):
-    """Unpickles stats without importing the torch package."""
+    """Unpickles stats pickles that reference ``neugk.*.RunningMeanStd``."""
 
     def find_class(self, module, name):
         # the jax twin carries the same buffers and pickle restores __dict__ directly

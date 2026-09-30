@@ -25,7 +25,7 @@ import jax.random as jr
 
 
 def gelu(x):
-    # approximate=False matches torch.nn.GELU()'s default (jax defaults to approximate=True)
+    # exact erf gelu; jax defaults to the tanh approximation
     return jax.nn.gelu(x, approximate=False)
 
 

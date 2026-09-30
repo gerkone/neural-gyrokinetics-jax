@@ -1,5 +1,4 @@
-"""Loss functions. AE/diffusion training uses relative-norm MSE on df,
-mirroring upstream ``neugk/losses.py:relative_norm_mse``."""
+"""Loss functions: relative-norm MSE, L1 and the physics-integral losses."""
 
 from __future__ import annotations
 
@@ -16,8 +15,7 @@ def mse_df(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
 def relative_norm_mse(pred: jnp.ndarray, target: jnp.ndarray, eps: float = 1e-4) -> jnp.ndarray:
     """``mean_b ||pred - target||² / (||target||² + eps)``.
 
-    Mirrors ``neugk/losses.py:relative_norm_mse`` (squared variant). Batch
-    axis 0 is preserved as the reduction axis; everything else flattened.
+    Batch axis 0 is preserved as the reduction axis; everything else flattened.
     Lands in the 1-10 range when target is z-scored unit-variance.
     """
     assert pred.shape == target.shape, f"shape mismatch {pred.shape} != {target.shape}"
@@ -30,10 +28,9 @@ def relative_norm_mse(pred: jnp.ndarray, target: jnp.ndarray, eps: float = 1e-4)
 
 
 def df_loss(pred: jnp.ndarray, target: jnp.ndarray, *, separate_zf: bool = False) -> jnp.ndarray:
-    """Upstream ``df`` loss: plain MSE on zf slot + relative-norm MSE elsewhere.
+    """``df`` loss: plain MSE on the zf slot + relative-norm MSE elsewhere.
 
-    Matches ``neugk/losses.py:LossWrapper.forward`` lines 178-185 when
-    ``separate_zf=True``. Channel slots 0:2 are the zf split, 2: are the
+    With ``separate_zf=True`` channel slots 0:2 are the zf split and 2: the
     other components. Without separate_zf falls back to relative-norm MSE.
     """
     if separate_zf and pred.shape[1] >= 4:
@@ -61,7 +58,7 @@ def integral_losses(
     *,
     real_potens: bool = True,
 ) -> dict[str, jnp.ndarray]:
-    """Physics-integral losses on denormalized batches, as upstream ``LossWrapper.integral_loss``.
+    """Physics-integral losses on denormalized batches.
 
     ``pred_df`` is ``(B, C, vp, mu, s, x, y)`` (a separate-zf ``C=4`` layout is
     recombined), ``geom_t`` a batched :func:`precompute_geometry` dict. Returns

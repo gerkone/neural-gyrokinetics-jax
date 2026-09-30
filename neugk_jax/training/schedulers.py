@@ -1,6 +1,6 @@
 """Optax learning-rate schedules used by the training runners.
 
-Matches ``BaseRunner.setup_scheduler`` from the upstream torch repo:
+Warmup + cosine:
 
 * warmup steps = ``total_steps // 6`` for long runs (``n_epochs > 150``)
   or ``max(total_steps // 10, 10 * steps_per_epoch)`` otherwise

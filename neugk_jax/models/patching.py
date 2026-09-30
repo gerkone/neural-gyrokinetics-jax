@@ -219,8 +219,7 @@ class PatchMerge(eqx.Module):
 class StridedConvTranspose(eqx.Module):
     """ConvTranspose with stride == kernel (non-overlapping) == the patch-expand op.
 
-    Stores the weight in **torch ConvTranspose layout** ``(in, out, *kernel)`` so the
-    checkpoint loads with a direct copy. Output channel placement matches torch:
+    The weight is laid out ``(in, out, *kernel)``; output placement is
     ``out[*(g_i*k_i), oc] = sum_ic x[*g, ic] * W[ic, oc, *k]`` (kernel block per grid
     cell), implemented as einsum + interleave-reshape (same layout as ``unfold_patches``).
     """
@@ -321,7 +320,7 @@ class PatchExpand(eqx.Module):
         self.use_conv = use_conv
         kexp, kpc, kmod = jr.split(key, 3)
         if use_conv:
-            # stride==kernel ConvTranspose, torch layout (in, out, *kernel) -> direct copy
+            # stride==kernel ConvTranspose, weight (in, out, *kernel)
             self.expansion = StridedConvTranspose(dim, self.out_dim, eb, key=kexp)
         else:
             # hidden = prod(expand_by) * mlp_ratio, not dim * mlp_ratio

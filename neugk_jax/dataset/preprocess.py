@@ -3,8 +3,7 @@
 Thin entrypoint with mode dispatch. Takes an existing fp32 ``.bin`` shard
 and produces side-by-side quantized siblings (``.bf16.bin``, ``.fp16.bin``,
 ``.i8.bin``, ``.i4.bin``) used by the dataloader's ``prefer_dtype="…"``
-fallback path. The raw GKW → fp32 preprocessing path stays in
-``neugk/dataset/preprocess.py``.
+fallback path. Raw GKW → fp32 preprocessing is not part of this package.
 
 Layout per file::
 
@@ -259,9 +258,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         "--mode",
         choices=("quantize",),
         default="quantize",
-        help="Currently only ``quantize`` is implemented. The full GKW raw → "
-             "fp32 preprocessing path stays on the torch side for now "
-             "(``neugk/dataset/preprocess.py``).",
+        help="Only ``quantize`` is implemented.",
     )
     ap.add_argument("--path", default="/local00/bioinf/galletti/preprocessed_kvikio")
     ap.add_argument(

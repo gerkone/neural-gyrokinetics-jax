@@ -243,9 +243,10 @@ class NumpyBackend(DataBackend):
         # fill in missing geometry scalars with safe defaults
         if "geometry" in meta:
             g = meta["geometry"]
-            for k in ("adiabatic", "de", "beta", "nlapar", "nlbpar"):
+            # missing species/field flags default to electrostatic with adiabatic electrons
+            for k, v in (("adiabatic", 1.0), ("de", 1.0), ("beta", 0.0), ("nlapar", 0.0), ("nlbpar", 0.0)):
                 if k not in g:
-                    g[k] = np.array(1.0, dtype=np.float64)
+                    g[k] = np.array(v, dtype=np.float64)
             # gyaradax needs ffun (flux-surface function); stub with ones for cyclone s-α at ε→0
             if "ffun" not in g and "ints" in g:
                 g["ffun"] = np.ones_like(np.asarray(g["ints"]), dtype=np.float64)

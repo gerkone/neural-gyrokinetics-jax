@@ -1,21 +1,6 @@
-"""Parity / round-trip tests for the AE checkpoint pipeline.
-
-Two layers of testing:
-
-1. **JAX → disk → JAX round trip.** Build an AE, save with our Orbax wrapper
-   (in this milestone, a pickle bundle of the model leaves), reload and
-   verify the model produces identical outputs on a fixed input.
-
-2. **Torch → JAX translation** (skipped by default — runs only when a
-   ``NEUGK_TORCH_CKPT`` env var points at a real ``.pth``). This is the
-   real M2 acceptance test; it fails today because of the divergences
-   listed in ``PARITY.md`` (post-norm, RPB, …). The test code is written
-   so that once those are reconciled the assertion will start passing.
-"""
+"""JAX checkpoint round trips: model-only and full training state."""
 
 from __future__ import annotations
-
-import os
 
 import jax
 import jax.numpy as jnp
@@ -82,40 +67,3 @@ def test_full_checkpoint_roundtrip(tmp_path):
     assert loaded.loss == pytest.approx(0.123)
     out_after = jax.vmap(lambda xi: loaded.model(xi)["df"])(x)
     assert jnp.allclose(out_before, out_after, atol=1e-6)
-
-
-
-
-@pytest.mark.skipif(
-    not os.environ.get("NEUGK_TORCH_CKPT"),
-    reason="set NEUGK_TORCH_CKPT and NEUGK_TORCH_CONFIG to run torch→jax parity",
-)
-def test_torch_to_jax_translation(tmp_path):
-    """M2 acceptance test — currently expected to fail until M1 divergences land.
-
-    See ``PARITY.md`` for the list of architectural mismatches that prevent
-    bit-exact translation right now (post-norm vs pre-norm, RPB, …).
-    """
-    from scripts.translate_ckpt import (
-        build_ae_from_config,
-        load_torch_state,
-        translate,
-    )
-
-    torch_ckpt = os.environ["NEUGK_TORCH_CKPT"]
-    cfg_path = os.environ["NEUGK_TORCH_CONFIG"]
-
-    torch_state = load_torch_state(torch_ckpt)
-    model = build_ae_from_config(cfg_path, key=jr.PRNGKey(0))
-    translated, missing, unused = translate(model, torch_state, strict=False)
-
-    # structural check: most leaves should match by name; numerical equivalence not yet asserted
-    total = sum(1 for _ in iter_leaves_compat(model))
-    matched = total - len(missing)
-    print(f"translated {matched}/{total} leaves; unused torch keys: {len(unused)}")
-    assert matched / total > 0.5, "fewer than half of jax leaves found a torch counterpart"
-
-
-def iter_leaves_compat(tree):
-    from scripts.translate_ckpt import iter_leaves
-    yield from iter_leaves(tree)

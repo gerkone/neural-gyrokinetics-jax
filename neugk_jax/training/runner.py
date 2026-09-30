@@ -2,7 +2,7 @@
 
 Owns the boilerplate (epoch loop, checkpoint resume, eval cadence, logging
 hand-off) so the workflow-specific runners only define ``setup_components``,
-``train_step`` and ``evaluate``. Mirrors the upstream ``BaseRunner``.
+``train_step`` and ``evaluate``.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def weight_decay_mask(params, exclude):
 
 
 def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999):
-    """Clip + Adam chain; ``decoupled`` picks torch AdamW over Adam's coupled L2 decay."""
+    """Clip + Adam chain; ``decoupled`` selects AdamW, else Adam with coupled L2 decay."""
     wd = tcfg.get("weight_decay", 0.0)
     params = eqx.filter(model, trainable_mask(model))
     mask = weight_decay_mask(params, tcfg.get("exclude_from_wd", []))
@@ -51,7 +51,7 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
         return optax.chain(clip, optax.adam(schedule, b2=b2))
     if decoupled:
         return optax.chain(clip, optax.adamw(schedule, b2=b2, weight_decay=wd, mask=mask))
-    # torch Adam adds wd * p to the gradient before the moment estimates
+    # coupled l2: wd * p is added to the gradient before the moment estimates
     return optax.chain(clip, optax.add_decayed_weights(wd, mask=mask),
                        optax.scale_by_adam(b2=b2), optax.scale_by_learning_rate(schedule))
 

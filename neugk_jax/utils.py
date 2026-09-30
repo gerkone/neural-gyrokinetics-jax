@@ -17,7 +17,7 @@ def set_seed(seed: int) -> None:
 
 
 def separate_zf(x, axis: int = 0):
-    """Separate Zonal Flow (ZF) and non-ZF components — matches upstream.
+    """Separate Zonal Flow (ZF) and non-ZF components.
 
     Layout: ``[zf, x - zf]`` along ``axis``. ZF is the **mean** over the
     last axis (ky), broadcast back; the "rest" is ``x - zf`` (so the

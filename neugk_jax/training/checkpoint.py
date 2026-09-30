@@ -1,9 +1,7 @@
-"""Orbax-backed checkpointing for equinox models + opt state + metadata.
+"""Checkpointing for equinox models + opt state + metadata.
 
-Mirrors the torch convention of one checkpoint dict per training run with
-keys ``{model, opt_state, scheduler_state, epoch, loss}``. ``best.pth`` and
-``ckp.pth`` become two named items inside the same ``CheckpointManager`` —
-Orbax handles atomicity, async writes and step-history pruning for us.
+One pickle per snapshot (``ckp.eqx`` rolling, ``best.eqx`` best validation) holding
+the model array leaves, opt state, epoch, loss and a ``meta`` dict; writes are atomic.
 """
 
 from __future__ import annotations
@@ -87,7 +85,7 @@ def load_checkpoint(path: str | os.PathLike, model_template) -> CheckpointState:
 
 
 def save_model_only(path: str | os.PathLike, model) -> None:
-    """Fast path: write just the model leaves (used by the torch translator)."""
+    """Write just the model leaves (e.g. a translated checkpoint)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     leaves = _to_numpy_tree(eqx.filter(model, eqx.is_array))

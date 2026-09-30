@@ -1,4 +1,4 @@
-"""Latent cache naming matches torch and is independent of how the AE checkpoint is given."""
+"""Latent cache naming, independent of how the AE checkpoint is given."""
 
 from __future__ import annotations
 

@@ -6,7 +6,7 @@ keys). Goal: gyroswin -> 0 missing / only-intentional unused; AE/DiT stay at
 their known-good baseline (regression guard while editing the shared U-Net).
 
 Usage:
-  python scripts/check_ckpt_parity.py [ae|diff|tiny|cold|warm|all]
+  python scripts/parity/check_ckpt_parity.py [ae|diff|tiny|cold|warm|all]
 """
 import argparse
 import os
@@ -15,7 +15,9 @@ import tempfile
 
 import yaml
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _ROOT)
+sys.path.append(os.environ.get("NEUGK_TORCH_REPO", os.path.dirname(_ROOT)))
 
 import equinox as eqx
 import jax

@@ -1,11 +1,9 @@
 """Hydra entry point for the JAX/Equinox port.
 
-Mirrors the upstream torch ``main.py`` dispatch pattern: read the
-Hydra config, build an output directory, log the resolved config, and
-hand off to the workflow-appropriate runner. JAX's distributed setup
-piggybacks on the same SLURM / torchrun env vars (see
-``neugk_jax.training.ddp.init_distributed``), so there's no separate
-launcher tier to thread through.
+Reads the Hydra config, builds (or, with ``load_ckpt``, reuses) the output
+directory, saves the resolved config and hands off to the workflow runner.
+Distributed setup reads SLURM / torchrun env vars
+(``neugk_jax.training.ddp.init_distributed``).
 
 Usage::
 
@@ -27,10 +25,10 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 
 def dispatch_runner(cfg: DictConfig) -> None:
-    """Workflow → runner dispatch. Matches ``neugk.main.dispatch_runner``."""
+    """Workflow → runner dispatch."""
     workflow = cfg.get("workflow", "ae")
     base = workflow.split("_")[0] if "_" in workflow else workflow
-    if base in ("ae", "pinc"):  # accept the upstream label too
+    if base in ("ae", "pinc"):
         from neugk_jax.autoencoders.runner import AERunner
         AERunner(cfg, output_path=cfg.output_path)()
     elif base == "diffusion":

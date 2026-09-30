@@ -30,7 +30,7 @@ def _tqdm(*args, **kwargs):
 
 def latent_cache_path(dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False,
                       timestep_std_filter=None) -> Path:
-    """Torch-compatible cache file for a split's latents (``CycloneAEDataset.precompute_latents``).
+    """Cache file for a split's latents.
 
     ``<path>/diff_<split>_latents_offset<o>[_mu][_std<f>]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
     where ``<run>`` is the last ``_`` field of the AE run directory (a checkpoint file resolves
@@ -68,7 +68,7 @@ def precompute_latents(
     """Encode the dataset through ``encode_fn`` into ``cache_file`` (or load it if present).
 
     ``encode_fn(df_batch, cond_batch) -> latent_batch`` maps ``(B, C, *resolution)`` to
-    ``(B, *latent_grid, latent_channels)``. Entries follow the torch schema:
+    ``(B, *latent_grid, latent_channels)``. Entries:
     ``{(fid, t_idx): {"x", "phi", "flux", "timestep", <one raw scalar per condition>}}``.
     Process 0 encodes and writes atomically; the others wait and load. The dataset is
     switched to ``mode="diff"`` with ``precomputed_latents`` populated.

@@ -35,7 +35,7 @@ def main():
     p.add_argument("--config", default="configs/model/gyroswin/gyroswin_large_pretraining.yaml",
                    help="path to a gyroswin model config (under upstream torch repo)")
     p.add_argument("--out", default="/tmp/gyroswin_random.pth")
-    p.add_argument("--torch-repo", default="/system/user/publicwork/galletti/git/neural-gyrokinetics-gitlab",
+    p.add_argument("--torch-repo", default=os.environ.get("NEUGK_TORCH_REPO", os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
                    help="root of the upstream torch repo (for ``neugk.*`` imports)")
     args = p.parse_args()
 

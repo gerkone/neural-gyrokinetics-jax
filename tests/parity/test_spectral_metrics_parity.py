@@ -5,13 +5,12 @@ Compares ``neugk_jax.evaluate.metrics`` (gyaradax-backed) against
 Runs only when ``NEUGK_CYCLONE_PATH`` points at real data::
 
     NEUGK_CYCLONE_PATH=/local00/bioinf/galletti/preprocessed_kvikio \
-        python -m pytest tests/test_spectral_metrics_parity.py -x -q -s
+        python -m pytest tests/parity/test_spectral_metrics_parity.py -x -q -s
 """
 
 from __future__ import annotations
 
 import os
-import sys
 
 import numpy as np
 import pytest
@@ -21,8 +20,6 @@ pytestmark = pytest.mark.skipif(
     reason="set NEUGK_CYCLONE_PATH to run spectral-metrics parity (needs real data)",
 )
 
-# upstream torch repo (parent of this jax port)
-TORCH_REPO = "/system/user/publicwork/galletti/git/neural-gyrokinetics-gitlab"
 N_STEPS = 4
 SEED = 0
 
@@ -51,7 +48,6 @@ def snapshots():
 
 def _torch_side(gt, pred, geom, ds_val):
     """Per-snapshot diagnostics + time-averaged metrics via the torch stack."""
-    sys.path.insert(0, TORCH_REPO)
     import torch
     from neugk.pinc.eval import metrics as tmetrics
     torch.set_num_threads(8)
@@ -92,7 +88,7 @@ def test_spectral_metrics_parity(snapshots):
         if k in tam:
             print(f"{k:>16}: torch={tam[k]: .8e}  jax={jam[k]: .8e}  rel={_rel(jam[k], tam[k]):.2e}")
 
-    # jax replicates torch's zonal-correction quirk (kx index 0 special-cased on the ky=0 column, see integrals._torch_zonal_quirk)
+    # jax replicates torch's zonal-correction quirk (kx index 0 special-cased on the ky=0 column, see integrals._zonal_correction)
     for k in ("zfphi_rl2", "zfflow_rl2", "zfshear_rl2", "zf_energy_err"):
         assert _rel(jam[k], tam[k]) < 1e-4, (
             f"{k}: torch={tam[k]} jax={jam[k]} rel={_rel(jam[k], tam[k]):.3e}"

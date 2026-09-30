@@ -1,11 +1,4 @@
-"""Dataset shape + behaviour tests against a synthetic KvikIO-style directory.
-
-We don't need real cyclone preprocessed data to test the loader plumbing:
-a temp directory with a hand-built ``metadata.pkl`` and a few
-``timestep_NNNNN.bin`` files exercises every code path. A separate parity
-test against the actual upstream torch loader runs only when
-``NEUGK_CYCLONE_PATH`` points at real data.
-"""
+"""Dataset shape and behaviour tests on a synthetic kvikio-style directory."""
 
 from __future__ import annotations
 
@@ -169,8 +162,6 @@ def test_get_batch_geometry(synthetic_dir):
         assert v.shape[0] == 3, f"{k} not batched"
 
 
-
-
 def _assert_meta_equal(a: dict, b: dict):
     assert set(a) == set(b)
     for k in a:
@@ -198,8 +189,11 @@ def test_npz_metadata_matches_pkl(tmp_path):
 
     _assert_meta_equal(meta_pkl, meta_npz)
     # geometry defaults filled on both routes
-    for k in ("adiabatic", "de", "beta", "nlapar", "nlbpar", "ffun"):
-        assert k in meta_npz["geometry"]
+    g = meta_npz["geometry"]
+    assert "ffun" in g
+    # missing flags default to electrostatic with adiabatic electrons
+    assert {k: float(g[k]) for k in ("adiabatic", "de", "beta", "nlapar", "nlbpar")} == {
+        "adiabatic": 1.0, "de": 1.0, "beta": 0.0, "nlapar": 0.0, "nlbpar": 0.0}
     # resolution special-cased back to a tuple of ints
     assert tuple(meta_npz["resolution"]) == res
 
@@ -255,82 +249,3 @@ def test_missing_cond_filter_field_excludes_trajectory(tmp_path):
     # iteration_002 lacks the filter field -> excluded rather than crash
     assert len(ds.files) == 1
     assert "iteration_001" in ds.files[0]
-
-
-@pytest.mark.skipif(
-    not os.environ.get("NEUGK_CYCLONE_PATH"),
-    reason="set NEUGK_CYCLONE_PATH to run torch-loader parity (needs real data)",
-)
-@pytest.mark.parametrize("separate_zf", [False, True])
-def test_byte_equal_to_torch_loader(separate_zf):
-    """Compare ``df`` bytes against the upstream torch ``CycloneAEDataset``.
-
-    Parameterised over ``separate_zf`` so we catch divergences in either
-    the raw read path or the channel-axis pre-processing.
-
-    Required env vars::
-        NEUGK_CYCLONE_PATH=/local00/bioinf/galletti/preprocessed_kvikio
-        NEUGK_CYCLONE_TRAJS=iteration_{0-1}
-    """
-    import sys
-    sys.path.insert(0, "/system/user/publicwork/galletti/git/neural-gyrokinetics-gitlab")
-    from neugk.dataset.backend import KvikIOBackend as TorchKvikIO
-    from neugk.dataset.cyclone_diff import CycloneAEDataset as TorchAE
-
-    path = os.environ["NEUGK_CYCLONE_PATH"]
-    trajectories = os.environ.get("NEUGK_CYCLONE_TRAJS", "iteration_{0-1}")
-
-    t_ds = TorchAE(
-        backend=TorchKvikIO(rank=0, use_kvikio=False),
-        path=path, split="train",
-        trajectories=trajectories,
-        partial_holdouts={},
-        fields_to_load=["df"],
-        probe_targets=[],
-        # upstream get_dataset sorts before constructing; the jax dataset sorts internally
-        conditions=sorted(["itg", "dg", "s_hat", "q"]),
-        normalization=None,
-        offset=0,
-        bundle_seq_length=1,
-        spatial_ifft=True,
-        real_potens=True,
-        separate_zf=separate_zf,
-    )
-    j_ds = CycloneDataset(
-        path=path, split="train",
-        trajectories=trajectories,
-        fields_to_load=("df",),
-        conditions=("itg", "dg", "s_hat", "q"),
-        mode="ae",
-        backend=NumpyBackend(),
-        separate_zf=separate_zf,
-    )
-    assert len(t_ds) == len(j_ds), f"lengths differ: torch={len(t_ds)} jax={len(j_ds)}"
-    # match by (file basename, timestep) — ordering differs between stacks (torch: set, jax: sorted)
-    t_lookup = {
-        (os.path.basename(t_ds.files[fid]), int(t_idx)): flat
-        for flat, (fid, t_idx) in t_ds.flat_index_to_file_and_tstep.items()
-    }
-    for i in (0, 1, len(j_ds) // 2, len(j_ds) - 1):
-        j_fid, j_t = j_ds.flat_index_to_file_and_tstep[i]
-        key = (os.path.basename(j_ds.files[j_fid]), int(j_t))
-        ti = t_lookup[key]
-        ts = t_ds[ti]
-        js = j_ds[i]
-        t_df = np.asarray(ts.df)
-        j_df = np.asarray(js.df)
-        assert t_df.shape == j_df.shape, (
-            f"shape mismatch at jax-idx {i} (separate_zf={separate_zf}): "
-            f"torch={t_df.shape} jax={j_df.shape}"
-        )
-        # post-separate_zf path subtracts a mean ⇒ tiny rounding allowed
-        atol = 1e-6 if separate_zf else 0.0
-        diff = np.abs(t_df - j_df).max()
-        assert diff <= atol, (
-            f"df differs at jax-idx {i} key={key} "
-            f"(separate_zf={separate_zf}), max|diff|={diff}"
-        )
-        t_cond = np.asarray(ts.conditioning) if ts.conditioning is not None else None
-        j_cond = np.asarray(js.conditioning)
-        if t_cond is not None:
-            assert np.array_equal(t_cond, j_cond), f"conditioning differs at {key}"

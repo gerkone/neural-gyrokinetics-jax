@@ -188,15 +188,16 @@ def _gyaradax_spectral_one(df_one, geom):
     spec = jnp.fft.ifftshift(spec, axes=-2)
     gt = geom_tensors(geom)
     phi = _phi_adiabatic(gt, spec)  # (s, kx, ky) complex
-    phi = _torch_zonal_quirk(gt, geom, spec, phi)
+    phi = _zonal_correction(gt, geom, spec, phi)
     _pflux, eflux, _vflux = calculate_fluxes(gt, spec, phi, reduce=False)
     return phi, eflux
 
 
-def _torch_zonal_quirk(gt, geom, spec, phi):
-    """Special-case the zonal (kx_idx=0, ky_idx=0) phi mode to match the
-    torch zonal-profile convention; fluxes are unaffected (eflux ∝ krho = 0
-    on the zonal column). Reduces to ``phi = phi_raw + Σ_s matz·phi_raw``.
+def _zonal_correction(gt, geom, spec, phi):
+    """Zonal (kx_idx=0, ky_idx=0) phi mode with the zonal-profile correction.
+
+    Fluxes are unaffected (eflux ∝ krho = 0 on the zonal column). Reduces to
+    ``phi = phi_raw + Σ_s matz·phi_raw``.
     """
     de, signz, tmp = gt["de"], gt["signz"], gt["tmp"]
     intvp, intmu, bn = gt["intvp"], gt["intmu"], gt["bn"]
@@ -260,64 +261,6 @@ def _same_traj(geom: dict, batch_size: int) -> bool:
     if arr.ndim == 0 or arr.shape[0] != batch_size:
         return False
     return bool(np.all(arr == arr[0:1]))
-
-
-def torch_flux_integrals(
-    df_batch,
-    geometry_batch: dict,
-):
-    """Compute ``(phi, eflux)`` by delegating to torch ``FluxIntegral``.
-
-    Prefers CUDA, falls back to CPU with a capped thread count. The
-    integrator is built once and cached. Returns ``(phi_np, eflux_np)``
-    as host numpy arrays.
-    """
-    import numpy as _np
-    import torch
-    from neugk.integrals import FluxIntegral
-    from neugk.utils import recombine_zf
-
-    device = torch_flux_integrals._device
-    if device is None:
-        # cpu fallback with a capped thread count; override via TORCH_FLUX_DEVICE
-        import os
-        override = os.environ.get("TORCH_FLUX_DEVICE")
-        if override:
-            device = torch.device(override)
-        else:
-            device = torch.device("cpu")
-        if device.type == "cpu":
-            torch.set_num_threads(int(os.environ.get("TORCH_FLUX_THREADS", "16")))
-            try:
-                torch.set_num_interop_threads(2)
-            except RuntimeError:
-                pass
-        torch_flux_integrals._device = device
-
-    integrator = torch_flux_integrals._integrator
-    if integrator is None:
-        integrator = FluxIntegral(
-            real_potens=True, spectral_potens=False, flux_fields=False,
-            spectral_df=False, integral_precision="float64",
-        ).to(device)
-        torch_flux_integrals._integrator = integrator
-
-    df_t = torch.as_tensor(_np.array(df_batch), device=device)
-    if df_t.dim() == 7:
-        df_t = recombine_zf(df_t, dim=1)  # (B, 2, vp, mu, s, x, y)
-    df_t = df_t.unsqueeze(1).double()  # (B, sp=1, 2, vp, mu, s, x, y)
-
-    geom_t = {
-        k: torch.as_tensor(_np.array(v), device=device).double()
-        for k, v in geometry_batch.items()
-    }
-    with torch.no_grad():
-        phi, (_pflux, eflux, _vflux) = integrator(geom_t, df_t)
-    return _np.asarray(phi.float().cpu()), _np.asarray(eflux.squeeze(-1).float().cpu())
-
-
-torch_flux_integrals._integrator = None  # type: ignore[attr-defined]
-torch_flux_integrals._device = None  # type: ignore[attr-defined]
 
 
 _SCALAR_DEFAULTS = {
@@ -437,7 +380,7 @@ def _pev_fluxes(g: dict, spec, phi, apar, bpar):
 
 def flux_integral(geom_t: dict, df: jnp.ndarray, phi: Optional[jnp.ndarray] = None,
                   *, real_potens: bool = True):
-    """Jittable single-sample port of torch ``FluxIntegral`` (spatial df, real-space phi out).
+    """Jittable single-sample fields and fluxes from a spatial df (real-space phi out).
 
     ``geom_t`` comes from :func:`precompute_geometry`; ``df`` is ``(2, vp, mu, s, x, y)``
     (real/imag, spatial x/y). Fields are solved from ``df``; an external ``phi``

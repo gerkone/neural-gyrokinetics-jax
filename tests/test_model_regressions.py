@@ -1,4 +1,4 @@
-"""Regression guards for torch-parity port bugs."""
+"""Regression guards: legacy residual flag, rms_norm forwarding, weight-decay masking."""
 
 from __future__ import annotations
 

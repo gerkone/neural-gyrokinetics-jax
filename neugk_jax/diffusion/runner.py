@@ -64,7 +64,7 @@ class FlowMatchingRunner(BaseRunner):
         from neugk_jax.translate import build_ae_from_config, load_or_translate
         ae_file = resolve_ae_checkpoint(ae_path)
         ae_template = build_ae_from_config(str(ae_file.parent / "config.yaml"), key=jr.PRNGKey(0))
-        # .eqx loads directly; a torch .pth is translated on the fly
+        # .eqx loads directly; a .pth is translated on the fly
         self.ae = load_or_translate(ae_template, str(ae_file))
 
         backend = (
