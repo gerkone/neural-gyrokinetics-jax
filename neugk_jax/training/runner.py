@@ -94,13 +94,10 @@ class BaseRunner(ABC):
     @staticmethod
     def _omegaconf_to_dict(node):
         """OmegaConf node → plain python containers (dataset code indexes them directly)."""
+        from omegaconf import OmegaConf
         if node is None:
             return None
-        try:
-            from omegaconf import OmegaConf
-            return OmegaConf.to_container(node, resolve=True)
-        except Exception:
-            return dict(node)
+        return OmegaConf.to_container(node, resolve=True) if OmegaConf.is_config(node) else dict(node)
 
     @abstractmethod
     def setup_data(self) -> None: ...
@@ -149,12 +146,7 @@ class BaseRunner(ABC):
 
     def _current_lr(self, step: int) -> float | None:
         sched = getattr(self, "schedule", None)
-        if sched is None:
-            return None
-        try:
-            return float(sched(step))
-        except Exception:
-            return None
+        return None if sched is None else float(sched(step))
 
     def __call__(self) -> None:
         base_key = jax.random.PRNGKey(getattr(self.cfg, "seed", 0))

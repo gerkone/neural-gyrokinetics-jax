@@ -31,7 +31,26 @@ _PARAM_KEYS = ("adiabatic", "beta", "nlapar", "nlbpar")
 
 
 
+REQUIRED_GEOMETRY = ("krho", "kxrh", "ints", "intmu", "intvp", "vpgr", "mugr", "bn",
+                     "efun", "rfun", "bt_frac", "little_g")
+
+
+def require_integrals(geometry: Optional[dict]) -> None:
+    """Raise unless flux integrals can run: gyaradax importable and geometry complete."""
+    import importlib.util
+    if importlib.util.find_spec("gyaradax") is None:
+        raise ImportError("eval_integrals needs gyaradax (pip install -e '.[gyro]')")
+    if geometry is None:
+        raise ValueError("eval_integrals needs trajectory geometry in the metadata")
+    missing = [k for k in REQUIRED_GEOMETRY if k not in geometry]
+    if missing:
+        raise KeyError(f"geometry is missing {missing} required by the flux integrals")
+
+
 def _import_gyaradax():
+    import importlib.util
+    if importlib.util.find_spec("gyaradax") is None:
+        raise ImportError("flux integrals need gyaradax (pip install -e '.[gyro]')")
     prev = jax.config.jax_enable_x64
     import gyaradax.integrals  # noqa: F401
     jax.config.update("jax_enable_x64", prev)
@@ -110,10 +129,11 @@ def gyaradax_flux_integrals(
     Overrides ``parseval`` with the Hermitian-symmetry factor
     ``where(|krho|<1e-12, 1, 2)``.
     """
+    require_integrals(geometry_one)
     df_batch = jnp.asarray(df_batch)
     B = df_batch.shape[0]
-    # recombine_zf: (B, 4, ...) → (B, 2, ...) → complex (B, vp, mu, s, x, y)
-    df_rec = df_batch[:, :2] + df_batch[:, 2:]
+    # separate-zf (B, 4, ...) recombines to (B, 2, ...); a plain 2-channel df passes through
+    df_rec = df_batch[:, :2] + df_batch[:, 2:] if df_batch.shape[1] == 4 else df_batch
     df_cplx = (df_rec[:, 0] + 1j * df_rec[:, 1]).astype(jnp.complex128)
 
     geom = {k: jnp.asarray(v) for k, v in geometry_one.items()}
@@ -163,6 +183,7 @@ def gyaradax_spectral_fields(
 
     Applies the same ``parseval`` override as ``gyaradax_flux_integrals``.
     """
+    require_integrals(geometry_one)
     df_batch = jnp.asarray(df_batch)
     # recombine_zf only applies to the separate-zf channel-of-4 layout
     df_rec = df_batch[:, :2] + df_batch[:, 2:] if df_batch.shape[1] == 4 else df_batch

@@ -115,15 +115,12 @@ class GyroSwinEvaluator(BaseEvaluator):
 
                 if not plot_drawn and self.is_rank0 and t == 0:
                     plot_drawn = True
-                    try:
-                        from neugk_jax.evaluate.plots import generate_val_plots
-                        roll = {k: pred_d[k][0] for k in ("df", "phi") if k in pred_d}
-                        gt = {k: tgt_d[k][0] for k in ("df", "phi") if k in tgt_d}
-                        val_plots.update(generate_val_plots(
-                            rollout=roll, gt=gt, phase="random draw",
-                            ts=np.asarray(samples[live[0]].timestep).reshape(-1)))
-                    except Exception as e:
-                        print(f"[gyroswin eval] plot skipped: {e}")
+                    from neugk_jax.evaluate.plots import generate_val_plots
+                    roll = {k: pred_d[k][0] for k in ("df", "phi") if k in pred_d}
+                    gt = {k: tgt_d[k][0] for k in ("df", "phi") if k in tgt_d}
+                    val_plots.update(generate_val_plots(
+                        rollout=roll, gt=gt, phase="random draw",
+                        ts=np.asarray(samples[live[0]].timestep).reshape(-1)))
                 x = preds["df"]
 
         running, _ = self._sync(running, 0.0)

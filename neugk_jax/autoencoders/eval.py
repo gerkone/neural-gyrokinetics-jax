@@ -71,52 +71,43 @@ class AEEvaluator(BaseEvaluator):
             running, n_acc = self._accumulate(running, metrics, n_acc, n_new=batch_size)
 
             if eval_spectra and hasattr(ds, "get_batch_geometry"):
-                try:
-                    from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-                    # spectra are physical quantities — denormalize pred/tgt first
-                    if getattr(ds, "normalization", None) is not None:
-                        pred_d = np.stack([
-                            np.asarray(ds.denormalize(int(fid[b]), df=np.asarray(pred[b])))
-                            for b in range(batch_size)
-                        ])
-                        tgt_d = np.stack([
-                            np.asarray(ds.denormalize(int(fid[b]), df=np.asarray(df[b])))
-                            for b in range(batch_size)
-                        ])
-                    else:
-                        pred_d, tgt_d = np.asarray(pred), np.asarray(df)
-                    if not accumulate_spectral_diagnostics(spectra_store, pred_d, tgt_d, fid, ds):
-                        if self.is_rank0:
-                            print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
-                        eval_spectra = False
-                except Exception as e:
+                from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
+                # spectra are physical quantities — denormalize pred/tgt first
+                if getattr(ds, "normalization", None) is not None:
+                    pred_d = np.stack([
+                        np.asarray(ds.denormalize(int(fid[b]), df=np.asarray(pred[b])))
+                        for b in range(batch_size)
+                    ])
+                    tgt_d = np.stack([
+                        np.asarray(ds.denormalize(int(fid[b]), df=np.asarray(df[b])))
+                        for b in range(batch_size)
+                    ])
+                else:
+                    pred_d, tgt_d = np.asarray(pred), np.asarray(df)
+                if not accumulate_spectral_diagnostics(spectra_store, pred_d, tgt_d, fid, ds):
                     if self.is_rank0:
-                        print(f"[evaluate] spectral diagnostics failed: {e}")
+                        print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
                     eval_spectra = False
 
             # one cross-section panel per epoch (first eval batch only): df + integrated phi
             if not plot_drawn and self.is_rank0:
-                try:
-                    from neugk_jax.evaluate.plots import generate_val_plots
-                    b_idx = 0
-                    fid_i = int(samples[b_idx].file_index)
-                    pred_d = np.asarray(ds.denormalize(fid_i, df=np.asarray(pred[b_idx])))
-                    tgt_d = np.asarray(ds.denormalize(fid_i, df=np.asarray(df[b_idx])))
-                    rollout = {"df": pred_d}
-                    gt = {"df": tgt_d}
-                    if integrated is not None and integrated.get("phi") is not None:
-                        # phi is complex-valued; plot the magnitude so matplotlib can render it
-                        rollout["phi"] = np.abs(np.asarray(integrated["phi"])[b_idx])
-                        gt["phi"] = np.abs(np.asarray(integrated["phi_tgt"])[b_idx])
-                    panels = generate_val_plots(
-                        rollout=rollout, gt=gt, phase="random draw",
-                        ts=np.asarray(samples[b_idx].timestep).reshape(-1),
-                    )
-                    val_plots.update(panels)
-                except Exception as e:
-                    print(f"[evaluate] cross-section plot skipped: {e}")
-                finally:
-                    plot_drawn = True
+                from neugk_jax.evaluate.plots import generate_val_plots
+                b_idx = 0
+                fid_i = int(samples[b_idx].file_index)
+                pred_d = np.asarray(ds.denormalize(fid_i, df=np.asarray(pred[b_idx])))
+                tgt_d = np.asarray(ds.denormalize(fid_i, df=np.asarray(df[b_idx])))
+                rollout = {"df": pred_d}
+                gt = {"df": tgt_d}
+                if integrated is not None and integrated.get("phi") is not None:
+                    # phi is complex-valued; plot the magnitude so matplotlib can render it
+                    rollout["phi"] = np.abs(np.asarray(integrated["phi"])[b_idx])
+                    gt["phi"] = np.abs(np.asarray(integrated["phi_tgt"])[b_idx])
+                panels = generate_val_plots(
+                    rollout=rollout, gt=gt, phase="random draw",
+                    ts=np.asarray(samples[b_idx].timestep).reshape(-1),
+                )
+                val_plots.update(panels)
+                plot_drawn = True
 
         running, n_acc = self._sync(running, n_acc)
         finalized = self._finalize(running, n_acc)

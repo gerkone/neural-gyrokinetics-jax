@@ -123,58 +123,54 @@ class DiffusionEvaluator(BaseEvaluator):
 
                 # route through gyaradax; parseval corrected; denorm before integral
                 if eval_integrals and hasattr(ds, "get_batch_geometry"):
-                    try:
-                        from neugk_jax.evaluate.integrals import gyaradax_flux_integrals
-                        df_pred_np = np.asarray(df_pred)
+                    from neugk_jax.evaluate.integrals import gyaradax_flux_integrals
+                    df_pred_np = np.asarray(df_pred)
+                    if ds.normalization is not None and hasattr(ds, "denormalize"):
+                        df_pred_np = np.stack([
+                            np.asarray(ds.denormalize(int(file_idx[b]),
+                                                      df=df_pred_np[b]))
+                            for b in range(batch_size)
+                        ])
+                    # use per-file geometry; whole batch from same trajectory avoids per-sample broadcast
+                    geom = ds.get_batch_geometry(file_idx)
+                    unique_fids = np.unique(file_idx)
+                    if len(unique_fids) == 1:
+                        # fast path: whole batch from one trajectory
+                        geom_one = {k: np.asarray(v[0]) for k, v in geom.items()}
+                        _, eflux_b = gyaradax_flux_integrals(df_pred_np, geom_one)
+                        eflux = np.asarray(eflux_b).reshape(batch_size, -1).sum(axis=-1)
+                    else:
+                        # mixed-trajectory batch (boundary) — split + integrate
+                        eflux = np.zeros((batch_size,), dtype=np.float64)
+                        for fi in unique_fids:
+                            mask = (file_idx == fi)
+                            idx_b = np.where(mask)[0]
+                            df_sub = df_pred_np[idx_b]
+                            geom_sub = {k: np.asarray(v[idx_b[0]]) for k, v in geom.items()}
+                            _, e_sub = gyaradax_flux_integrals(df_sub, geom_sub)
+                            e_sub = np.asarray(e_sub).reshape(len(idx_b), -1).sum(axis=-1)
+                            eflux[idx_b] = e_sub
+                    for b, tid in enumerate(traj_ids):
+                        if tid is None:
+                            continue
+                        per_traj_pred[tid].append(float(eflux[b]))
+                        per_traj_tgt[tid] = float(tgt_avg_flux[b])
+                    # spectral diagnostics on the denormalized pred/tgt df
+                    if eval_spectra:
+                        from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
+                        df_tgt_np = np.asarray(df_tgt)
                         if ds.normalization is not None and hasattr(ds, "denormalize"):
-                            df_pred_np = np.stack([
+                            df_tgt_np = np.stack([
                                 np.asarray(ds.denormalize(int(file_idx[b]),
-                                                          df=df_pred_np[b]))
+                                                          df=df_tgt_np[b]))
                                 for b in range(batch_size)
                             ])
-                        # use per-file geometry; whole batch from same trajectory avoids per-sample broadcast
-                        geom = ds.get_batch_geometry(file_idx)
-                        unique_fids = np.unique(file_idx)
-                        if len(unique_fids) == 1:
-                            # fast path: whole batch from one trajectory
-                            geom_one = {k: np.asarray(v[0]) for k, v in geom.items()}
-                            _, eflux_b = gyaradax_flux_integrals(df_pred_np, geom_one)
-                            eflux = np.asarray(eflux_b).reshape(batch_size, -1).sum(axis=-1)
-                        else:
-                            # mixed-trajectory batch (boundary) — split + integrate
-                            eflux = np.zeros((batch_size,), dtype=np.float64)
-                            for fi in unique_fids:
-                                mask = (file_idx == fi)
-                                idx_b = np.where(mask)[0]
-                                df_sub = df_pred_np[idx_b]
-                                geom_sub = {k: np.asarray(v[idx_b[0]]) for k, v in geom.items()}
-                                _, e_sub = gyaradax_flux_integrals(df_sub, geom_sub)
-                                e_sub = np.asarray(e_sub).reshape(len(idx_b), -1).sum(axis=-1)
-                                eflux[idx_b] = e_sub
-                        for b, tid in enumerate(traj_ids):
-                            if tid is None:
-                                continue
-                            per_traj_pred[tid].append(float(eflux[b]))
-                            per_traj_tgt[tid] = float(tgt_avg_flux[b])
-                        # spectral diagnostics on the denormalized pred/tgt df
-                        if eval_spectra:
-                            from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-                            df_tgt_np = np.asarray(df_tgt)
-                            if ds.normalization is not None and hasattr(ds, "denormalize"):
-                                df_tgt_np = np.stack([
-                                    np.asarray(ds.denormalize(int(file_idx[b]),
-                                                              df=df_tgt_np[b]))
-                                    for b in range(batch_size)
-                                ])
-                            if not accumulate_spectral_diagnostics(
-                                spectra_store, df_pred_np, df_tgt_np, file_idx, ds,
-                            ):
-                                if self.is_rank0:
-                                    print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
-                                eval_spectra = False
-                    except Exception as e:
-                        if batch_idx == 0:
-                            print(f"[evaluate] gyaradax flux-integral failed: {e}")
+                        if not accumulate_spectral_diagnostics(
+                            spectra_store, df_pred_np, df_tgt_np, file_idx, ds,
+                        ):
+                            if self.is_rank0:
+                                print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
+                            eval_spectra = False
 
             if self.is_rank0 and (batch_idx + 1) % 25 == 0:
                 _el = time.time() - _t_start
@@ -184,25 +180,22 @@ class DiffusionEvaluator(BaseEvaluator):
 
             # emit the per-batch cross-section plot once for context
             if batch_idx == 0 and self.is_rank0:
-                try:
-                    if hasattr(ds, "denormalize") and ds.normalization is not None:
-                        df_pred_d = np.asarray(ds.denormalize(int(file_idx[0]), df=np.asarray(df_pred)))
-                        df_tgt_d = np.asarray(ds.denormalize(int(file_idx[0]), df=np.asarray(df_tgt)))
-                    else:
-                        df_pred_d = np.asarray(df_pred)
-                        df_tgt_d = np.asarray(df_tgt)
-                    ts_arr = np.asarray([float(samples[0].timestep)])
-                    val_plots.update(
-                        generate_val_plots(
-                            rollout={"df": df_pred_d[0]},
-                            gt={"df": df_tgt_d[0]},
-                            phase="val sample",
-                            ts=ts_arr,
-                            to_wandb=True,
-                        )
+                if hasattr(ds, "denormalize") and ds.normalization is not None:
+                    df_pred_d = np.asarray(ds.denormalize(int(file_idx[0]), df=np.asarray(df_pred)))
+                    df_tgt_d = np.asarray(ds.denormalize(int(file_idx[0]), df=np.asarray(df_tgt)))
+                else:
+                    df_pred_d = np.asarray(df_pred)
+                    df_tgt_d = np.asarray(df_tgt)
+                ts_arr = np.asarray([float(samples[0].timestep)])
+                val_plots.update(
+                    generate_val_plots(
+                        rollout={"df": df_pred_d[0]},
+                        gt={"df": df_tgt_d[0]},
+                        phase="val sample",
+                        ts=ts_arr,
+                        to_wandb=True,
                     )
-                except Exception as e:
-                    print(f"[eval] cross-section plots skipped: {e}")
+                )
 
         running, n_acc = self._sync(running, n_acc)
         metrics = self._finalize(running, n_acc)

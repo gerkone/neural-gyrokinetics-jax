@@ -126,16 +126,22 @@ def test_ae_evaluator_runs(tiny_setup):
     assert jnp.isfinite(metrics["df_mse"])
 
 
-def test_ae_evaluator_with_integrals_optional(tiny_setup):
-    """When eval_integrals=True but the df layout doesn't fit the flux
-    integral (plain 2-channel df), the evaluator should still finish and
-    just skip the integrals."""
+def test_ae_evaluator_integrals_plain_df(tiny_setup):
+    """eval_integrals on a plain 2-channel df yields finite phi/flux integral metrics."""
     ds, ae = tiny_setup
     cfg = OmegaConf.create({"validation": {"eval_integrals": True}})
     ev = AEEvaluator(cfg, val_ds=ds, is_rank0=True)
     metrics, _ = ev(ae, epoch=1, batch_size=1, eval_integrals=True)
-    assert "df_mse" in metrics
-    assert jnp.isfinite(metrics["df_mse"])
+    for key in ("df_mse", "phi_int_mse", "flux_int_mse"):
+        assert np.isfinite(metrics[key]), key
+
+
+def test_integrals_reject_incomplete_geometry(tiny_setup):
+    ds, ae = tiny_setup
+    del ds.metadata[0]["geometry"]["kxrh"]
+    cfg = OmegaConf.create({"validation": {"eval_integrals": True}})
+    with pytest.raises(KeyError, match="kxrh"):
+        AEEvaluator(cfg, val_ds=ds, is_rank0=True)(ae, epoch=1, batch_size=1, eval_integrals=True)
 
 
 def test_ae_evaluator_spectral_metrics(tiny_setup):

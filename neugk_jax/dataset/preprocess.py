@@ -193,13 +193,9 @@ def _quantize_file(src: str, bits: str, force: bool) -> tuple[str, int, str]:
     dst = quantized_sibling(src, bits)
     if os.path.exists(dst) and not force:
         return src, 0, "skip"
-    try:
-        arr = np.fromfile(src, dtype=np.float32)
-        payload, scale = quantize_array(arr, bits)
-        n = write_quantized(dst, payload, scale)
-        return src, n, "written"
-    except Exception as e:
-        return src, 0, f"error: {e}"
+    arr = np.fromfile(src, dtype=np.float32)
+    payload, scale = quantize_array(arr, bits)
+    return src, write_quantized(dst, payload, scale), "written"
 
 
 def _process_traj(traj_dir: str, bits: str, force: bool) -> tuple[str, int, int, int]:

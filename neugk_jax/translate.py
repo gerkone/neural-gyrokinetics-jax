@@ -62,7 +62,7 @@ def _stub_pickle_module():
         def find_class(self, mod_name, name):
             try:
                 return super().find_class(mod_name, name)
-            except Exception:
+            except (ImportError, AttributeError):
                 # permissive ctor: enums/scalers are rebuilt as ``Cls(value)``
                 return type(name, (), {
                     "__init__": lambda self, *a, **k: None,
@@ -78,7 +78,8 @@ def load_torch_state(path: str) -> dict[str, np.ndarray]:
     import torch
     try:
         blob = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception:
+    except (ImportError, AttributeError):
+        # trainer-side objects (e.g. deepspeed loss scalers) whose modules do not import here
         blob = torch.load(path, map_location="cpu", weights_only=False,
                           pickle_module=_stub_pickle_module())
     sd = blob["model_state_dict"] if isinstance(blob, dict) and "model_state_dict" in blob else blob

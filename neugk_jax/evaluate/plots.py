@@ -38,17 +38,16 @@ def _plt_to_wandb_image(fig):
     """Convert a figure to ``wandb.Image`` (or return it unchanged if wandb is
     missing). Closes the figure to free the matplotlib resources."""
     try:
-        from PIL import Image as PILImage
-
         import wandb
-        buf = io.BytesIO()
-        fig.savefig(buf, bbox_inches="tight", format="png", dpi=120, pad_inches=0.01)
-        buf.seek(0)
-        img = PILImage.open(buf)
-        plt.close(fig)
-        return wandb.Image(img)
-    except Exception:
+        from PIL import Image as PILImage
+    except ImportError:
         return fig
+    buf = io.BytesIO()
+    fig.savefig(buf, bbox_inches="tight", format="png", dpi=120, pad_inches=0.01)
+    buf.seek(0)
+    img = PILImage.open(buf)
+    plt.close(fig)
+    return wandb.Image(img)
 
 
 def plot_nd(

@@ -81,11 +81,7 @@ def check_gyroswin(name):
 def check_ae(name="AE_noCond"):
     from neugk_jax.translate import build_ae_from_config, load_torch_state, translate_ae
     cfg, _ = _shaped_cfg(_find(name))
-    try:
-        model = build_ae_from_config(cfg, key=jr.PRNGKey(0), resolution=RES)
-    except Exception as e:
-        print(f"[{name}] BUILD FAILED: {type(e).__name__}: {e}")
-        return
+    model = build_ae_from_config(cfg, key=jr.PRNGKey(0), resolution=RES)
     sd = load_torch_state(_pth(name))
     _report(name, model, sd, translate_ae)
 
