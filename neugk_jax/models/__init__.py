@@ -14,8 +14,8 @@ from neugk_jax.models.patching import (
     pad_to_blocks,
     unpad,
 )
-from neugk_jax.models.swin import DiTSwinLayer, SwinLayer
-from neugk_jax.models.utils import MLP, DiTModulation, Film, LayerNorm, Linear
+from neugk_jax.models.swin import DiTSwinLayer, Film, SwinLayer
+from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, Linear
 from neugk_jax.models.vit import DiTLayer, LayerModes, ViTLayer
 
 __all__ = [

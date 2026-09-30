@@ -72,7 +72,7 @@ def _tiny_ae_cfg(path, resolution, out_path):
                 "qk_norm": False, "qkv_bias": False,
             },
             "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2, "normalized_latent": False},
-            "middle_depth": 1, "middle_num_heads": 2, "hidden_mlp_ratio": 2.0,
+            "hidden_mlp_ratio": 2.0,
         },
         "dataset": {
             "name": "cyclone", "path": str(path), "backend": "numpy",

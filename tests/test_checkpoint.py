@@ -24,7 +24,7 @@ def _toy_ae(key):
         in_channels=2, out_channels=2,
         patch_size=(2, 0, 2, 4, 2), window_size=(2, 0, 2, 2, 2),
         depth=2, num_heads=2, num_layers=2,
-        middle_depth=1, middle_num_heads=2,
+
         bottleneck_dim=24, bottleneck_depth=1, bottleneck_num_heads=2,
         merging_depth=1, unmerging_depth=1,
         merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,

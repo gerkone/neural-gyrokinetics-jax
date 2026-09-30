@@ -69,11 +69,16 @@ def check_gyroswin(name):
     # show a few of each for debugging
     for m in miss[:12]:
         print("    MISSING", m)
-    # flux_head weights are dead when the flux loss weight is 0.0 (still built, never trained)
-    dead_flux = [u for u in real_unused if u.startswith("flux_head")]
-    other = [u for u in real_unused if not u.startswith("flux_head")]
-    if dead_flux:
-        print(f"    dead flux_head weights (loss weight 0.0): {len(dead_flux)}")
+    # known-dead torch keys: the whole flux head when the port builds none, else the outer flux cond embed
+    if model.flux_head is None:
+        dead = [u for u in real_unused if u.startswith("flux_head.")]
+    else:
+        dead = [u for u in real_unused if u.startswith("flux_head.cond_embed.")]
+    other = [u for u in real_unused if u not in dead]
+    print(f"    flux head built: {model.flux_head is not None} "
+          f"(conditioned: {bool(model.flux_head and model.flux_head.use_cond)})")
+    if dead:
+        print(f"    known-dead torch weights: {len(dead)} {dead}")
     print(f"    non-trivial UNUSED: {len(other)}")
     for u in other[:15]:
         print("    UNUSED", u)

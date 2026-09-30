@@ -21,11 +21,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from neugk_jax.models.utils import MLP, LayerNorm, Linear, RMSNorm, leaky_relu
-
-
-def _norm(dim: int, *, rms: bool, affine: bool = True):
-    return RMSNorm(dim) if rms else LayerNorm(dim, elementwise_affine=affine)
+from neugk_jax.models.utils import MLP, Linear, leaky_relu, make_norm
 
 
 def _prod(xs):
@@ -153,7 +149,7 @@ class PatchEmbed(eqx.Module):
         dims = [patch_elems] + [hidden] * (mlp_depth - 1) + [embed_dim]
         # PatchEmbed mlp uses the model act_fn (config: gelu); bias=False
         self.patch = MLP(dims, key=key, act_fn=act_fn, use_bias=False)
-        self.norm = _norm(embed_dim, rms=rms_norm) if norm else None
+        self.norm = make_norm(embed_dim, rms=rms_norm) if norm else None
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = fold_patches(x, self.patch_size)
@@ -203,7 +199,7 @@ class PatchMerge(eqx.Module):
         out_features = dim * c_multiplier
         self.in_dim = dim
         self.out_dim = out_features
-        self.norm = _norm(in_features, rms=rms_norm)
+        self.norm = make_norm(in_features, rms=rms_norm)
         self.proj = Linear(in_features, out_features, key=key, use_bias=False)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -336,7 +332,7 @@ class PatchExpand(eqx.Module):
         else:
             self.modulation = None
         # norm runs over out_dim channels after unfold
-        self.norm = _norm(self.out_dim, rms=rms_norm) if norm else None
+        self.norm = make_norm(self.out_dim, rms=rms_norm) if norm else None
 
     def __call__(self, x: jnp.ndarray, cond: Optional[jnp.ndarray] = None) -> jnp.ndarray:
         # order: proj_concat (skip residual) -> film -> expansion -> crop -> norm

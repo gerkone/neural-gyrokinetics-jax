@@ -19,7 +19,7 @@ def test_ae_drop_path():
     res = (4, 4, 4, 16, 8)
     ae = Swin5DAE(decouple_mu=True, dim=16, base_resolution=list(res), in_channels=2,
                   out_channels=2, patch_size=[2, 0, 2, 4, 2], window_size=[2, 0, 2, 2, 2],
-                  depth=[1], num_heads=[2], num_layers=1, middle_depth=1, middle_num_heads=2,
+                  depth=[1], num_heads=[2], num_layers=1,
                   bottleneck_dim=8, bottleneck_depth=1, bottleneck_num_heads=2,
                   c_multiplier=1, drop_path=0.5, key=jr.PRNGKey(0))
     x = jr.normal(jr.PRNGKey(3), (2, *res))

@@ -12,7 +12,7 @@ import numpy as np
 
 from neugk_jax.models.attention import MultiHeadSelfAttention
 from neugk_jax.models.patching import pad_to_blocks, unpad
-from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, Linear, RMSNorm, gelu
+from neugk_jax.models.utils import MLP, DiTModulation, Linear, gelu, make_norm
 
 
 def _prod(xs):
@@ -174,8 +174,8 @@ class SwinBlock(eqx.Module):
         self.window_size = eff_w
         self.shift_size = shift_size
 
-        self.norm1 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
-        self.norm2 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
+        self.norm1 = make_norm(dim, rms=rms_norm, affine=norm_affine)
+        self.norm2 = make_norm(dim, rms=rms_norm, affine=norm_affine)
         katt, kmlp = jr.split(key, 2)
         self.attn = MultiHeadSelfAttention(
             dim, num_heads, key=katt,
@@ -276,10 +276,9 @@ class DiTSwinBlock(eqx.Module):
         self.window_size = eff_w
         self.shift_size = shift_size
 
-        # DiT modulation provides scale/shift, so the norm is non-affine; norm type follows the model (rmsnorm for cold/warm)
-        _Norm = RMSNorm if rms_norm else LayerNorm
-        self.norm1 = _Norm(dim, elementwise_affine=False)
-        self.norm2 = _Norm(dim, elementwise_affine=False)
+        # dit modulation provides scale/shift, so the norm is non-affine
+        self.norm1 = make_norm(dim, rms=rms_norm, affine=False)
+        self.norm2 = make_norm(dim, rms=rms_norm, affine=False)
         katt, kmlp, kmod = jr.split(key, 3)
         self.attn = MultiHeadSelfAttention(
             dim, num_heads, key=katt, qkv_bias=qkv_bias, qk_norm=qk_norm,
@@ -342,7 +341,6 @@ class SwinLayer(eqx.Module):
     mlp_ratio: float = eqx.field(static=True)
     drop_path: float = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
-    norm_layer: type = eqx.field(static=True)
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -358,7 +356,6 @@ class SwinLayer(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
-        norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = False,
@@ -367,7 +364,6 @@ class SwinLayer(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         keys = jr.split(key, depth)
         self.blocks = [
@@ -397,10 +393,9 @@ class SwinLayer(eqx.Module):
         self.mlp_ratio = mlp_ratio
         self.drop_path = drop_path
         self.use_checkpoint = use_checkpoint
-        self.norm_layer = norm_layer
         self.act_fn = act_fn
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False, **_) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
             call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
@@ -418,7 +413,6 @@ class DiTSwinLayer(eqx.Module):
     mlp_ratio: float = eqx.field(static=True)
     drop_path: float = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
-    norm_layer: type = eqx.field(static=True)
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -435,7 +429,6 @@ class DiTSwinLayer(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
-        norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = False,
@@ -443,7 +436,6 @@ class DiTSwinLayer(eqx.Module):
         gated_attention: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         keys = jr.split(key, depth)
         self.blocks = [
@@ -473,10 +465,9 @@ class DiTSwinLayer(eqx.Module):
         self.mlp_ratio = mlp_ratio
         self.drop_path = drop_path
         self.use_checkpoint = use_checkpoint
-        self.norm_layer = norm_layer
         self.act_fn = act_fn
 
-    def __call__(self, x, condition, *, key=None, inference=False, **_):
+    def __call__(self, x, condition, *, key=None, inference=False):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
             call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
@@ -541,7 +532,6 @@ class FilmSwinLayer(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         bkeys = jr.split(key, depth)
         fkeys = jr.split(jr.fold_in(key, 1), depth)
@@ -560,7 +550,7 @@ class FilmSwinLayer(eqx.Module):
         self.dim = dim
         self.use_checkpoint = use_checkpoint
 
-    def __call__(self, x, condition, *, key=None, inference=False, **_):
+    def __call__(self, x, condition, *, key=None, inference=False):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, film, k in zip(self.blocks, self.conditioning, keys):
             x = film(x, condition)

@@ -11,7 +11,7 @@ import jax.random as jr
 
 from neugk_jax.models.attention import MultiHeadSelfAttention
 from neugk_jax.models.swin import Film, _DropPath
-from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, RMSNorm, gelu
+from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, gelu, make_norm
 
 
 class LayerModes(enum.Enum):
@@ -47,8 +47,8 @@ class ViTBlock(eqx.Module):
         legacy_double_shortcut: bool = False,
     ):
         katt, kmlp = jr.split(key, 2)
-        self.norm1 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
-        self.norm2 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
+        self.norm1 = make_norm(dim, rms=rms_norm, affine=norm_affine)
+        self.norm2 = make_norm(dim, rms=rms_norm, affine=norm_affine)
         self.attn = MultiHeadSelfAttention(
             dim, num_heads, key=katt,
             qkv_bias=qkv_bias, qk_norm=qk_norm,
@@ -129,7 +129,6 @@ class ViTLayer(eqx.Module):
     drop_path: float = eqx.field(static=True)
     mlp_ratio: float = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
-    norm_layer: type = eqx.field(static=True)
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -144,7 +143,6 @@ class ViTLayer(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
-        norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = False,
@@ -152,7 +150,6 @@ class ViTLayer(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         keys = jr.split(key, depth)
         self.blocks = [
@@ -171,10 +168,9 @@ class ViTLayer(eqx.Module):
         self.drop_path = drop_path
         self.mlp_ratio = mlp_ratio
         self.use_checkpoint = use_checkpoint
-        self.norm_layer = norm_layer
         self.act_fn = act_fn
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference=False, **_):
+    def __call__(self, x: jnp.ndarray, *, key=None, inference=False):
         # x: (*grid, dim) → flatten → blocks → reshape
         spatial = x.shape[:-1]
         dim = x.shape[-1]
@@ -194,7 +190,6 @@ class DiTLayer(eqx.Module):
     drop_path: float = eqx.field(static=True)
     mlp_ratio: float = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
-    norm_layer: type = eqx.field(static=True)
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -210,12 +205,10 @@ class DiTLayer(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
-        norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         norm_affine: bool = True,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         keys = jr.split(key, depth)
         self.blocks = [
@@ -232,10 +225,9 @@ class DiTLayer(eqx.Module):
         self.drop_path = drop_path
         self.mlp_ratio = mlp_ratio
         self.use_checkpoint = use_checkpoint
-        self.norm_layer = norm_layer
         self.act_fn = act_fn
 
-    def __call__(self, x, condition, *, key=None, inference=False, **_):
+    def __call__(self, x, condition, *, key=None, inference=False):
         spatial = x.shape[:-1]
         dim = x.shape[-1]
         x = x.reshape(-1, dim)
@@ -277,7 +269,6 @@ class FilmViTLayer(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         bkeys = jr.split(key, depth)
         fkeys = jr.split(jr.fold_in(key, 1), depth)
@@ -295,7 +286,7 @@ class FilmViTLayer(eqx.Module):
         self.grid_size = tuple(grid_size)
         self.dim = dim
 
-    def __call__(self, x: jnp.ndarray, condition, *, key=None, inference=False, **_):
+    def __call__(self, x: jnp.ndarray, condition, *, key=None, inference=False):
         spatial = x.shape[:-1]
         dim = x.shape[-1]
         x = x.reshape(-1, dim)

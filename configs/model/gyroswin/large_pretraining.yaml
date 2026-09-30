@@ -53,4 +53,6 @@ swin:
   flux_num_heads: 8
   flux_depth: 1
   flux_conditioning: false
+  attn_drop: 0.1  # attention dropout of the mixing blocks and velocity reductions
+  flux_drop: 0.1  # flux head projection and mlp dropout
   norm_fn: RMSNorm

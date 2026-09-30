@@ -9,6 +9,7 @@ Centralizes the AE/DiT translation logic so:
 Public API:
 
 - ``load_torch_state(.pth)`` → ``dict[str, np.ndarray]``
+- ``load_config(src)`` → plain dict from a YAML path, OmegaConf config or mapping
 - ``build_ae_from_config(cfg, key)`` → ``Swin5DAE`` (f32-forced)
 - ``build_dit_from_config(cfg, ae, key)`` → ``DiT`` (f32-forced)
 - ``translate_ae(model, state)`` and ``translate_dit(model, state)``
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import re
+from collections.abc import Mapping
 from typing import Optional, Sequence
 
 import jax
@@ -28,7 +30,18 @@ import yaml
 
 _LAYERS_RE = re.compile(r"\.layers\.(\d+)")
 _NON_PERSISTENT = (".attn_mask", ".rel_pos", ".rpb", ".rpb_idx", ".omega")
-_AE_DEAD = ("backbone.middle.",)
+
+
+def load_config(src) -> dict:
+    """A config as a plain dict, from a YAML path, an OmegaConf config or a mapping."""
+    from omegaconf import OmegaConf
+
+    if OmegaConf.is_config(src):
+        return OmegaConf.to_container(src, resolve=True)
+    if isinstance(src, Mapping):
+        return dict(src)
+    with open(src) as f:
+        return yaml.safe_load(f)
 
 
 def force_f32(model):
@@ -42,6 +55,11 @@ def force_f32(model):
         if isinstance(x, jax.Array) and x.dtype == jnp.float64 else x,
         model,
     )
+
+
+def _unimportable(e: Exception) -> bool:
+    # a pickled class whose module is missing or fails at import (deepspeed without cuda)
+    return isinstance(e, (ImportError, AttributeError)) or type(e).__name__ == "MissingCUDAException"
 
 
 def _stub_pickle_module():
@@ -62,7 +80,9 @@ def _stub_pickle_module():
         def find_class(self, mod_name, name):
             try:
                 return super().find_class(mod_name, name)
-            except (ImportError, AttributeError):
+            except Exception as e:
+                if not _unimportable(e):
+                    raise
                 # permissive ctor: enums/scalers are rebuilt as ``Cls(value)``
                 return type(name, (), {
                     "__init__": lambda self, *a, **k: None,
@@ -78,7 +98,9 @@ def load_torch_state(path: str) -> dict[str, np.ndarray]:
     import torch
     try:
         blob = torch.load(path, map_location="cpu", weights_only=False)
-    except (ImportError, AttributeError):
+    except Exception as e:
+        if not _unimportable(e):
+            raise
         # trainer-side objects (e.g. deepspeed loss scalers) whose modules do not import here
         blob = torch.load(path, map_location="cpu", weights_only=False,
                           pickle_module=_stub_pickle_module())
@@ -118,10 +140,6 @@ def iter_leaves(tree, prefix: str = ""):
 
 def _is_non_persistent(name: str) -> bool:
     return any(name.endswith(s) for s in _NON_PERSISTENT)
-
-
-def _is_dead_leaf(name: str) -> bool:
-    return any(s in name for s in _AE_DEAD)
 
 
 def _ae_name_map(jax_name: str) -> list[str]:
@@ -209,7 +227,7 @@ def _translate(model, torch_state, name_map, *, strict: bool = False):
                         and int(np.prod(leaf.shape[1:])) == 1):
                     replacements[name] = np.asarray(tw).reshape(leaf.shape)
                     used.add(cand); matched = True; break
-        if not matched and not _is_non_persistent(name) and not _is_dead_leaf(name):
+        if not matched and not _is_non_persistent(name):
             missing.append((name, tuple(leaf.shape)))
     unused = sorted(set(torch_state) - used)
     if strict and (missing or unused):
@@ -230,18 +248,17 @@ def translate_gyroswin(model, torch_state, *, strict: bool = False):
 
 
 def build_ae_from_config(
-    cfg_path: str, *, key, resolution: Optional[Sequence[int]] = None,
+    cfg_path, *, key, resolution: Optional[Sequence[int]] = None,
     legacy_double_shortcut: Optional[bool] = None,
 ):
-    """Construct a ``Swin5DAE`` from a Hydra YAML config (upstream or local).
+    """Construct a ``Swin5DAE`` from a config (YAML path or mapping, upstream or local).
 
     ``legacy_double_shortcut`` defaults to the config's
     ``model.legacy_swin_shortcut``, or True when absent — matches checkpoints
     trained with the doubled swin-shortcut residual.
     """
     from neugk_jax.autoencoders import Swin5DAE
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config(cfg_path)
     mcfg = cfg["model"]
     vit, patch, bn = mcfg.get("vit", {}), mcfg.get("patch", {}), mcfg.get("bottleneck", {})
     dataset = cfg.get("dataset", {})
@@ -263,8 +280,6 @@ def build_ae_from_config(
         depth=depth,
         num_heads=vit["num_heads"],
         num_layers=n_layers,
-        middle_depth=mcfg.get("middle_depth", 2),
-        middle_num_heads=mcfg.get("middle_num_heads", 8),
         bottleneck_dim=bn.get("dim"),
         bottleneck_depth=bn.get("depth", 2),
         bottleneck_num_heads=bn.get("num_heads", 2),
@@ -274,6 +289,7 @@ def build_ae_from_config(
         merging_depth=patch.get("merging_depth", 2),
         unmerging_depth=patch.get("unmerging_depth", 2),
         c_multiplier=int(patch.get("c_multiplier", 2)),
+        drop_path=float(vit.get("drop_path", 0.1)),
         normalized_latent=bn.get("normalized_latent", False),
         qkv_bias=vit.get("qkv_bias", False),
         qk_norm=vit.get("qk_norm", False),
@@ -285,11 +301,10 @@ def build_ae_from_config(
     ))
 
 
-def build_dit_from_config(cfg_path: str, ae, *, key):
-    """Construct a ``DiT`` whose dims match an existing AE's bottleneck."""
+def build_dit_from_config(cfg_path, ae, *, key):
+    """Construct a ``DiT`` whose dims match an existing AE's bottleneck (config path or mapping)."""
     from neugk_jax.diffusion.dit import DiT
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config(cfg_path)
     mcfg = cfg["model"]
     vit = mcfg["vit"]
     grid = tuple(ae.bottleneck_grid_size)
@@ -302,8 +317,8 @@ def build_dit_from_config(cfg_path: str, ae, *, key):
         num_heads=vit["num_heads"],
         n_cond=len(mcfg.get("conditioning", []) or []),
         key=key,
-        mlp_ratio=vit.get("mlp_ratio", 2.0),
-        drop_path=vit.get("drop_path", 0.1),
+        mlp_ratio=float(vit.get("mlp_ratio", 2.0)),
+        drop_path=float(vit.get("drop_path", 0.1)),
     ))
 
 

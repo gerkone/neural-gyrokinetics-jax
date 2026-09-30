@@ -241,9 +241,9 @@ class SwinNDUnet(eqx.Module):
     patch_embed: PatchEmbed
     cond_embed: Optional[object]
     down_blocks: list[SwinBlockDown]
-    middle: object  # ViTLayer (ae) or FilmSwinLayer (gyroswin windowed+rpb middle)
+    middle: Optional[object]
     middle_pe: Optional[APE]
-    middle_upscale: PatchExpand
+    middle_upscale: Optional[PatchExpand]
     up_blocks: list[SwinBlockUp]
     unpatch: PatchExpand
 
@@ -257,7 +257,6 @@ class SwinNDUnet(eqx.Module):
     down_dims: tuple = eqx.field(static=True)
     in_channels: int = eqx.field(static=True)
     out_channels: int = eqx.field(static=True)
-    norm_output: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -283,7 +282,6 @@ class SwinNDUnet(eqx.Module):
         merging_depth: int = 2,
         unmerging_depth: int = 2,
         act_fn: Callable = gelu,
-        norm_output: bool = False,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = False,
@@ -298,6 +296,7 @@ class SwinNDUnet(eqx.Module):
         n_cond: int = 0,
         cond_embed_dim: int = 128,
         middle_swin: bool = False,
+        build_middle: bool = True,
         conv_patch: bool = False,
         unpatch_patch_skip: bool = False,
         key,
@@ -357,8 +356,10 @@ class SwinNDUnet(eqx.Module):
         self.grid_sizes = tuple(grid_sizes)
         self.down_dims = tuple(down_dims)
 
-        # middle: global attention at the deepest grid; the ae uses a plain vit, gyroswin uses a windowed swinlayer with rpb whose window equals the bottleneck grid (so it's global) plus per-block film
-        if middle_swin and cond_mode == "dit":
+        # global attention at the deepest grid: a vit, or a swin layer whose window is the whole grid
+        if not build_middle:
+            self.middle = None
+        elif middle_swin and cond_mode == "dit":
             self.middle = DiTSwinLayer(
                 space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
                 grid_size=grid_sizes[-1], window_size=grid_sizes[-1], cond_dim=cond_dim,
@@ -388,13 +389,17 @@ class SwinNDUnet(eqx.Module):
                 gated_attention=gated_attention, norm_affine=norm_affine,
             )
         ki += 1
-        self.middle_pe = APE(down_dims[-1], grid_sizes[-1], init="sincos") if use_abs_pe else None
+        use_mid_pe = use_abs_pe and build_middle
+        self.middle_pe = APE(down_dims[-1], grid_sizes[-1], init="sincos") if use_mid_pe else None
         # middle_upscale always uses layernorm (unlike PatchMerge's rmsnorm)
-        self.middle_upscale = PatchExpand(
-            down_dims[-1], grid_sizes[-1], key=keys[ki],
-            target_grid_size=grid_sizes[-2], c_multiplier=c_multiplier,
-            mlp_depth=1, rms_norm=False, use_conv=conv_patch,
-        )
+        if build_middle:
+            self.middle_upscale = PatchExpand(
+                down_dims[-1], grid_sizes[-1], key=keys[ki],
+                target_grid_size=grid_sizes[-2], c_multiplier=c_multiplier,
+                mlp_depth=1, rms_norm=False, use_conv=conv_patch,
+            )
+        else:
+            self.middle_upscale = None
         ki += 1
 
         # up path
@@ -454,7 +459,6 @@ class SwinNDUnet(eqx.Module):
         self.window_size = tuple(window_size)
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.norm_output = norm_output
 
     # forward path
 
@@ -476,6 +480,8 @@ class SwinNDUnet(eqx.Module):
         return jnp.moveaxis(x, -1, 0)
 
     def __call__(self, x: jnp.ndarray, *, key=None, inference=True):
+        if self.middle is None:
+            raise ValueError("built with build_middle=False; the owner runs its own bottleneck")
         z, pad_axes = self.patch_encode(x)
         skips = []
         for blk in self.down_blocks:

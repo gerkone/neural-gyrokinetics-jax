@@ -54,8 +54,6 @@ class Swin5DAE(eqx.Module):
         depth,
         num_heads,
         num_layers: int = 4,
-        middle_depth: int = 2,
-        middle_num_heads: int = 8,
         bottleneck_dim: Optional[int] = None,
         bottleneck_depth: int = 2,
         bottleneck_num_heads: int = 2,
@@ -90,8 +88,6 @@ class Swin5DAE(eqx.Module):
             depth=depth,
             num_heads=num_heads,
             num_layers=num_layers,
-            middle_depth=middle_depth,
-            middle_num_heads=middle_num_heads,
             c_multiplier=c_multiplier,
             drop_path=drop_path,
             hidden_mlp_ratio=hidden_mlp_ratio,
@@ -106,8 +102,9 @@ class Swin5DAE(eqx.Module):
             norm_affine=norm_affine,
             legacy_double_shortcut=legacy_double_shortcut,
             rms_norm=True,
-            # ae has no encoder→decoder skips
+            # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
+            build_middle=False,
             key=kb,
         )
 

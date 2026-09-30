@@ -185,7 +185,7 @@ def test_swin_5d_unet_no_decouple():
         patch_size=(2, 2, 2, 4, 2),
         window_size=(2, 2, 2, 2, 2),
         depth=2, num_heads=2, num_layers=2,
-        middle_depth=1, middle_num_heads=2,
+
         merging_depth=1, unmerging_depth=1,
         merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,
         hidden_mlp_ratio=2.0,
@@ -209,7 +209,7 @@ def test_swin5d_ae_decouple_mu():
         patch_size=(2, 0, 2, 4, 2),
         window_size=(2, 0, 2, 2, 2),
         depth=2, num_heads=2, num_layers=2,
-        middle_depth=1, middle_num_heads=2,
+
         bottleneck_dim=24, bottleneck_depth=1, bottleneck_num_heads=2,
         merging_depth=1, unmerging_depth=1,
         merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,
@@ -247,7 +247,7 @@ def test_swin5d_ae_vmapped_batch():
         base_resolution=base, in_channels=2, out_channels=2,
         patch_size=(2, 0, 2, 4, 2), window_size=(2, 0, 2, 2, 2),
         depth=1, num_heads=2, num_layers=2,
-        middle_depth=1, middle_num_heads=2,
+
         bottleneck_dim=16, bottleneck_depth=1, bottleneck_num_heads=2,
         merging_depth=1, unmerging_depth=1,
         merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,

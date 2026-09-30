@@ -5,7 +5,8 @@
   fail pickle identity checks when stored as Equinox static fields).
 * ``Linear``, ``LayerNorm`` — thin wrappers around ``eqx.nn.*`` that add
   arbitrary leading-dim support + mixed-precision dtype casting.
-* ``MLP``, ``Film``, ``DiTModulation`` — small composites.
+* ``MLP``, ``DiTModulation`` — small composites.
+* ``dropout``, ``make_norm`` — stateless dropout and the LayerNorm/RMSNorm switch.
 * ``RMSNorm``, ``Gate`` — used by the WindowAttention extras
   (``qk_norm``, ``gated_attention``).
 
@@ -114,12 +115,22 @@ class LayerNorm(eqx.Module):
         return out.reshape(x.shape).astype(in_dtype)
 
 
+def dropout(x: jax.Array, rate: float, *, key=None, inference: bool = True) -> jax.Array:
+    """Inverted dropout; identity when ``rate == 0``, ``inference`` or no ``key``."""
+    if inference or rate == 0.0 or key is None:
+        return x
+    keep = 1.0 - rate
+    mask = jr.bernoulli(key, p=keep, shape=x.shape)
+    return jnp.where(mask, x / keep, 0.0).astype(x.dtype)
+
+
 class MLP(eqx.Module):
-    """Multi-layer perceptron over the last axis."""
+    """Multi-layer perceptron over the last axis, with optional dropout after every linear."""
 
     layers: list[Linear]
     act: Callable = eqx.field(static=True)
     last_act: bool = eqx.field(static=True)
+    drop: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -129,6 +140,7 @@ class MLP(eqx.Module):
         act_fn: Callable = gelu,
         use_bias: bool = True,
         last_act: bool = False,
+        drop: float = 0.0,
     ):
         keys = jr.split(key, len(dims) - 1)
         self.layers = [
@@ -137,34 +149,16 @@ class MLP(eqx.Module):
         ]
         self.act = act_fn
         self.last_act = last_act
+        self.drop = drop
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self, x: jax.Array, *, key=None, inference: bool = True) -> jax.Array:
         n = len(self.layers)
+        keys = [None] * n if key is None else list(jr.split(key, n))
         for i, lyr in enumerate(self.layers):
-            x = lyr(x)
+            x = dropout(lyr(x), self.drop, key=keys[i], inference=inference)
             if i < n - 1 or self.last_act:
                 x = self.act(x)
         return x
-
-
-class Film(eqx.Module):
-    """Feature-wise linear modulation: scale * x + shift driven by a condition."""
-
-    proj: Linear
-    dim: int = eqx.field(static=True)
-
-    def __init__(self, cond_dim: int, dim: int, *, key):
-        self.proj = Linear(cond_dim, 2 * dim, key=key)
-        self.dim = dim
-
-    def __call__(self, x: jax.Array, cond: jax.Array) -> jax.Array:
-        # cond: (..., cond_dim); x: (..., dim)
-        scale, shift = jnp.split(self.proj(jax.nn.silu(cond)), 2, axis=-1)
-        # add trailing spatial singleton axes so scale/shift broadcast over (*spatial, dim)
-        while scale.ndim < x.ndim:
-            scale = scale[..., None, :]
-            shift = shift[..., None, :]
-        return x * (1.0 + scale) + shift
 
 
 class DiTModulation(eqx.Module):
@@ -182,8 +176,6 @@ class DiTModulation(eqx.Module):
     def __call__(self, cond: jax.Array):
         # cond: (..., cond_dim) → 6 tensors of shape (..., dim); SiLU already applied in ContinuousConditionEmbed
         return jnp.split(self.proj(cond), 6, axis=-1)
-
-
 
 
 class RMSNorm(eqx.Module):
@@ -213,6 +205,10 @@ class RMSNorm(eqx.Module):
         if self.elementwise_affine:
             y = y * self.weight
         return y.astype(in_dtype)
+
+
+def make_norm(dim: int, *, rms: bool, affine: bool = True):
+    return RMSNorm(dim, elementwise_affine=affine) if rms else LayerNorm(dim, elementwise_affine=affine)
 
 
 class Gate(eqx.Module):

@@ -1,8 +1,9 @@
-"""Forward parity: torch GyroSwinMultitask vs translated JAX port on GyroSwin_tiny.
+"""Forward parity: torch GyroSwinMultitask vs translated JAX port on a GyroSwin checkpoint.
 
 Builds both from the checkpoint config, loads best.pth into torch and translates
-it into JAX, runs the same random input + conditioning through both, and reports
-cosine similarity / max|diff| / MSE per output (df, phi, flux).
+it into JAX, runs the same random inputs + conditioning through both, and reports
+cosine similarity / max|diff| / MSE per output (df, phi) and the scalar flux head
+output (flux or fluxavg, whichever the config schedules) over a small batch.
 
 Residual semantics: neurips26 checkpoints predate upstream e79b021, which removed a
 doubled MLP shortcut from ``SwinTransformerBlock``. ``--pre-fix-residual`` puts BOTH
@@ -91,23 +92,27 @@ jmodel, miss, unused = translate_gyroswin(jmodel, load_torch_state(CK + "/best.p
 print(f"translate: {len(miss)} missing, {len(unused)} unused (torch aliases/dead heads)")
 
 # ---- shared input ----
+N_FLUX = 4  # extra samples for the scalar flux comparison
 rng = np.random.default_rng(0)
 in_ch = 4  # 2 active_keys * (2 if separate_zf)
-df_np = rng.standard_normal((in_ch, *RES)).astype(np.float32) * 0.1
-cond_np = rng.standard_normal(len(COND_KEYS)).astype(np.float32)
+# sample-wise draws so sample 0 is the single-sample input of earlier runs
+draws = [(rng.standard_normal((in_ch, *RES)).astype(np.float32) * 0.1,
+          rng.standard_normal(len(COND_KEYS)).astype(np.float32)) for _ in range(N_FLUX)]
+df_np = np.stack([d for d, _ in draws])
+cond_np = np.stack([c for _, c in draws])
+FLUX_KEY = jmodel.flux_key
 
-# torch forward (batched)
-df_t = torch.from_numpy(df_np)[None]  # (1, C, vp, mu, s, x, y)
-cond_kw = {k: torch.tensor([[cond_np[i]]]) for i, k in enumerate(COND_KEYS)}
-with torch.no_grad():
-    tout = tmodel(df_t, **cond_kw)
 def _t2n(x): return x.detach().cpu().numpy()
-tdf = _t2n(tout[0] if isinstance(tout, (tuple, list)) else tout["df"])[0]
-tphi = _t2n(tout[1] if isinstance(tout, (tuple, list)) else tout["phi"])[0]
-tflux = tout.get("flux") if isinstance(tout, dict) else None
-
-# jax forward (unbatched)
-jout = jmodel(jnp.asarray(df_np), jnp.asarray(cond_np), inference=True)
+touts, jouts = [], []
+for b in range(N_FLUX):
+    # torch forward (batch of 1); conditioning in sorted-key order, same vector as jax
+    cond_kw = {k: torch.tensor([[cond_np[b, i]]]) for i, k in enumerate(COND_KEYS)}
+    with torch.no_grad():
+        touts.append(tmodel(torch.from_numpy(df_np[b])[None], **cond_kw))
+    jouts.append(jmodel(jnp.asarray(df_np[b]), jnp.asarray(cond_np[b]), inference=True))
+tout, jout = touts[0], jouts[0]
+tdf = _t2n(tout["df"])[0]
+tphi = _t2n(tout["phi"])[0]
 jdf = np.asarray(jout["df"]); jphi = np.asarray(jout["phi"])
 
 def cmp(name, a, b):
@@ -122,6 +127,13 @@ print("\n=== forward parity (fp32) ===")
 print(f"  shapes: torch df{tdf.shape} phi{tphi.shape} | jax df{jdf.shape} phi{jphi.shape}")
 cmp("df", tdf, jdf)
 cmp("phi", tphi, jphi)
-if tflux is not None and "flux" in jout:
-    tf = float(np.ravel(_t2n(tflux))[0]); jf = float(np.ravel(np.asarray(jout.get("flux", jout.get("fluxavg"))))[0])
-    print(f"  flux: torch={tf:.6f}  jax={jf:.6f}  |diff|={abs(tf - jf):.3e}")
+if FLUX_KEY is None or FLUX_KEY not in tout:
+    print(f"  flux: no flux head (jax {FLUX_KEY}, torch keys {sorted(tout)})")
+else:
+    tf = np.array([float(np.ravel(_t2n(o[FLUX_KEY]))[0]) for o in touts])
+    jf = np.array([float(np.ravel(np.asarray(o[FLUX_KEY]))[0]) for o in jouts])
+    cond_tag = "conditioned" if jmodel.flux_head.use_cond else "unconditioned"
+    print(f"  {FLUX_KEY} ({cond_tag}, {N_FLUX} samples): torch={np.round(tf, 6).tolist()} "
+          f"jax={np.round(jf, 6).tolist()}")
+    rel = np.abs(tf - jf) / (np.abs(tf) + 1e-12)
+    print(f"  {FLUX_KEY}: max|diff|={np.abs(tf - jf).max():.3e}  max rel={rel.max():.3e}")
