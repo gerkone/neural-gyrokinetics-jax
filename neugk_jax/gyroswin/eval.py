@@ -111,6 +111,7 @@ class GyroSwinEvaluator(BaseEvaluator):
             t0 = np.asarray([t for _, t in ft])
             steps = np.minimum(n_eval, np.asarray([ds.num_ts(f) for f in fids]) - t0 - 1)
             x, cond = batch["df"], batch.get("conditioning")
+            # next-step targets live on CycloneSample as y_<field>
             tgt = {k: batch[f"y_{k}"] for k in self.fields}
             for t in range(int(steps[plan.mask > 0].max())):
                 if t > 0:

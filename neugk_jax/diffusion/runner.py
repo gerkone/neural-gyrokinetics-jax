@@ -165,7 +165,6 @@ class FlowMatchingRunner(AERunner):
                     ds.split,
                     cfg.ae_checkpoint,
                     decouple_mu=dcfg.get("norm_decouple_mu", False),
-                    timestep_std_filter=dcfg.get("timestep_std_filter"),
                 )
                 precompute_latents(
                     ds,

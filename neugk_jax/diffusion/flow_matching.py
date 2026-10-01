@@ -101,39 +101,6 @@ def fm_forward_loss(
     return jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
 
-def _euler_step(velocity, x, ti, dti):
-    return velocity(x, ti) * dti
-
-
-def _midpoint_step(velocity, x, ti, dti):
-    k1 = velocity(x, ti)
-    return velocity(x + 0.5 * dti * k1, ti + 0.5 * dti) * dti
-
-
-def _heun_step(velocity, x, ti, dti):
-    # explicit trapezoid
-    k1 = velocity(x, ti)
-    k2 = velocity(x + dti * k1, ti + dti)
-    return 0.5 * dti * (k1 + k2)
-
-
-def _rk4_step(velocity, x, ti, dti):
-    k1 = velocity(x, ti)
-    k2 = velocity(x + 0.5 * dti * k1, ti + 0.5 * dti)
-    k3 = velocity(x + 0.5 * dti * k2, ti + 0.5 * dti)
-    k4 = velocity(x + dti * k3, ti + dti)
-    return (dti / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-
-_STEPPERS = {
-    "euler": _euler_step,
-    "midpoint": _midpoint_step,
-    "heun": _heun_step,
-    "rk4": _rk4_step,
-}
-NFE_PER_STEP = {"euler": 1, "midpoint": 2, "heun": 2, "rk4": 4}
-
-
 def euler_sample(
     model_fn: Callable,
     *,
@@ -143,12 +110,8 @@ def euler_sample(
     steps: int = 10,
     latent_scale: float = 1.0,
     dtype=jnp.float32,
-    method: str = "euler",
 ) -> jnp.ndarray:
-    """Integrate the velocity field over ``[0, 1]``.
-
-    ``method`` selects the explicit scheme (``euler``, ``midpoint``, ``heun``, ``rk4``); compare
-    schemes at matched NFE via :data:`NFE_PER_STEP`, not at matched step count.
+    """Euler-integrate the velocity field over ``[0, 1]``.
 
     Fused as a single ``jax.lax.scan`` so the whole sampling roll-out is
     one jit'd kernel. ``shape = (B, *latent_grid, z_dim)`` matches the
@@ -170,11 +133,9 @@ def euler_sample(
         def velocity(x, ti):
             return jax.vmap(model_fn)(x, jnp.full((bs,), ti, dtype=dtype))
 
-    increment = _STEPPERS[method]
-
     def step(x, ti_dti):
         ti, dti = ti_dti
-        return x + increment(velocity, x, ti, dti), None
+        return x + velocity(x, ti) * dti, None
 
     x, _ = jax.lax.scan(step, x0, (ts, dts))
     return x / latent_scale

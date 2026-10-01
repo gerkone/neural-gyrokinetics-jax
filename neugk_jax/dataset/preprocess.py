@@ -155,12 +155,8 @@ def write_quantized(dst: str, payload: np.ndarray, scale: np.float32 | None) -> 
     return n
 
 
-def read_quantized(path: str, bits: str, n_elems: int, *, return_raw: bool = False):
-    """Read a quantized shard and (optionally) dequantize.
-
-    ``return_raw=True`` returns ``(payload, scale)`` without dequantizing, keeping
-    the read in its on-disk dtype.
-    """
+def read_quantized(path: str, bits: str, n_elems: int) -> np.ndarray:
+    """Read and dequantize a quantized shard."""
     with open(path, "rb") as f:
         scale = None
         if bits in ("i8", "i4"):
@@ -177,8 +173,6 @@ def read_quantized(path: str, bits: str, n_elems: int, *, return_raw: bool = Fal
             payload = np.frombuffer(f.read(), dtype=np.uint8)
         else:
             raise ValueError(f"unknown bits={bits!r}")
-    if return_raw:
-        return payload, scale
     return dequantize_array(payload, scale, bits, n_elems)
 
 
@@ -594,10 +588,6 @@ class FieldSolver:
             return np.asarray(out, dtype=np.float64)
 
 
-def field_solve_phi(df: np.ndarray, geometry: dict, x64: bool = True) -> np.ndarray:
-    return FieldSolver(geometry, x64=x64)(df)[0]
-
-
 class StreamStats:
     """Elementwise running mean/var/min/max over single samples, updated in place in float64.
 
@@ -665,8 +655,8 @@ def write_metadata(traj_dir: str, metadata: dict) -> None:
     _save_meta_atomic(os.path.join(traj_dir, "metadata_light"), light)
 
 
-def _write_bin(path: str, arr: np.ndarray, overwrite: bool = False) -> None:
-    if overwrite or not os.path.exists(path):
+def _write_bin(path: str, arr: np.ndarray) -> None:
+    if not os.path.exists(path):
         np.ascontiguousarray(arr).tofile(path)
 
 
@@ -689,7 +679,6 @@ def _progress(it, show: bool, **kwargs):
 
 def preprocess(
     filename: str,
-    backend=None,
     spatial_ifft: bool = True,
     separate_zf: bool = False,
     split_into_bands: Optional[int] = None,
@@ -718,7 +707,7 @@ def preprocess(
     assert phi_source in ("field_solve", "gkw"), phi_source
     if "Lin" in filename:
         raise ValueError(f"{filename}: linear runs are not converted by preprocess")
-    backend = backend or NumpyBackend()
+    backend = NumpyBackend()
     if root is None:
         raise ValueError("preprocess needs the raw GKW root (root= or $NEUGK_RAW_ROOT)")
     target_dir = root if target_dir is None else target_dir
@@ -914,12 +903,8 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
 
 def preprocess_gyaradax(
     traj_dir: str,
-    backend=None,
     target_dir: Optional[str] = TARGET_DIR,
-    out_name: Optional[str] = None,
     metadata_only: bool = False,
-    verify: bool = True,
-    flux_atol: float = 1.0,
     show_tqdm: bool = False,
     x64: bool = True,
 ) -> str:
@@ -933,9 +918,9 @@ def preprocess_gyaradax(
 
     from neugk_jax.dataset.backend import NumpyBackend
 
-    backend = backend or NumpyBackend()
+    backend = NumpyBackend()
     traj_dir = str(traj_dir)
-    name = out_name or os.path.basename(os.path.normpath(traj_dir))
+    name = os.path.basename(os.path.normpath(traj_dir))
     if target_dir is None:
         raise ValueError("preprocess_gyaradax needs target_dir (or $NEUGK_TARGET_DIR)")
     dir_out = os.path.join(target_dir, KVIKIO_SUBDIR)
@@ -987,7 +972,7 @@ def preprocess_gyaradax(
         df_real = solver_df_to_realspace(d["df"])
         phi, eflux_total = solver(df_real)
         reported = float(d["fluxes"][1])
-        if verify and not np.isclose(eflux_total, reported, rtol=0.0, atol=flux_atol):
+        if not np.isclose(eflux_total, reported, rtol=0.0, atol=1.0):
             warnings.warn(
                 f"{name} step {int(d['step'])}: flux {eflux_total:.4f} != reported "
                 f"{reported:.4f}"

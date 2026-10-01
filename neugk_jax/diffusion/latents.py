@@ -32,11 +32,11 @@ def _tqdm(*args, **kwargs):
 
 
 def latent_cache_path(
-    dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False, timestep_std_filter=None
+    dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False
 ) -> Path:
     """Cache file for a split's latents.
 
-    ``<path>/diff_<split>_latents_offset<o>[_mu][_std<f>]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
+    ``<path>/diff_<split>_latents_offset<o>[_mu]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
     where ``<run>`` is the last ``_`` field of the AE run directory (a checkpoint file resolves
     to its directory).
     """
@@ -50,7 +50,6 @@ def latent_cache_path(
         f"{split}_latents",
         f"offset{dataset.offset}",
         "mu" if decouple_mu else "",
-        f"std{timestep_std_filter}" if timestep_std_filter else "",
         file_hash,
         "latents",
         "ae" + run_dir.split("_")[-1],
@@ -124,7 +123,6 @@ def precompute_latents(
     encode_fn: Callable,
     cache_file: str | Path,
     batch_size: int = 4,
-    overwrite: bool = False,
     meta: Optional[dict] = None,
     latent_shape=None,
 ) -> None:
@@ -141,7 +139,7 @@ def precompute_latents(
     import jax
 
     cache_file = Path(cache_file)
-    if (overwrite or not cache_file.exists()) and jax.process_index() == 0:
+    if not cache_file.exists() and jax.process_index() == 0:
         latents_dict = _encode_all(dataset, encode_fn, batch_size)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = cache_file.with_name(cache_file.name + f".tmp{os.getpid()}")
@@ -195,7 +193,6 @@ def load_precomputed_latents(
     dataset,
     pickle_path: str | Path,
     *,
-    remap: bool = True,
     latent_shape=None,
     meta: Optional[dict] = None,
 ) -> None:
@@ -207,8 +204,8 @@ def load_precomputed_latents(
     (see :func:`check_cache_meta`). The cache is verified against this dataset: every
     indexed ``(fid, t_idx)`` must be present, the scalar conditions it carries must agree
     with the trajectory metadata and the latents must have ``latent_shape`` when given.
-    With ``remap`` a cache keyed by a different file ordering is re-keyed onto this
-    dataset's fids (see :func:`remap_latent_cache`) instead of failing.
+    A cache keyed by a different file ordering is re-keyed onto this dataset's fids
+    (see :func:`remap_latent_cache`) instead of failing.
     """
     p = Path(pickle_path)
     if not p.exists():
@@ -219,8 +216,6 @@ def load_precomputed_latents(
     try:
         verify_latent_cache(dataset, cache)
     except ValueError:
-        if not remap:
-            raise
         cache = remap_latent_cache(dataset, cache)
     verify_latent_cache(dataset, cache, latent_shape=latent_shape)
     dataset.precomputed_latents = cache

@@ -6,7 +6,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import pytest
 
 from neugk_jax.gyroswin.models.gyroswin import GyroSwinMultitask
 from neugk_jax.gyroswin.models.x_layers import FluxDecoder, MixingBlock, VSpaceReduce
@@ -36,11 +35,10 @@ def test_dropout_fn():
     assert 0.3 < float(jnp.mean(y == 0.0)) < 0.7
 
 
-@pytest.mark.parametrize("backend", ["einsum", "flash"])
-def test_self_attention_dropout(backend):
+def test_self_attention_dropout():
     x = jr.normal(jr.PRNGKey(3), (12, 16))
-    attn = MultiHeadSelfAttention(16, 2, key=jr.PRNGKey(0), attn_drop=0.5, backend=backend)
-    base = MultiHeadSelfAttention(16, 2, key=jr.PRNGKey(0), backend=backend)
+    attn = MultiHeadSelfAttention(16, 2, key=jr.PRNGKey(0), attn_drop=0.5)
+    base = MultiHeadSelfAttention(16, 2, key=jr.PRNGKey(0))
     assert _shapes(attn) == _shapes(base)
     assert jnp.allclose(attn(x), base(x))
     _check(lambda k, inf: attn(x, key=k, inference=inf))

@@ -105,6 +105,7 @@ class GyroSwinRunner(BaseRunner):
         x, cond = batch["df"], batch.get("conditioning")
         keys = jr.split(key, x.shape[0])
         preds = jax.vmap(lambda xi, ci, k: model(xi, ci, key=k, inference=False))(x, cond, keys)
+        # next-step targets live on CycloneSample as y_<field> (y_df, y_phi, y_flux, y_fluxavg)
         tgts = {k: batch.get(f"y_{k}") for k in TARGETS}
         ints = None
         if loss_cfg.integrals:

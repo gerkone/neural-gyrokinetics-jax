@@ -1,17 +1,4 @@
-"""Multi-head self-attention used by both Swin and ViT layers.
-
-Operates on flattened token tensors of shape ``(n_tokens, dim)`` per sample.
-Two backends:
-
-* ``"einsum"`` — explicit q/k/v einsum + softmax. Always available.
-* ``"flash"``  — ``jax.nn.dot_product_attention(implementation="cudnn")``
-  which dispatches to cuDNN's flash attention kernel on Hopper/Ampere
-  (falls back to XLA elsewhere). Available in JAX ≥ 0.4.31.
-
-Backend is selected per-module at construction; a free function
-``set_default_attention_backend`` lets benchmarks flip it globally without
-rebuilding the model.
-"""
+"""Multi-head self- and cross-attention on flattened ``(n_tokens, dim)`` tokens per sample."""
 
 from __future__ import annotations
 
@@ -25,28 +12,6 @@ import jax.random as jr
 from neugk_jax.models.embeddings import RPB
 from neugk_jax.models.utils import Gate, Linear, RMSNorm, dropout
 
-_DEFAULT_BACKEND = "einsum"
-
-
-def set_default_attention_backend(backend: str) -> None:
-    global _DEFAULT_BACKEND
-    if backend not in ("einsum", "flash"):
-        raise ValueError(f"unknown attention backend: {backend!r}")
-    _DEFAULT_BACKEND = backend
-
-
-def get_default_attention_backend() -> str:
-    return _DEFAULT_BACKEND
-
-
-def _has_flash() -> bool:
-    return hasattr(jax.nn, "dot_product_attention")
-
-
-def _pick_backend(backend: Optional[str]) -> str:
-    chosen = backend or get_default_attention_backend()
-    return "einsum" if chosen == "flash" and not _has_flash() else chosen
-
 
 def _einsum_attention(q, k, v, scale, bias, attn_drop=0.0, key=None, inference=True):
     # q, k, v: (n, heads, head_dim)
@@ -56,46 +21,6 @@ def _einsum_attention(q, k, v, scale, bias, attn_drop=0.0, key=None, inference=T
     attn = jax.nn.softmax(logits, axis=-1)
     attn = dropout(attn, attn_drop, key=key, inference=inference)
     return jnp.einsum("hnm,mhd->nhd", attn, v)
-
-
-def _dropout_active(rate, key, inference):
-    return rate > 0.0 and key is not None and not inference
-
-
-_FLASH_DTYPES = (jnp.bfloat16, jnp.float16)
-
-
-def _flash_attention(q, k, v, scale, bias):
-    """Wrap ``jax.nn.dot_product_attention`` (expects (B, n, H, D)).
-
-    Falls back to einsum when the dtype is unsupported by cuDNN (fp32, etc.).
-    Inputs are kept in ``(n, H, D)`` layout so the head_dim axis stays
-    stride-1 — cuDNN's flash kernel requires that.
-    """
-    if q.dtype not in _FLASH_DTYPES:
-        return _einsum_attention(q, k, v, scale, bias)
-    N, H, D = q.shape
-    q4 = q[None]
-    k4 = k[None]
-    v4 = v[None]
-    if bias is not None:
-        b = bias
-        if b.ndim == 2:
-            b = jnp.broadcast_to(b, (H, N, N))
-        elif b.ndim == 3 and b.shape[0] == 1:
-            b = jnp.broadcast_to(b, (H, N, N))
-        # force contiguous allocation via astype — cuDNN dislikes views
-        b = jnp.asarray(b, dtype=q.dtype)
-        bias = b[None]
-    out = jax.nn.dot_product_attention(
-        q4,
-        k4,
-        v4,
-        bias=bias,
-        scale=scale,
-        implementation="cudnn",
-    )
-    return out[0]  # drop the added batch dim, back to (n, H, D)
 
 
 class MultiHeadSelfAttention(eqx.Module):
@@ -110,9 +35,6 @@ class MultiHeadSelfAttention(eqx.Module):
       Linear, applied to the attention output.
     * ``attn_drop`` / ``proj_drop`` — dropout on the attention probabilities
       and on the output projection, active only with a key and ``inference=False``.
-
-    Backend selection (``einsum`` / ``flash``) is independent; the einsum path
-    is used whenever attention dropout is active.
     """
 
     qkv: Linear
@@ -124,7 +46,6 @@ class MultiHeadSelfAttention(eqx.Module):
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
     scale: float = eqx.field(static=True)
-    backend: str = eqx.field(static=True)
     attn_drop: float = eqx.field(static=True)
     proj_drop: float = eqx.field(static=True)
 
@@ -139,7 +60,6 @@ class MultiHeadSelfAttention(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         window_size: Optional[tuple[int, ...]] = None,
-        backend: Optional[str] = None,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
     ):
@@ -158,7 +78,6 @@ class MultiHeadSelfAttention(eqx.Module):
         else:
             self.rpb = None
         self.gate = Gate(self.head_dim, key=kgate) if gated_attention else None
-        self.backend = _pick_backend(backend)
         self.attn_drop = attn_drop
         self.proj_drop = proj_drop
 
@@ -183,10 +102,7 @@ class MultiHeadSelfAttention(eqx.Module):
             rpb_bias = self.rpb()  # shape: (heads, sl, sl)
             attn_bias = rpb_bias if attn_bias is None else attn_bias + rpb_bias
         ka, kp = (None, None) if key is None else jr.split(key)
-        if self.backend == "flash" and not _dropout_active(self.attn_drop, ka, inference):
-            out = _flash_attention(q, k, v, self.scale, attn_bias)
-        else:
-            out = _einsum_attention(q, k, v, self.scale, attn_bias, self.attn_drop, ka, inference)
+        out = _einsum_attention(q, k, v, self.scale, attn_bias, self.attn_drop, ka, inference)
         # out: (n, H, D); apply optional headwise gate before flattening to (n, dim)
         if self.gate is not None:
             out = self.gate(out, q)
@@ -209,7 +125,6 @@ class MultiHeadCrossAttention(eqx.Module):
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
     scale: float = eqx.field(static=True)
-    backend: str = eqx.field(static=True)
     attn_drop: float = eqx.field(static=True)
     proj_drop: float = eqx.field(static=True)
 
@@ -222,7 +137,6 @@ class MultiHeadCrossAttention(eqx.Module):
         key,
         out_dim: Optional[int] = None,
         qkv_bias: bool = False,
-        backend: Optional[str] = None,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
     ):
@@ -235,7 +149,6 @@ class MultiHeadCrossAttention(eqx.Module):
         self.q = Linear(q_dim, q_dim, key=kq, use_bias=qkv_bias)
         self.kv = Linear(kv_dim, 2 * q_dim, key=kkv, use_bias=qkv_bias)
         self.proj = Linear(q_dim, out_dim, key=kp, use_bias=True)
-        self.backend = _pick_backend(backend)
         self.attn_drop = attn_drop
         self.proj_drop = proj_drop
 
@@ -249,9 +162,6 @@ class MultiHeadCrossAttention(eqx.Module):
         k = kv[:, 0]
         v = kv[:, 1]
         ka, kp = (None, None) if key is None else jr.split(key)
-        if self.backend == "flash" and not _dropout_active(self.attn_drop, ka, inference):
-            out = _flash_attention(q, k, v, self.scale, None)
-        else:
-            out = _einsum_attention(q, k, v, self.scale, None, self.attn_drop, ka, inference)
+        out = _einsum_attention(q, k, v, self.scale, None, self.attn_drop, ka, inference)
         out = out.reshape(n_q, -1)
         return dropout(self.proj(out), self.proj_drop, key=kp, inference=inference)

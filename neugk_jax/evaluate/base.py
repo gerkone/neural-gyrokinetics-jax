@@ -84,12 +84,12 @@ def integrate(geom, fids, df, phi=None, *, real_potens: bool = True):
     return jax.vmap(lambda gi, d, p: flux_integral(gi, d, p, real_potens=real_potens))(g, df, phi)
 
 
-def accumulate(acc: dict, values: Mapping[str, jnp.ndarray], weight, count_key: str = "_n") -> dict:
+def accumulate(acc: dict, values: Mapping[str, jnp.ndarray], weight) -> dict:
     """Add the ``weight``-masked per-sample ``values`` and the weight total into ``acc``."""
     out = dict(acc)
     for k, v in values.items():
         out[k] = acc[k] + jnp.sum(v * weight)
-    out[count_key] = acc[count_key] + jnp.sum(weight)
+    out["_n"] = acc["_n"] + jnp.sum(weight)
     return out
 
 

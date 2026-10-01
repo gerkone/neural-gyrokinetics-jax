@@ -38,7 +38,7 @@ def _traj_id(path: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def _sample_decode(dit, ae, key, cond, n, steps, latent_scale, method):
+def _sample_decode(dit, ae, key, cond, n, steps, latent_scale):
     z = euler_sample(
         lambda x, t, c=None: dit(x, t, c),
         key=key,
@@ -46,26 +46,15 @@ def _sample_decode(dit, ae, key, cond, n, steps, latent_scale, method):
         cond=cond,
         steps=steps,
         latent_scale=latent_scale,
-        method=method,
     )
     return jax.vmap(lambda zi: ae.decode(zi)["df"])(z)
 
 
 @eqx.filter_jit
-def sample_and_decode(
-    dit, ae, key, cond, n: int, steps: int = 50, latent_scale: float = 1.0, method: str = "euler"
-):
-    count_trace("sample_and_decode")
-    return _sample_decode(dit, ae, key, cond, n, steps, latent_scale, method)
-
-
-@eqx.filter_jit
-def diffusion_eval_step(
-    dit, ae, key, batch, acc, denorm, geom, steps: int, latent_scale: float, method: str
-):
+def diffusion_eval_step(dit, ae, key, batch, acc, denorm, geom, steps: int, latent_scale: float):
     count_trace("diffusion_eval_step")
     x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
-    pred = _sample_decode(dit, ae, key, batch.get("cond"), x.shape[0], steps, latent_scale, method)
+    pred = _sample_decode(dit, ae, key, batch.get("cond"), x.shape[0], steps, latent_scale)
     pred_d, tgt_d = denorm("df", pred, fids), denorm("df", x, fids)
     values = {
         "df_mse": per_sample_mse(pred, x),
@@ -99,7 +88,6 @@ class DiffusionEvaluator(BaseEvaluator):
         n_samples: Optional[int] = None,
         stride: Optional[int] = None,
         max_batches: Optional[int] = None,
-        method: str = "euler",
         **kwargs,
     ):
         vcfg = (cfg.get("validation") if hasattr(cfg, "get") else None) or {}
@@ -117,7 +105,6 @@ class DiffusionEvaluator(BaseEvaluator):
         self.cond_slots = cond_slots
         self.steps = int(steps or self.vcfg.get("eval_sample_steps", 50))
         self.n_samples = int(n_samples or self.vcfg.get("eval_n_samples", 1))
-        self.method = method
         self.eval_integrals = bool(self.vcfg.get("eval_integrals", True))
         self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
         self.metric_keys = ("df_mse", "df_rel_l2")
@@ -154,7 +141,6 @@ class DiffusionEvaluator(BaseEvaluator):
                     geom,
                     self.steps,
                     self.latent_scale,
-                    self.method,
                 )
                 if eflux is not None:
                     fluxes.append((fids, plan.mask, eflux))
