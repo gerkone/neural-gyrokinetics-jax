@@ -193,13 +193,13 @@ def test_weight_schedule_does_not_retrace(cyclone_dir, monkeypatch):
     from neugk_jax.utils import TRACE_COUNTS
 
     calls = []
-    orig = runner_mod.gyroswin_loss
+    orig = runner_mod.compute_multi_task_loss
 
     def counting(*args, **kwargs):
         calls.append(1)
         return orig(*args, **kwargs)
 
-    monkeypatch.setattr(runner_mod, "gyroswin_loss", counting)
+    monkeypatch.setattr(runner_mod, "compute_multi_task_loss", counting)
     sched = {
         "phi": {
             "type": "linear",

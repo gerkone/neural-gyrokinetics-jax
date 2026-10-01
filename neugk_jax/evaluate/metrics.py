@@ -127,7 +127,7 @@ def metrics_from_spectral_sums(sums: Dict[str, np.ndarray]) -> Dict[str, float]:
         out[f"{key}_pc"] = float(_pearson(p, g))
         out[f"{key}_sc"] = float(_spearman(p, g))
         out[f"{key}_l1"] = float(np.abs(p - g).sum())
-        out[f"{key}_rl2"] = float(np.linalg.norm(p - g) / (np.linalg.norm(g) + 1e-12))
+        out[f"{key}_rl2"] = _rl2(p, g)
         out[f"{key}_rl1"] = float(np.abs(p - g).sum() / (np.abs(g).sum() + 1e-12))
         pn, gn = p / (p.sum() + 1e-12), g / (g.sum() + 1e-12)
         out[f"{key}_wd"] = float(_wasserstein_1d(pn, gn))

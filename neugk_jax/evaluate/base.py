@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from neugk_jax.evaluate.integrals import flux_integral, precompute_geometry, require_geometry
+from neugk_jax.losses import per_sample_mse, per_sample_rel_l2
 from neugk_jax.training.data import BatchLoader, eval_plans
 from neugk_jax.training.ddp import (
     DistributedInfo,
@@ -23,6 +24,11 @@ from neugk_jax.training.ddp import (
     shard_local,
 )
 from neugk_jax.utils import config_dict, recombine_zf
+
+
+def validation_cfg(cfg) -> dict:
+    """The ``validation`` section of a run config as a plain dict."""
+    return config_dict(cfg.get("validation")) if hasattr(cfg, "get") else {}
 
 
 def geometry_table(ds, fids: Optional[Sequence[int]] = None) -> dict[str, np.ndarray]:
@@ -36,13 +42,12 @@ def geometry_table(ds, fids: Optional[Sequence[int]] = None) -> dict[str, np.nda
     return {k: np.stack([g[k] for g in geoms]) for k in geoms[0]}
 
 
-def per_sample_mse(p, t):
-    return jnp.mean((p - t).reshape(p.shape[0], -1) ** 2, axis=-1)
-
-
-def per_sample_rel_l2(p, t, eps: float = 1e-12):
-    p, t = p.reshape(p.shape[0], -1), t.reshape(t.shape[0], -1)
-    return jnp.linalg.norm(p - t, axis=-1) / (jnp.linalg.norm(t, axis=-1) + eps)
+def recon_metrics(pred, x, pred_d, tgt_d) -> dict:
+    """``df_mse`` of the normalized pair and ``df_rel_l2`` of the denormalized, zf-recombined pair."""
+    return {
+        "df_mse": per_sample_mse(pred, x),
+        "df_rel_l2": per_sample_rel_l2(recombine_zf(pred_d, axis=1), recombine_zf(tgt_d, axis=1)),
+    }
 
 
 def integrate(geom, fids, df, phi=None):
@@ -82,13 +87,15 @@ class BaseEvaluator:
         max_batches: Optional[int] = None,
     ):
         self.cfg = cfg
-        self.vcfg = config_dict(cfg.get("validation")) if hasattr(cfg, "get") else {}
+        self.vcfg = validation_cfg(cfg)
         self.ds = val_ds
         self.dist = dist or init_distributed()
         self.batch_size = int(batch_size) * self.dist.local_device_count
         self.loader = loader or BatchLoader()
         idx = range(len(val_ds)) if indices is None else indices
-        self.plans = eval_plans(self.dist, idx, self.batch_size, max_batches)
+        self.plans = eval_plans(
+            self.dist, idx, self.batch_size, max_batches, val_ds.flat_index_to_file_and_tstep
+        )
         self.norm = replicate_local(self.dist, val_ds.norm)
         self._geometry = None
 
@@ -108,11 +115,26 @@ class BaseEvaluator:
     def local_model(self, model):
         return local_view(self.dist, model)
 
-    def zeros(self, keys: Sequence[str]) -> dict:
-        return replicate_local(self.dist, {k: jnp.zeros((), jnp.float32) for k in keys})
+    def zeros(self, keys: Sequence[str], shape: tuple = ()) -> dict:
+        return replicate_local(self.dist, {k: jnp.zeros(shape, jnp.float32) for k in keys})
 
     def reduce(self, acc: dict) -> dict[str, float]:
         return self.sum_processes({k: float(v) for k, v in jax.device_get(acc).items()})
+
+    def finalize(self, sums: Mapping[str, float], keys: Sequence[str]) -> dict[str, float]:
+        """Per-sample means of the accumulated ``keys`` (``_n`` holds the sample count)."""
+        return {k: sums[k] / max(sums["_n"], 1.0) for k in keys}
+
+    def spectra(self, store: dict, pred_d, tgt_d, plan) -> None:
+        """Add the plan's per-trajectory spectral sums of a denormalized pair into ``store``."""
+        from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
+
+        accumulate_spectral_diagnostics(store, pred_d, tgt_d, plan.fids, self.ds, plan.mask > 0)
+
+    @staticmethod
+    def plot_time(batch) -> np.ndarray:
+        """Time of the first batch row, the plotted snapshot."""
+        return np.asarray(jax.device_get(batch["timestep"][:1])).reshape(-1)
 
     def spectra_available(self, requested: bool) -> bool:
         """``requested`` unless a validation trajectory's metadata lacks the ``ds`` spacing."""

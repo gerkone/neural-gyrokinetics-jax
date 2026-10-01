@@ -6,7 +6,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Optional, Sequence
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -16,11 +16,14 @@ from neugk_jax.training.ddp import DistributedInfo, eval_batch_owner, process_ba
 
 @dataclass(frozen=True)
 class BatchPlan:
-    """Sample indices of one batch, a validity mask, and its global batch number."""
+    """Sample indices of one batch, a validity mask, its global batch number and, for
+    dataset batches, the ``(file index, timestep index)`` of every row."""
 
     indices: np.ndarray
     mask: np.ndarray
     number: int
+    fids: Optional[np.ndarray] = None
+    t_idx: Optional[np.ndarray] = None
 
 
 def train_plans(
@@ -40,8 +43,12 @@ def eval_plans(
     indices: Sequence[int],
     batch_size: int,
     max_batches: Optional[int] = None,
+    index: Optional[Mapping[int, tuple[int, int]]] = None,
 ) -> list[BatchPlan]:
-    """Fixed-size batches over ``indices`` owned by this process; the last one is padded and masked."""
+    """Fixed-size batches over ``indices`` owned by this process; the last one is padded and masked.
+
+    ``index`` (flat index -> ``(fid, t_idx)``) fills the plans' ``fids`` and ``t_idx``.
+    """
     indices = np.asarray(indices, dtype=np.int64)
     n_batches = -(-len(indices) // batch_size)
     if max_batches is not None:
@@ -54,7 +61,10 @@ def eval_plans(
         mask = np.zeros(batch_size, np.float32)
         mask[: len(sel)] = 1.0
         sel = np.concatenate([sel, np.full(batch_size - len(sel), sel[-1])])
-        plans.append(BatchPlan(sel, mask, b))
+        fids = t_idx = None
+        if index is not None:
+            fids, t_idx = (np.asarray(a) for a in zip(*(index[int(i)] for i in sel)))
+        plans.append(BatchPlan(sel, mask, b, fids, t_idx))
     return plans
 
 

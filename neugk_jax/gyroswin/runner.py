@@ -12,17 +12,9 @@ from neugk_jax.evaluate.base import geometry_table
 from neugk_jax.losses import integral_losses
 from neugk_jax.training.build import build_gyroswin
 from neugk_jax.training.data import stack_fields
-from neugk_jax.training.loss_scheduler import LossConfig, compute_multi_task_loss
+from neugk_jax.training.loss_scheduler import DATA_LOSSES, LossConfig, compute_multi_task_loss
 from neugk_jax.training.runner import BaseRunner
 from neugk_jax.utils import config_dict
-
-TARGETS = ("df", "phi", "flux", "fluxavg")
-
-
-def gyroswin_loss(preds, tgts, weights, loss_cfg, *, integrals=None, separate_zf_loss=False):
-    return compute_multi_task_loss(
-        preds, tgts, weights, loss_cfg.active, extra=integrals, separate_zf_loss=separate_zf_loss
-    )
 
 
 def model_conditions(cfg) -> tuple:
@@ -93,7 +85,8 @@ class GyroSwinRunner(BaseRunner):
 
     def load_batch(self, ds, indices, read) -> dict:
         batch = stack_fields(
-            read(ds, indices), ("df", "conditioning", "file_index", *(f"y_{k}" for k in TARGETS))
+            read(ds, indices),
+            ("df", "conditioning", "file_index", *(f"y_{k}" for k in DATA_LOSSES)),
         )
         if self.loss_cfg.integrals:
             batch["geom"] = self.geometry(np.asarray(batch["file_index"]))
@@ -105,7 +98,7 @@ class GyroSwinRunner(BaseRunner):
         keys = jr.split(key, x.shape[0])
         preds = jax.vmap(lambda xi, ci, k: model(xi, ci, key=k, inference=False))(x, cond, keys)
         # next-step targets live on CycloneSample as y_<field> (y_df, y_phi, y_flux, y_fluxavg)
-        tgts = {k: batch.get(f"y_{k}") for k in TARGETS}
+        tgts = {k: batch.get(f"y_{k}") for k in DATA_LOSSES}
         ints = None
         if loss_cfg.integrals:
             norm, fids = batch["norm"].denormalize, batch["file_index"]
@@ -116,12 +109,12 @@ class GyroSwinRunner(BaseRunner):
                 norm("phi", tgts["phi"], fids),
                 norm("flux", tgts["flux"], fids),
             )
-        return gyroswin_loss(
+        return compute_multi_task_loss(
             preds,
             tgts,
             batch["weights"],
-            loss_cfg,
-            integrals=ints,
+            loss_cfg.active,
+            extra=ints,
             separate_zf_loss=self.separate_zf_loss,
         )
 

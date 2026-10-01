@@ -10,50 +10,43 @@ optional ``phi_int`` (MSE of the integrated phi) and ``flux_int_rel_err``
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Optional, Sequence
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.evaluate.base import BaseEvaluator, integrate, per_sample_mse, per_sample_rel_l2
+from neugk_jax.evaluate.base import BaseEvaluator, integrate
+from neugk_jax.losses import per_sample_mse, per_sample_rel_l2, per_sample_rel_norm_mse, rel_err
 from neugk_jax.training.data import stack_fields
-from neugk_jax.training.ddp import replicate_local
-from neugk_jax.utils import count_trace, recombine_zf
+from neugk_jax.training.loss_scheduler import DATA_LOSSES
+from neugk_jax.utils import recombine_zf, traced_jit
 
-TARGETS = ("df", "phi", "flux", "fluxavg")
-
-
-def _rel_norm_mse(p, y, eps: float = 1e-4):
-    p, y = p.reshape(p.shape[0], -1), y.reshape(y.shape[0], -1)
-    return jnp.sum((p - y) ** 2, -1) / (jnp.sum(y**2, -1) + eps)
+# outputs the integrated heat flux is checked against
+INTEGRAL_OUTPUTS = {"df", "phi", "flux"}
 
 
-@eqx.filter_jit
+@traced_jit("gyroswin_eval_step")
 def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, norm, geom, fields):
     """One rollout step; adds the ``live``-masked metric sums at row ``t`` of ``acc``."""
-    count_trace("gyroswin_eval_step")
     preds = jax.vmap(lambda xi, ci: model(xi, ci, inference=True))(x, cond)
     pred_d = {k: norm.denormalize(k, preds[k], fids) for k in fields}
     tgt_d = {k: norm.denormalize(k, tgt[k].reshape(preds[k].shape), fids) for k in fields}
     if "df" in fields:
-        pred_d["df"], tgt_d["df"] = (
-            recombine_zf(pred_d["df"], axis=1),
-            recombine_zf(tgt_d["df"], axis=1),
-        )
+        pred_d["df"] = recombine_zf(pred_d["df"], axis=1)
+        tgt_d["df"] = recombine_zf(tgt_d["df"], axis=1)
     values = {}
     for k in fields:
         if k in ("df", "phi"):
-            values[k] = _rel_norm_mse(pred_d[k], tgt_d[k])
+            values[k] = per_sample_rel_norm_mse(pred_d[k], tgt_d[k])
             values[f"{k}_rel_l2"] = per_sample_rel_l2(pred_d[k], tgt_d[k])
         else:
             values[k] = per_sample_mse(pred_d[k], tgt_d[k])
     if geom is not None:
         phi_i, (_, eflux, _) = integrate(geom, fids, pred_d["df"], pred_d["phi"])
-        flux = tgt_d["flux"].reshape(-1)
         values["phi_int"] = per_sample_mse(phi_i, tgt_d["phi"].reshape(phi_i.shape))
-        values["flux_int_rel_err"] = jnp.abs(eflux - flux) / (jnp.abs(flux) + 1e-12)
+        values["flux_int_rel_err"] = rel_err(eflux, tgt_d["flux"].reshape(-1))
     out = {k: acc[k].at[t].add(jnp.sum(v * live)) for k, v in values.items()}
     out["_n"] = acc["_n"].at[t].add(jnp.sum(live))
     return preds["df"], out, pred_d, tgt_d
@@ -67,12 +60,14 @@ class GyroSwinEvaluator(BaseEvaluator):
         ds = self.ds
         self.n_eval = int(self.vcfg.get("n_eval_steps", 1))
         outputs = tuple(outputs or ("df", "phi"))
-        self.fields = tuple(k for k in TARGETS if k in outputs)
-        self.eval_integrals = bool(self.vcfg.get("eval_integrals", False)) and set(outputs) == {
-            "df",
-            "phi",
-            "flux",
-        }
+        self.fields = tuple(k for k in DATA_LOSSES if k in outputs)
+        self.eval_integrals = bool(self.vcfg.get("eval_integrals", False))
+        if self.eval_integrals and set(outputs) != INTEGRAL_OUTPUTS:
+            warnings.warn(
+                f"validation.eval_integrals needs the outputs {sorted(INTEGRAL_OUTPUTS)}, the "
+                f"model predicts {sorted(outputs)}; skipping the integral metrics"
+            )
+            self.eval_integrals = False
         self.t_slot = ds.conditions.index("timestep") if "timestep" in ds.conditions else None
         names = []
         for k in self.fields:
@@ -82,7 +77,7 @@ class GyroSwinEvaluator(BaseEvaluator):
     def load(self, ds, indices, read):
         return stack_fields(
             read(ds, indices),
-            ("df", "conditioning", "file_index", "timestep", *(f"y_{k}" for k in TARGETS)),
+            ("df", "conditioning", "file_index", "timestep", *(f"y_{k}" for k in DATA_LOSSES)),
         )
 
     def _targets(self, fids, t0, t, steps) -> dict:
@@ -94,14 +89,10 @@ class GyroSwinEvaluator(BaseEvaluator):
         ds, n_eval = self.ds, self.n_eval
         model = self.local_model(model)
         geom = self.geometry if self.eval_integrals else None
-        acc = replicate_local(
-            self.dist, {k: jnp.zeros((n_eval,), jnp.float32) for k in (*self.names, "_n")}
-        )
+        acc = self.zeros((*self.names, "_n"), (n_eval,))
         plots: dict[str, Any] = {}
         for plan, batch, _ in self.loader.iterate(ds, self.plans, self.load, self.place):
-            ft = [ds.flat_index_to_file_and_tstep[int(i)] for i in plan.indices]
-            fids = np.asarray([f for f, _ in ft])
-            t0 = np.asarray([t for _, t in ft])
+            fids, t0 = plan.fids, plan.t_idx
             steps = np.minimum(n_eval, np.asarray([ds.num_ts(f) for f in fids]) - t0 - 1)
             x, cond = batch["df"], batch.get("conditioning")
             # next-step targets live on CycloneSample as y_<field>
@@ -111,8 +102,8 @@ class GyroSwinEvaluator(BaseEvaluator):
                     tgt = self.place(self._targets(fids, t0, t, steps))
                 if self.t_slot is not None:
                     ts = np.asarray([ds.get_timestep(f, ti + t) for f, ti in zip(fids, t0)])
-                    cond = cond.at[:, self.t_slot].set(self.place({"ts": ts})["ts"])
-                live = self.place({"m": (plan.mask * (steps > t)).astype(np.float32)})["m"]
+                    cond = cond.at[:, self.t_slot].set(self.place(ts))
+                live = self.place((plan.mask * (steps > t)).astype(np.float32))
                 x, acc, pred_d, tgt_d = gyroswin_eval_step(
                     model,
                     x,
@@ -145,11 +136,9 @@ class GyroSwinEvaluator(BaseEvaluator):
                 metrics[k] = float(np.mean(per_step))
         return metrics, plots
 
-    @staticmethod
-    def _plots(pred_d, tgt_d, batch) -> dict[str, Any]:
+    def _plots(self, pred_d, tgt_d, batch) -> dict[str, Any]:
         from neugk_jax.evaluate.plots import generate_val_plots
 
         roll = {k: pred_d[k][0] for k in ("df", "phi") if k in pred_d}
         gt = {k: tgt_d[k][0] for k in ("df", "phi") if k in tgt_d}
-        ts = np.asarray(jax.device_get(batch["timestep"][:1])).reshape(-1)
-        return generate_val_plots(rollout=roll, gt=gt, phase="random draw", ts=ts)
+        return generate_val_plots(roll, gt, "random draw", ts=self.plot_time(batch))

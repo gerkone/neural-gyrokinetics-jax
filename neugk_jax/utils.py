@@ -3,10 +3,12 @@ separate/recombine zonal flow, running stats."""
 
 from __future__ import annotations
 
+import functools
 import os
 from collections import Counter
 from typing import Callable
 
+import equinox as eqx
 import numpy as np
 from omegaconf import OmegaConf
 
@@ -16,6 +18,20 @@ TRACE_COUNTS: Counter = Counter()
 
 def count_trace(name: str) -> None:
     TRACE_COUNTS[name] += 1
+
+
+def traced_jit(name: str, **jit_kwargs):
+    """``eqx.filter_jit`` that counts every trace of the function under ``name``."""
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def traced(*args, **kwargs):
+            count_trace(name)
+            return fn(*args, **kwargs)
+
+        return eqx.filter_jit(traced, **jit_kwargs)
+
+    return deco
 
 
 def config_dict(cfg) -> dict:

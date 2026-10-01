@@ -1,4 +1,4 @@
-"""Loss functions: relative-norm MSE, L1 and the physics-integral losses."""
+"""Per-sample error metrics shared by the losses and the evaluators, and the training losses."""
 
 from __future__ import annotations
 
@@ -8,19 +8,35 @@ import jax
 import jax.numpy as jnp
 
 
-def relative_norm_mse(pred: jnp.ndarray, target: jnp.ndarray, eps: float = 1e-4) -> jnp.ndarray:
-    """``mean_b ||pred - target||² / (||target||² + eps)``.
+def _flat(x):
+    return x.reshape(x.shape[0], -1)
 
-    Batch axis 0 is preserved as the reduction axis; everything else flattened.
-    Lands in the 1-10 range when target is z-scored unit-variance.
-    """
+
+def per_sample_mse(p, t):
+    return jnp.mean(_flat(p - t) ** 2, axis=-1)
+
+
+def per_sample_rel_l2(p, t, eps: float = 1e-12):
+    return jnp.linalg.norm(_flat(p - t), axis=-1) / (jnp.linalg.norm(_flat(t), axis=-1) + eps)
+
+
+def per_sample_rel_norm_mse(p, t, eps: float = 1e-4):
+    """``||p - t||² / (||t||² + eps)`` per sample (batch axis 0)."""
+    return jnp.sum(_flat(p - t) ** 2, axis=-1) / (jnp.sum(_flat(t) ** 2, axis=-1) + eps)
+
+
+def rel_err(p, t, eps: float = 1e-12):
+    return jnp.abs(p - t) / (jnp.abs(t) + eps)
+
+
+def masked_mean(values, mask):
+    return jnp.sum(values * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+
+def relative_norm_mse(pred: jnp.ndarray, target: jnp.ndarray, eps: float = 1e-4) -> jnp.ndarray:
+    """Batch mean of :func:`per_sample_rel_norm_mse`; 1-10 when the target is z-scored."""
     assert pred.shape == target.shape, f"shape mismatch {pred.shape} != {target.shape}"
-    if pred.ndim > 1:
-        pred = pred.reshape(pred.shape[0], -1)
-        target = target.reshape(target.shape[0], -1)
-    diff_sq = jnp.sum((pred - target) ** 2, axis=-1)
-    tgt_sq = jnp.sum(target**2, axis=-1)
-    return jnp.mean(diff_sq / (tgt_sq + eps))
+    return jnp.mean(per_sample_rel_norm_mse(pred, target, eps))
 
 
 def df_loss(pred: jnp.ndarray, target: jnp.ndarray, *, separate_zf: bool = False) -> jnp.ndarray:
@@ -31,8 +47,7 @@ def df_loss(pred: jnp.ndarray, target: jnp.ndarray, *, separate_zf: bool = False
     """
     if separate_zf and pred.shape[1] >= 4:
         zf_loss = jnp.mean((pred[:, :2] - target[:, :2]) ** 2)
-        other_loss = relative_norm_mse(pred[:, 2:], target[:, 2:])
-        return zf_loss + other_loss
+        return zf_loss + relative_norm_mse(pred[:, 2:], target[:, 2:])
     return relative_norm_mse(pred, target)
 
 

@@ -22,6 +22,8 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
+from neugk_jax.losses import masked_mean, per_sample_mse
+
 
 def sample_prior(key, shape, dtype=jnp.float32):
     return jr.normal(key, shape, dtype=dtype)
@@ -97,8 +99,7 @@ def fm_forward_loss(
     pred = jax.vmap(model_fn)(*args)
     if mask is None:
         return jnp.mean((pred - target_v) ** 2)
-    per_sample = jnp.mean(((pred - target_v) ** 2).reshape(bs, -1), axis=-1)
-    return jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+    return masked_mean(per_sample_mse(pred, target_v), mask)
 
 
 def euler_sample(

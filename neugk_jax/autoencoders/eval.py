@@ -10,40 +10,27 @@ from __future__ import annotations
 
 from typing import Any
 
-import equinox as eqx
 import jax
-import jax.numpy as jnp
-import numpy as np
 
-from neugk_jax.evaluate.base import (
-    BaseEvaluator,
-    accumulate,
-    integrate,
-    per_sample_mse,
-    per_sample_rel_l2,
-)
+from neugk_jax.evaluate.base import BaseEvaluator, accumulate, integrate, recon_metrics
+from neugk_jax.losses import per_sample_mse, per_sample_rel_l2, rel_err
 from neugk_jax.training.data import stack_fields
-from neugk_jax.utils import count_trace, recombine_zf
+from neugk_jax.utils import traced_jit
 
 
-@eqx.filter_jit
+@traced_jit("ae_target_integrals")
 def target_integrals(x, fids, norm, geom):
-    count_trace("ae_target_integrals")
     phi, (_, eflux, _) = integrate(geom, fids, norm.denormalize("df", x, fids))
     return phi, eflux
 
 
-@eqx.filter_jit
+@traced_jit("ae_eval_step")
 def ae_eval_step(model, batch, acc, norm, geom, tgt_int):
     """Reconstruct one batch, add its masked metric sums to ``acc``; returns the denormalized pair."""
-    count_trace("ae_eval_step")
     x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
     pred = jax.vmap(lambda xi: model(xi, inference=True)["df"])(x)
     pred_d, tgt_d = norm.denormalize("df", pred, fids), norm.denormalize("df", x, fids)
-    values = {
-        "df_mse": per_sample_mse(pred, x),
-        "df_rel_l2": per_sample_rel_l2(recombine_zf(pred_d, axis=1), recombine_zf(tgt_d, axis=1)),
-    }
+    values = recon_metrics(pred, x, pred_d, tgt_d)
     phi = None
     if tgt_int is not None:
         phi_t, eflux_t = tgt_int
@@ -51,7 +38,7 @@ def ae_eval_step(model, batch, acc, norm, geom, tgt_int):
         values["phi_int_mse"] = per_sample_mse(phi, phi_t)
         values["phi_int_rel_l2"] = per_sample_rel_l2(phi, phi_t)
         values["flux_int_mse"] = (eflux - eflux_t) ** 2
-        values["flux_int_rel_err"] = jnp.abs(eflux - eflux_t) / (jnp.abs(eflux_t) + 1e-12)
+        values["flux_int_rel_err"] = rel_err(eflux, eflux_t)
     return accumulate(acc, values, mask), pred_d, tgt_d, phi
 
 
@@ -88,32 +75,18 @@ class AEEvaluator(BaseEvaluator):
                 tgt_int = self.place(self._tgt_int[plan.number])
             acc, pred_d, tgt_d, phi = ae_eval_step(model, batch, acc, self.norm, geom, tgt_int)
             if self.eval_spectra:
-                self._spectra(spectra, pred_d, tgt_d, plan)
+                self.spectra(spectra, pred_d, tgt_d, plan)
             if plan.number == 0 and self.is_rank0:
                 plots = self._plots(pred_d, tgt_d, phi, tgt_int, batch)
-        sums = self.reduce(acc)
-        metrics = {k: sums[k] / max(sums["_n"], 1.0) for k in self.metric_keys}
+        metrics = self.finalize(self.reduce(acc), self.metric_keys)
         if self.eval_spectra:
             metrics.update(self.spectral_metrics(spectra))
         return metrics, plots
 
-    def _spectra(self, store, pred_d, tgt_d, plan) -> None:
-        from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-
-        accumulate_spectral_diagnostics(
-            store, pred_d, tgt_d, plan_fids(self.ds, plan), self.ds, valid=plan.mask > 0
-        )
-
-    @staticmethod
-    def _plots(pred_d, tgt_d, phi, tgt_int, batch) -> dict[str, Any]:
+    def _plots(self, pred_d, tgt_d, phi, tgt_int, batch) -> dict[str, Any]:
         from neugk_jax.evaluate.plots import generate_val_plots
 
         rollout, gt = {"df": pred_d[0]}, {"df": tgt_d[0]}
         if phi is not None:
             rollout["phi"], gt["phi"] = phi[0], tgt_int[0][0]
-        ts = np.asarray(jax.device_get(batch["timestep"][:1])).reshape(-1)
-        return generate_val_plots(rollout=rollout, gt=gt, phase="random draw", ts=ts)
-
-
-def plan_fids(ds, plan) -> np.ndarray:
-    return np.asarray([ds.flat_index_to_file_and_tstep[int(i)][0] for i in plan.indices])
+        return generate_val_plots(rollout, gt, "random draw", ts=self.plot_time(batch))
