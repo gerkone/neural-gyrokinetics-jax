@@ -20,11 +20,7 @@ from einops import rearrange
 from neugk_jax.models.attention import MultiHeadCrossAttention
 from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.swin import Film, _DropPath
-from neugk_jax.models.utils import MLP, LayerNorm, Linear, dropout, gelu
-
-
-def _split(key, n):
-    return [None] * n if key is None else list(jr.split(key, n))
+from neugk_jax.models.utils import MLP, LayerNorm, Linear, dropout, gelu, split_key
 
 
 def _pool_attention(q, k, v, scale, attn_drop, key, inference):
@@ -80,7 +76,7 @@ class MixingBlock(eqx.Module):
         l_shape = left.shape
         l_tok = left.reshape(-1, l_shape[-1])
         r_tok = right.reshape(-1, right.shape[-1])
-        k_attn, k_dp1, k_mlp, k_dp2 = _split(key, 4)
+        k_attn, k_dp1, k_mlp, k_dp2 = split_key(key, 4)
         # post-norm on the attn output, pre-norm on the mlp branch
         h = self.norm1(self.attn(l_tok, r_tok, key=k_attn, inference=inference))
         x = l_tok + self.drop_path(h, key=k_dp1, inference=inference)
@@ -181,7 +177,7 @@ class LatentMixingTransformer(eqx.Module):
                  inference: bool = True) -> jnp.ndarray:
         c = self.cond_embed(cond) if self.cond_embed is not None else None
         x = left
-        for i, (blk, k) in enumerate(zip(self.blocks, _split(key, len(self.blocks)))):
+        for i, (blk, k) in enumerate(zip(self.blocks, split_key(key, len(self.blocks)))):
             if c is not None:
                 x = self.conditioning[i](x, c)
             x = blk(x, right, key=k, inference=inference)
@@ -235,7 +231,7 @@ class FluxDecoder(eqx.Module):
             inference: bool = True) -> jnp.ndarray:
         if self.detach_latents:
             left, right = jax.lax.stop_gradient(left), jax.lax.stop_gradient(right)
-        k_mix, k_red = _split(key, 2)
+        k_mix, k_red = split_key(key, 2)
         x = self.blocks[i](left, right, cond if self.use_cond else None, key=k_mix,
                            inference=inference)
         if self.reduction == "integral":

@@ -12,6 +12,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 sys.path.insert(0, _ROOT)
 sys.path.append(os.environ.get("NEUGK_TORCH_REPO", os.path.dirname(_ROOT)))
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -19,6 +20,8 @@ import torch
 from omegaconf import OmegaConf
 
 from neugk_jax.translate import build_ae_from_config, load_torch_state, translate_ae
+
+jax.config.update("jax_default_matmul_precision", "highest")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("name", nargs="?", default="AE_noCond")

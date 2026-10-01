@@ -118,7 +118,7 @@ class _DropPath(eqx.Module):
     def __init__(self, rate: float = 0.0):
         self.rate = rate
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
         if inference or self.rate == 0.0 or key is None:
             return x
         keep = 1.0 - self.rate
@@ -189,7 +189,7 @@ class SwinBlock(eqx.Module):
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
         """SwinV2 post-norm forward (single residual).
 
         ``forward_part1`` runs attention on the un-normed input and applies
@@ -291,7 +291,7 @@ class DiTSwinBlock(eqx.Module):
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=False) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=True) -> jnp.ndarray:
         spatial = x.shape[:-1]
         # order: (scale1, shift1, gate1, scale2, shift2, gate2) from DiTModulation
         scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = self.mod(cond)
@@ -395,7 +395,7 @@ class SwinLayer(eqx.Module):
         self.use_checkpoint = use_checkpoint
         self.act_fn = act_fn
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
             call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
@@ -467,7 +467,7 @@ class DiTSwinLayer(eqx.Module):
         self.use_checkpoint = use_checkpoint
         self.act_fn = act_fn
 
-    def __call__(self, x, condition, *, key=None, inference=False):
+    def __call__(self, x, condition, *, key=None, inference=True):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
             call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
@@ -550,7 +550,7 @@ class FilmSwinLayer(eqx.Module):
         self.dim = dim
         self.use_checkpoint = use_checkpoint
 
-    def __call__(self, x, condition, *, key=None, inference=False):
+    def __call__(self, x, condition, *, key=None, inference=True):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, film, k in zip(self.blocks, self.conditioning, keys):
             x = film(x, condition)

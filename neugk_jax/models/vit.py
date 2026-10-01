@@ -59,7 +59,7 @@ class ViTBlock(eqx.Module):
         self.drop_path = _DropPath(drop_path)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x, *, key=None, inference=False):
+    def __call__(self, x, *, key=None, inference=True):
         # x: (n_tokens, dim); standard pre-norm transformer block
         key1, key2 = (None, None) if key is None else jr.split(key, 2)
         x = x + self.drop_path(self.attn(self.norm1(x)), key=key1, inference=inference)
@@ -103,7 +103,7 @@ class DiTViTBlock(eqx.Module):
         self.mod = DiTModulation(cond_dim, dim, key=kmod)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x, cond, *, key=None, inference=False):
+    def __call__(self, x, cond, *, key=None, inference=True):
         # order: (scale1, shift1, gate1, scale2, shift2, gate2)
         scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = self.mod(cond)
         shift_msa = shift_msa[None, :]
@@ -170,7 +170,7 @@ class ViTLayer(eqx.Module):
         self.use_checkpoint = use_checkpoint
         self.act_fn = act_fn
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference=False):
+    def __call__(self, x: jnp.ndarray, *, key=None, inference=True):
         # x: (*grid, dim) → flatten → blocks → reshape
         spatial = x.shape[:-1]
         dim = x.shape[-1]
@@ -227,7 +227,7 @@ class DiTLayer(eqx.Module):
         self.use_checkpoint = use_checkpoint
         self.act_fn = act_fn
 
-    def __call__(self, x, condition, *, key=None, inference=False):
+    def __call__(self, x, condition, *, key=None, inference=True):
         spatial = x.shape[:-1]
         dim = x.shape[-1]
         x = x.reshape(-1, dim)
@@ -286,7 +286,7 @@ class FilmViTLayer(eqx.Module):
         self.grid_size = tuple(grid_size)
         self.dim = dim
 
-    def __call__(self, x: jnp.ndarray, condition, *, key=None, inference=False):
+    def __call__(self, x: jnp.ndarray, condition, *, key=None, inference=True):
         spatial = x.shape[:-1]
         dim = x.shape[-1]
         x = x.reshape(-1, dim)

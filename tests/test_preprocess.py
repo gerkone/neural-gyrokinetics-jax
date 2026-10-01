@@ -153,7 +153,6 @@ def test_quantize_roundtrip(tmp_path, bits):
     assert np.max(np.abs(y - x)) <= tol * np.max(np.abs(x))
 
 
-@needs_gyaradax
 def test_field_solver_spectrum_sums_to_flux_and_matches_flux_integral():
     import jax
     import jax.numpy as jnp
@@ -187,7 +186,6 @@ def _synthetic_traj(root, n=3):
     return traj
 
 
-@needs_gyaradax
 def test_rewrite_poten_backs_up_and_resolves(tmp_path):
     traj = _synthetic_traj(str(tmp_path / "data"))
     backup = str(tmp_path / "backup")

@@ -2,8 +2,7 @@
 
 For each checkpoint: build the JAX template from the checkpoint's own config,
 run the matching translate_*, and report (#missing JAX params, #unused torch
-keys). Goal: gyroswin -> 0 missing / only-intentional unused; AE/DiT stay at
-their known-good baseline (regression guard while editing the shared U-Net).
+keys). Expected: 0 missing everywhere; unused only torch aliases and modules torch never calls.
 
 Usage:
   python scripts/parity/check_ckpt_parity.py [ae|diff|tiny|cold|warm|all]
@@ -11,7 +10,6 @@ Usage:
 import argparse
 import os
 import sys
-import tempfile
 
 import yaml
 
@@ -44,9 +42,7 @@ def _shaped_cfg(cfg_path, extra_ds=None):
     ds = {"separate_zf": full.get("dataset", {}).get("separate_zf", True), "resolution": RES}
     if extra_ds:
         ds.update(extra_ds)
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-        yaml.safe_dump({"model": full["model"], "dataset": ds}, f)
-        return f.name, full
+    return {"model": full["model"], "dataset": ds}, full
 
 def _report(tag, model, sd, fn):
     n_leaves = len(list(jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))))

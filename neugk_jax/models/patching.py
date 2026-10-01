@@ -255,7 +255,7 @@ class PatchExpand(eqx.Module):
     MLP is stored under ``expansion`` (``unpatch.expansion.mlp.0.weight`` etc.).
     """
 
-    expansion: object  # mlp (mlp patch) or eqx.nn.ConvTranspose (conv patch)
+    expansion: object  # mlp (mlp patch) or StridedConvTranspose (conv patch)
     proj_concat: Optional[Linear]
     modulation: Optional[object]  # Film, when cond_dim given (unpatch)
     norm: Optional[object]

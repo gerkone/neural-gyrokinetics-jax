@@ -15,12 +15,8 @@ import jax.random as jr
 
 from neugk_jax.models.gk_unet import Swin5DUnet
 from neugk_jax.models.patching import PatchExpand
-from neugk_jax.models.utils import LayerNorm, Linear, gelu
+from neugk_jax.models.utils import LayerNorm, Linear, gelu, split_key
 from neugk_jax.models.vit import ViTLayer
-
-
-def _split(key, n):
-    return [None] * n if key is None else list(jr.split(key, n))
 
 
 class Swin5DAE(eqx.Module):
@@ -155,7 +151,7 @@ class Swin5DAE(eqx.Module):
 
 
     def encode(self, df: jnp.ndarray, *, key=None, inference: bool = True):
-        keys = _split(key, len(self.backbone.down_blocks) + 1)
+        keys = split_key(key, len(self.backbone.down_blocks) + 1)
         z, pad_axes = self.backbone.patch_encode(df)
         for blk, k in zip(self.backbone.down_blocks, keys):
             z = blk(z, return_skip=False, key=k, inference=inference)
@@ -167,7 +163,7 @@ class Swin5DAE(eqx.Module):
 
 
     def decode(self, z: jnp.ndarray, pad_axes=None, *, key=None, inference: bool = True):
-        keys = _split(key, len(self.backbone.up_blocks) + 1)
+        keys = split_key(key, len(self.backbone.up_blocks) + 1)
         if pad_axes is None:
             # reconstruct pad_axes from the base resolution
             dummy = jnp.zeros((self.backbone.original_in_channels, *self.backbone.full_resolution))
@@ -186,7 +182,7 @@ class Swin5DAE(eqx.Module):
 
     def __call__(self, df: jnp.ndarray, return_latent: bool = False, *, key=None,
                  inference: bool = True):
-        k_enc, k_dec = _split(key, 2)
+        k_enc, k_dec = split_key(key, 2)
         z, pad_axes = self.encode(df, key=k_enc, inference=inference)
         out = self.decode(z, pad_axes, key=k_dec, inference=inference)
         if return_latent:

@@ -25,6 +25,10 @@ import jax.numpy as jnp
 import jax.random as jr
 
 
+def split_key(key, n):
+    return [None] * n if key is None else list(jr.split(key, n))
+
+
 def gelu(x):
     # exact erf gelu; jax defaults to the tanh approximation
     return jax.nn.gelu(x, approximate=False)

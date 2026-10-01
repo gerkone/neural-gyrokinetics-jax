@@ -8,7 +8,6 @@ from __future__ import annotations
 from typing import Callable, Optional, Sequence
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 from einops import rearrange
@@ -129,6 +128,7 @@ class SwinBlockUp(eqx.Module):
     resampled_grid_size: tuple[int, ...] = eqx.field(static=True)
     mode: LayerModes = eqx.field(static=True)
     use_cond: bool = eqx.field(static=True)
+    act_fn: Callable = eqx.field(static=True)
 
     def __init__(
         self,
@@ -160,6 +160,7 @@ class SwinBlockUp(eqx.Module):
         legacy_double_shortcut: bool = False,
     ):
         k1, k2, k3 = jr.split(key, 3)
+        self.act_fn = act_fn
         if use_skip:
             self.proj_concat = Linear(2 * dim, dim, key=k1)
         else:
@@ -218,8 +219,7 @@ class SwinBlockUp(eqx.Module):
 
     def __call__(self, x, s=None, condition=None, *, key=None, inference=True):
         if self.proj_concat is not None and s is not None:
-            x = self.proj_concat(jnp.concatenate([x, s], axis=-1))
-            x = jax.nn.gelu(x)
+            x = self.act_fn(self.proj_concat(jnp.concatenate([x, s], axis=-1)))
         if self.pos_embed is not None:
             x = self.pos_embed(x)
         if self.use_cond:

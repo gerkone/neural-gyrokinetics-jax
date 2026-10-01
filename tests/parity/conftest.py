@@ -8,7 +8,8 @@ import os
 import sys
 from pathlib import Path
 
-collect_ignore_glob = [] if importlib.util.find_spec("torch") else ["test_*.py"]
 _REPO = os.environ.get("NEUGK_TORCH_REPO", str(Path(__file__).resolve().parents[3]))
 if _REPO not in sys.path:
     sys.path.append(_REPO)
+_HAVE = all(importlib.util.find_spec(m) is not None for m in ("torch", "neugk"))
+collect_ignore_glob = [] if _HAVE else ["test_*.py"]

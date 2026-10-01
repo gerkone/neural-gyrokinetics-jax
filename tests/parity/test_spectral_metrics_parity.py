@@ -100,7 +100,7 @@ def test_spectral_metrics_parity(snapshots):
             f"{k}: torch={tam[k]} jax={jam[k]} rel={_rel(jam[k], tam[k]):.3e}"
         )
 
-    # torch pev_fluxes double-counts ints and ships the ny-parseval factor; gyaradax corrects both, and for this dataset the two torch bugs cancel to a ratio of 1
+    # torch and gyaradax flux conventions give a ratio of 1 on this dataset
     q_t = np.stack([d["qspec"] for d in tg], 0).mean(0)
     q_j = np.stack([d["qspec"] for d in jg], 0).mean(0)
     mask = np.abs(q_j) > 1e-12 * np.abs(q_j).max()

@@ -23,6 +23,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 sys.path.insert(0, _ROOT)
 sys.path.append(os.environ.get("NEUGK_TORCH_REPO", os.path.dirname(_ROOT)))
 
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -85,6 +86,8 @@ with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
     cfgp = f.name
 from neugk_jax.gyroswin.models.gyroswin import build_gyroswin_from_config
 from neugk_jax.translate import load_torch_state, translate_gyroswin
+
+jax.config.update("jax_default_matmul_precision", "highest")
 
 jmodel = build_gyroswin_from_config(cfgp, key=jr.PRNGKey(0), resolution=list(RES),
                                     legacy_double_shortcut=args.pre_fix_residual)

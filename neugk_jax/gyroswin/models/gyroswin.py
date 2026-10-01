@@ -351,6 +351,12 @@ def build_gyroswin_from_config(cfg_path, *, key,
     sched = mcfg.get("loss_scheduler") or {}
     outputs = [k for k, w in (mcfg.get("loss_weights") or {}).items()
                if (w and w > 0) or sched.get(k)]
+    if int(mcfg.get("num_layers", 1)) != 1:
+        raise NotImplementedError("model.num_layers != 1")
+    if int(swin.get("flux_depth", 1)) != 1:
+        raise NotImplementedError("model.swin.flux_depth != 1")
+    if outputs and "phi" not in outputs:
+        raise NotImplementedError("gyroswin without a phi output")
     model = GyroSwinMultitask(
         dim=mcfg["latent_dim"],
         df_base_resolution=base_resolution,
@@ -359,7 +365,7 @@ def build_gyroswin_from_config(cfg_path, *, key,
         depth=swin["depth"],
         num_heads=swin["num_heads"],
         in_channels=in_ch, out_channels=in_ch,
-        num_layers=mcfg.get("num_layers", 4),
+        num_layers=int(mcfg.get("num_layers", 1)),
         c_multiplier=swin.get("c_multiplier", 2),
         merging_hidden_ratio=swin.get("merging_hidden_ratio", 4.0),
         unmerging_hidden_ratio=swin.get("unmerging_hidden_ratio", 8.0),
@@ -371,7 +377,7 @@ def build_gyroswin_from_config(cfg_path, *, key,
         gated_attention=swin.get("gated_attention", False),
         cond_mode=swin.get("modulation", "film"),
         rms_norm=(swin.get("norm_fn") == "RMSNorm"),
-        drop_path=float(mcfg.get("drop_path", 0.1)),
+        drop_path=float(mcfg.get("drop_path") if mcfg.get("drop_path") is not None else 0.1),
         flux_num_heads=swin.get("flux_num_heads", 4),
         flux_depth=swin.get("flux_depth", 1),
         flux_reduce=swin.get("flux_reduce", "max"),

@@ -50,8 +50,8 @@ from typing import Iterable, Optional, Sequence
 
 import numpy as np
 
-RAW_ROOT = "/restricteddata/ukaea/gyrokinetics"
-TARGET_DIR = "/local00/bioinf/galletti"
+RAW_ROOT = os.environ.get("NEUGK_RAW_ROOT", "/restricteddata/ukaea/gyrokinetics")
+TARGET_DIR = os.environ.get("NEUGK_TARGET_DIR", "/local00/bioinf/galletti")
 KVIKIO_SUBDIR = "preprocessed_kvikio"
 LIGHT_DROP_KEYS = ("df_min", "df_max", "df_var", "df_mean", "df_std", "phi_min", "phi_max",
                    "phi_var")
@@ -914,7 +914,9 @@ def preprocess_gyaradax(
     ns = len(ints)
     resolution = (len(np.asarray(np_geom["intvp"])), len(np.asarray(np_geom["intmu"])), ns,
                   len(np.asarray(np_geom["kxrh"])), len(np.asarray(np_geom["krho"])))
-    # gyaradax ky weights [1, 2, 2, ...] -> gkw convention [1, 2ns, 2ns, ...]
+    # the flux kernel weights ints twice, so the ky factor carries one 1/ints = ns
+    if not np.allclose(ints, 1.0 / ns):
+        raise NotImplementedError("gyaradax import assumes a uniform s grid (ints == 1/ns)")
     parseval = np.asarray(np_geom["parseval"], dtype=np.float64).copy()
     parseval[1:] *= float(ns)
     np_geom["parseval"] = parseval
