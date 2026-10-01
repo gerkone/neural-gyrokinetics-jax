@@ -151,6 +151,11 @@ def test_fm_e2e_train_eval(cyclone_dir, tmp_path):
     state = load_checkpoint(out / "ckp.eqx", runner.model)
     assert state.epoch == 1
     assert jnp.isfinite(jnp.asarray(state.loss))
+    # the trained latent scale is recorded in the checkpoint and the run config
+    assert state.meta["latent_scale"] == pytest.approx(runner.latent_scale)
+    assert OmegaConf.load(out / "config.yaml").latent_scale == pytest.approx(runner.latent_scale)
+    # fm_loss covers the whole val set with a fixed key
+    assert runner.evaluate(1)[0]["fm_loss"] == pytest.approx(runner.evaluate(2)[0]["fm_loss"])
 
 
 def test_ae_resume_keeps_best_and_continues(cyclone_dir, tmp_path):
@@ -192,3 +197,52 @@ def test_resume_config_cli_wins(tmp_path):
                             "training": {"n_epochs": 9, "lr": 2.0}})
     merged = entry.resume_config(cfg)
     assert merged.seed == 3 and merged.training.lr == 1.0 and merged.output_path == str(run)
+
+
+def _main_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "neugk_jax_main", Path(__file__).resolve().parents[1] / "main.py")
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    return entry
+
+
+def test_resume_hydra_compose_cli_wins(tmp_path):
+    from hydra import compose, initialize_config_dir
+    from hydra.core.hydra_config import HydraConfig
+    from omegaconf import open_dict
+
+    entry = _main_module()
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "ckp.eqx").write_bytes(b"")
+    OmegaConf.save(OmegaConf.create({"seed": 3, "training": {"n_epochs": 5, "learning_rate": 1.0},
+                                     "output_path": "elsewhere"}), run / "config.yaml")
+    cfg_dir = str(Path(__file__).resolve().parents[1] / "configs")
+    overrides = [f"output_path={run}", "load_ckpt=true", "training.n_epochs=9"]
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        cfg = compose(config_name="main", overrides=overrides, return_hydra_config=True)
+        HydraConfig.instance().set_config(cfg)
+        with open_dict(cfg):
+            del cfg["hydra"]
+        merged = entry.resume_config(cfg)
+    assert merged.training.n_epochs == 9 and merged.output_path == str(run)
+    assert merged.seed == 3 and merged.training.learning_rate == 1.0
+
+
+def test_run_id_format():
+    import re
+
+    assert re.fullmatch(r"\d{8}_\d{6}_\d{3}", _main_module().run_id())
+
+
+def test_runner_writes_config_with_corrected_residual(cyclone_dir, tmp_path):
+    from neugk_jax.autoencoders.runner import AERunner
+
+    path, resolution = cyclone_dir
+    cfg = _tiny_ae_cfg(path, resolution, tmp_path / "run")
+    AERunner(cfg, output_path=cfg.output_path)
+    saved = OmegaConf.load(tmp_path / "run" / "config.yaml")
+    assert saved.model.legacy_swin_shortcut is False

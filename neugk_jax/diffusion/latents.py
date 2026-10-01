@@ -9,10 +9,12 @@ running the encoder on each step.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pickle
+import warnings
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 import jax.numpy as jnp
 import numpy as np
@@ -50,6 +52,52 @@ def latent_cache_path(dataset, split: str, ae_checkpoint: str, *, decouple_mu: b
     return Path(dataset.path) / ("_".join(filter(None, segments)) + ".pkl")
 
 
+def cache_meta_path(cache_file: str | Path) -> Path:
+    cache_file = Path(cache_file)
+    return cache_file.with_name(cache_file.name + ".meta.json")
+
+
+def latent_cache_meta(dataset, ae_checkpoint: str | os.PathLike, *,
+                      normalization_stats=None) -> dict:
+    """Provenance of a latent cache: AE checkpoint file identity and the dataset preprocessing."""
+    ae = Path(ae_checkpoint).resolve()
+    st = ae.stat()
+    stats = normalization_stats if isinstance(normalization_stats, (str, os.PathLike)) else None
+    return {
+        "ae_checkpoint": str(ae),
+        "ae_size": int(st.st_size),
+        "ae_mtime": float(st.st_mtime),
+        "normalization_stats": None if stats is None else str(Path(stats).resolve()),
+        "separate_zf": bool(dataset.separate_zf),
+        "offset": int(dataset.offset),
+    }
+
+
+def write_cache_meta(cache_file: str | Path, meta: dict) -> None:
+    path = cache_meta_path(cache_file)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(meta, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def check_cache_meta(cache_file: str | Path, meta: Optional[dict]) -> None:
+    """Raise if the sidecar of ``cache_file`` disagrees with ``meta``; warn if it has none."""
+    if meta is None:
+        return
+    path = cache_meta_path(cache_file)
+    if not path.exists():
+        warnings.warn(f"{cache_file} has no {path.name}; its AE and preprocessing cannot be "
+                      "checked, only its index and latent shape")
+        return
+    saved = json.loads(path.read_text())
+    diff = {k: (saved.get(k), v) for k, v in meta.items() if saved.get(k) != v}
+    if diff:
+        lines = "\n".join(f"  {k}: cache={a!r} run={b!r}" for k, (a, b) in sorted(diff.items()))
+        raise ValueError(f"latent cache {cache_file} was built for a different AE or "
+                         f"preprocessing:\n{lines}\ndelete it to re-encode, or point "
+                         "dataset.latents_cache_* at a matching cache")
+
+
 def _barrier(name: str) -> None:
     import jax
     if jax.process_count() > 1:
@@ -64,14 +112,18 @@ def precompute_latents(
     cache_file: str | Path,
     batch_size: int = 4,
     overwrite: bool = False,
+    meta: Optional[dict] = None,
+    latent_shape=None,
 ) -> None:
     """Encode the dataset through ``encode_fn`` into ``cache_file`` (or load it if present).
 
     ``encode_fn(df_batch, cond_batch) -> latent_batch`` maps ``(B, C, *resolution)`` to
     ``(B, *latent_grid, latent_channels)``. Entries:
     ``{(fid, t_idx): {"x", "phi", "flux", "timestep", <one raw scalar per condition>}}``.
-    Process 0 encodes and writes atomically; the others wait and load. The dataset is
-    switched to ``mode="diff"`` with ``precomputed_latents`` populated.
+    Process 0 encodes and writes atomically, with ``meta`` (see :func:`latent_cache_meta`)
+    as a ``<cache>.meta.json`` sidecar; the others wait. Every process then loads the cache
+    through :func:`load_precomputed_latents`, which checks it against ``meta`` and this
+    dataset, and the dataset is switched to ``mode="diff"``.
     """
     import jax
 
@@ -82,12 +134,11 @@ def precompute_latents(
         tmp = cache_file.with_name(cache_file.name + f".tmp{os.getpid()}")
         with open(tmp, "wb") as f:
             pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        if meta is not None:
+            write_cache_meta(cache_file, meta)
         os.replace(tmp, cache_file)
     _barrier(f"latents:{cache_file.name}")
-    with open(cache_file, "rb") as f:
-        dataset.precomputed_latents = pickle.load(f)
-    dataset.mode = "diff"
-    _compute_latent_stats(dataset)
+    load_precomputed_latents(dataset, cache_file, latent_shape=latent_shape, meta=meta)
 
 
 def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
@@ -128,38 +179,33 @@ def latent_arrays(dataset) -> tuple[np.ndarray, np.ndarray | None]:
 
 
 def load_precomputed_latents(
-    dataset, pickle_path: str | Path, *, verify: bool = True, remap: bool = True,
-    latent_shape=None,
+    dataset, pickle_path: str | Path, *, remap: bool = True, latent_shape=None,
+    meta: Optional[dict] = None,
 ) -> None:
-    """Populate ``dataset.precomputed_latents`` from a pre-existing pickle.
+    """Populate ``dataset.precomputed_latents`` from a cache pickle and switch to ``mode="diff"``.
 
-    Bypasses the ``encode_fn`` path in :func:`precompute_latents` when the
-    cache has been computed externally. The pickle is expected to be
-    ``dict[(file_idx, t_idx), dict]`` with the same per-entry schema
-    written by :func:`precompute_latents` — at minimum ``x``, ``flux``,
-    ``timestep``; optionally ``phi`` and the scalar conditioning fields.
-
-    ``verify`` cross-checks the cache against this dataset: every indexed
-    ``(fid, t_idx)`` must be present, and where the cache carries the scalar
-    conditions they must agree with the trajectory metadata — a foreign cache
-    whose file ordering differs would otherwise pair latents with the wrong
-    trajectory silently. ``latent_shape``, when given, is checked too. ``remap``
-    then re-keys such a cache onto this dataset's fids (see
-    :func:`remap_latent_cache`) instead of failing.
+    The pickle is ``dict[(file_idx, t_idx), dict]`` with the per-entry schema written by
+    :func:`precompute_latents` (at minimum ``x``, ``flux``, ``timestep``; optionally ``phi``
+    and the scalar conditions). With ``meta`` the ``<cache>.meta.json`` sidecar must match
+    (see :func:`check_cache_meta`). The cache is verified against this dataset: every
+    indexed ``(fid, t_idx)`` must be present, the scalar conditions it carries must agree
+    with the trajectory metadata and the latents must have ``latent_shape`` when given.
+    With ``remap`` a cache keyed by a different file ordering is re-keyed onto this
+    dataset's fids (see :func:`remap_latent_cache`) instead of failing.
     """
     p = Path(pickle_path)
     if not p.exists():
         raise FileNotFoundError(p)
+    check_cache_meta(p, meta)
     with open(p, "rb") as f:
         cache = pickle.load(f)
-    if verify:
-        try:
-            verify_latent_cache(dataset, cache, latent_shape=latent_shape)
-        except ValueError:
-            if not remap:
-                raise
-            cache = remap_latent_cache(dataset, cache)
-            verify_latent_cache(dataset, cache, latent_shape=latent_shape)
+    try:
+        verify_latent_cache(dataset, cache)
+    except ValueError:
+        if not remap:
+            raise
+        cache = remap_latent_cache(dataset, cache)
+    verify_latent_cache(dataset, cache, latent_shape=latent_shape)
     dataset.precomputed_latents = cache
     dataset.mode = "diff"
     _compute_latent_stats(dataset)

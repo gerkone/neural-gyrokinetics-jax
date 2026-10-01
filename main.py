@@ -1,9 +1,10 @@
 """Hydra entry point for the JAX/Equinox port.
 
 Reads the Hydra config, builds (or, with ``load_ckpt``, reuses) the output
-directory, saves the resolved config and hands off to the workflow runner.
+directory and hands off to the workflow runner, which saves the resolved config.
 Distributed setup reads SLURM / torchrun env vars
-(``neugk_jax.training.ddp.init_distributed``).
+(``neugk_jax.training.ddp.init_distributed``); every process shares the run id of
+process 0.
 
 Usage (one experiment preset per workflow, see ``configs/experiment``)::
 
@@ -23,15 +24,16 @@ from datetime import datetime
 from pathlib import Path
 
 import hydra
+import numpy as np
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf
 
 
 def dispatch_runner(cfg: DictConfig) -> None:
     """Workflow → runner dispatch."""
     workflow = cfg.get("workflow", "ae")
     base = workflow.split("_")[0]
-    if base in ("ae", "pinc"):
+    if base == "ae":
         from neugk_jax.autoencoders.runner import AERunner as Runner
     elif base == "diffusion":
         from neugk_jax.diffusion.runner import FlowMatchingRunner as Runner
@@ -63,27 +65,30 @@ def resume_config(cfg: DictConfig) -> DictConfig:
     return OmegaConf.merge(cfg, saved)
 
 
+def run_id() -> str:
+    """``YYYYmmdd_HHMMSS_<rand>`` of process 0, identical on every process."""
+    from neugk_jax.training.ddp import init_distributed
+    dist = init_distributed()
+    now = datetime.today()
+    stamp = np.asarray([int(now.strftime("%Y%m%d")), int(now.strftime("%H%M%S")),
+                        random.randint(0, 999)], np.int32)
+    if dist.num_processes > 1:
+        from jax.experimental import multihost_utils
+        stamp = np.asarray(multihost_utils.broadcast_one_to_all(stamp))
+    day, time, rand = (int(v) for v in stamp)
+    return f"{day:08d}_{time:06d}_{rand:03d}"
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="main")
 def main(cfg: DictConfig) -> None:
     os.environ.setdefault("HYDRA_FULL_ERROR", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    rand_suffix = random.randint(0, 999)
-    date_and_time = datetime.today().strftime("%Y%m%d_%H%M%S") + f"_{rand_suffix:03d}"
-
     if cfg.get("load_ckpt"):
         cfg = resume_config(cfg)
-    elif cfg.get("output_path") is None:
-        cfg.output_path = str(Path("outputs") / date_and_time)
     else:
-        cfg.output_path = str(Path(cfg.output_path) / date_and_time)
+        cfg.output_path = str(Path(cfg.get("output_path") or "outputs") / run_id())
     Path(cfg.output_path).mkdir(parents=True, exist_ok=True)
-
-    # jax-trained models use the corrected swin residual; record it so rebuilds from config agree
-    if cfg.get("model") is not None and cfg.model.get("legacy_swin_shortcut") is None:
-        with open_dict(cfg):
-            cfg.model.legacy_swin_shortcut = False
-    OmegaConf.save(cfg, Path(cfg.output_path) / "config.yaml")
     print("#" * 88)
     print("Starting neugk-jax with configs:")
     print(OmegaConf.to_yaml(cfg))

@@ -8,6 +8,8 @@ defaults:
   - override /training: diffusion
 
 workflow: diffusion
+# sampler latent scale; null computes 1 / std of the train latents (saved to config and checkpoint)
+latent_scale: null
 ae_checkpoint: /restricteddata/ukaea/checkpoints/neurips26/AE_noCond/20260405_022851_327
 model:
   # dit conditioning: a subset of dataset.conditions

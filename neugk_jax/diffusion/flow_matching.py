@@ -70,12 +70,14 @@ def fm_forward_loss(
     latent_scale: float = 1.0,
     use_ot: bool = True,
     dropout_key=None,
+    mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """One flow-matching training step (returns the scalar loss).
 
     ``model_fn(xt, t_scalar, cond_per_sample)`` is the *per-sample* DiT
     forward — caller vmaps the model over the batch. With ``dropout_key`` it is called as
-    ``model_fn(xt, t, cond, key)`` with one key per sample.
+    ``model_fn(xt, t, cond, key)`` with one key per sample. ``mask`` (``(B,)``) averages
+    the loss over the rows it marks.
     """
     bs = latents.shape[0]
     k_prior, k_t = jr.split(key, 2)
@@ -92,7 +94,10 @@ def fm_forward_loss(
     if dropout_key is not None:
         args = (*args, jr.split(dropout_key, bs))
     pred = jax.vmap(model_fn)(*args)
-    return jnp.mean((pred - target_v) ** 2)
+    if mask is None:
+        return jnp.mean((pred - target_v) ** 2)
+    per_sample = jnp.mean(((pred - target_v) ** 2).reshape(bs, -1), axis=-1)
+    return jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
 
 def _euler_step(velocity, x, ti, dti):

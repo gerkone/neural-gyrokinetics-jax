@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import optax
+from omegaconf import OmegaConf, open_dict
 
 from neugk_jax.models.utils import trainable_mask
 from neugk_jax.training.checkpoint import AsyncCheckpointer, CheckpointState, load_checkpoint
@@ -117,7 +118,10 @@ class BaseRunner:
     Hooks: ``setup_data`` (sets ``train_ds``/``val_ds``), ``build_model(key)``,
     ``loss_fn(model, batch, key) -> (loss, aux)``, ``make_evaluator()``; optional
     ``load_batch(ds, indices, read)``, ``step_context()`` (run-constant device arrays merged
-    into the batch), ``step_extras(step)`` (per-step arrays merged into the batch).
+    into the batch), ``step_extras(step)`` (per-step arrays merged into the batch),
+    ``checkpoint_meta()`` (extra checkpoint metadata). Models built from the run config use
+    the corrected swin residual unless ``model.legacy_swin_shortcut`` is set; process 0
+    writes the resolved config to ``<output_path>/config.yaml``.
     """
 
     # validation metrics that select best.eqx, first present wins (lower is better)
@@ -129,6 +133,9 @@ class BaseRunner:
 
     def __init__(self, cfg, *, output_path: str | None = None):
         self.cfg = cfg
+        if cfg.get("model") is not None and cfg.model.get("legacy_swin_shortcut") is None:
+            with open_dict(cfg):
+                cfg.model.legacy_swin_shortcut = False
         configure_compilation_cache(cfg)
         self.dist = init_distributed()
         self.logger = Logger(is_rank0=self.dist.is_rank0, config=config_dict(cfg),
@@ -147,6 +154,15 @@ class BaseRunner:
         self.spec = StepSpec(type(self).__name__, self.loss_fn, self.optimizer, self.trainable)
         self._maybe_resume()
         self.evaluator = self.make_evaluator()
+        self.save_config()
+
+    def save_config(self) -> None:
+        if self.dist.is_rank0:
+            self.output_path.mkdir(parents=True, exist_ok=True)
+            OmegaConf.save(self.cfg, self.output_path / "config.yaml")
+
+    def checkpoint_meta(self) -> dict:
+        return {}
 
     def setup_data(self) -> None:
         raise NotImplementedError
@@ -206,7 +222,8 @@ class BaseRunner:
             return
         state = CheckpointState(model=local_view(self.dist, self.model),
                                 opt_state=local_view(self.dist, self.opt_state),
-                                epoch=epoch, loss=val, meta={"best_val": self.best_val})
+                                epoch=epoch, loss=val,
+                                meta={"best_val": self.best_val, **self.checkpoint_meta()})
         self.checkpointer.save(self.output_path / name, state)
 
     def train_epoch(self, epoch: int, key) -> tuple[dict, dict]:

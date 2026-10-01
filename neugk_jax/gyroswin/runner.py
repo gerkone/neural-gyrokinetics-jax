@@ -45,7 +45,7 @@ class GyroSwinRunner(BaseRunner):
         fields |= {k for k in self.loss_cfg.outputs if k in ("df", "phi")}
         if self.loss_cfg.integrals:
             fields |= {"df", "phi"}
-        # crop the trajectory tail so autoregressive rollout targets exist
+        # the val split ends n_eval_steps frames early; those frames are rollout targets
         tail = int((cfg.get("validation") or {}).get("n_eval_steps", 1))
         self.train_ds, self.val_ds = build_splits(
             cfg.dataset, dist=self.dist, mode="next", fields=tuple(sorted(fields)),
