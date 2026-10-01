@@ -177,11 +177,12 @@ def test_ae_evaluator_spectral_metrics(tiny_setup):
 
 
 def test_ae_evaluator_padded_last_batch_and_no_retrace(tiny_setup):
-    """3 samples at batch 2: the tail batch is padded and masked, and epochs reuse one trace."""
+    """3 samples: the tail batch is padded and masked, and epochs reuse one trace."""
     ds, ae = tiny_setup
     ev = AEEvaluator(_cfg(eval_integrals=True), val_ds=ds, batch_size=2)
-    assert [p.indices.shape for p in ev.plans] == [(2,), (2,)]
-    assert ev.plans[-1].mask.tolist() == [1.0, 0.0]
+    bs, tail = ev.batch_size, 3 % ev.batch_size or ev.batch_size
+    assert [p.indices.shape for p in ev.plans] == [(bs,)] * -(-3 // bs)
+    assert ev.plans[-1].mask.tolist() == [1.0] * tail + [0.0] * (bs - tail)
     full = AEEvaluator(_cfg(eval_integrals=True), val_ds=ds, batch_size=1)
     m1, _ = ev(ae, epoch=1)
     TRACE_COUNTS.clear()
@@ -212,3 +213,26 @@ def test_diffusion_evaluator_samples_and_scores(tiny_setup):
         assert np.isfinite(metrics[key]), key
     assert metrics["avg_flux_gt/iteration_0"] == pytest.approx(ds.get_avg_flux(0))
     assert "avg_flux_UQ" in plots
+
+
+def test_spectral_sums_split_over_processes_match_the_whole():
+    """Per-process packed sums add up to the metrics of the whole trajectory set."""
+    from neugk_jax.evaluate import metrics as m
+
+    rng = np.random.default_rng(0)
+
+    def diag():
+        return {"kyspec": rng.random(4), "qspec": rng.random(4), "kxspec": rng.random(6),
+                **{k: rng.standard_normal(6) for k in ("zfphi", "zfflow", "zfshear")}}
+
+    pred = {f: [diag() for _ in range(5)] for f in (0, 2)}
+    gt = {f: [diag() for _ in range(5)] for f in (0, 2)}
+    whole = {f: m.time_averaged_spectral_metrics(pred[f], gt[f]) for f in (0, 2)}
+    want = {k: np.mean([whole[f][k] for f in (0, 2)]) for k in whole[0]}
+    parts = [{f: m.spectral_sums(pred[f][sl], gt[f][sl]) for f in (0, 2)}
+             for sl in (slice(0, 2), slice(2, 5))]
+    packed = sum(m.pack_spectral_store(p, 3, 4) for p in parts)
+    got = m.merged_spectral_metrics(m.unpack_spectral_store(packed, 4))
+    assert set(got) == set(want)
+    for k in want:
+        assert got[k] == pytest.approx(want[k], rel=1e-10), k

@@ -1,15 +1,10 @@
-"""Gyaradax adapter — phi / particle / heat / momentum fluxes from df.
+"""Flux integrals and spectral fields of a spatial df.
 
-Delegates to the pure-JAX ``gerkone/gyaradax`` package. The API:
-
-    from gyaradax.integrals import get_integrals
-    phi, (pflux, eflux, vflux) = get_integrals(df, geometry, params=None, ...)
-
-Inputs are unbatched; we ``vmap`` over the batch axis. The public entry points
-run in float64 inside a local ``jax.enable_x64`` context; gyaradax's global x64
-switch on import is undone so the rest of the process stays fp32.
-
-``gyaradax`` is electrostatic-only at the moment (no apar/bpar paths).
+``precompute_geometry`` + ``flux_integral`` are the jittable single-sample field solve and
+fluxes used in training and evaluation. ``gyaradax_spectral_fields`` keeps the per-mode
+potential and heat flux for the spectral metrics via the ``gyaradax`` package (electrostatic
+only); it runs in float64 inside a local ``jax.enable_x64`` context and undoes gyaradax's
+global x64 switch on import.
 """
 
 from __future__ import annotations
@@ -68,103 +63,29 @@ def _f64(fn):
 
 
 @_x64
-def gyaradax_flux_integrals(
-    df_batch: jnp.ndarray,
-    geometry_one: dict,
-):
-    """Pure-JAX flux integral via gyaradax. Returns ``(phi, eflux)`` as
-    host numpy arrays.
+def gyaradax_spectral_fields(df_batch, geometry: dict, *, per_sample: bool = False):
+    """Spectral potential + per-mode heat-flux field of a spatial df batch via gyaradax.
 
-    Inputs:
-        df_batch:     ``(B, 4, vp, mu, s, x, y)`` — denormalised AE-decoded
-                      df with the separate-zf channel-of-4 layout.
-        geometry_one: dict of per-trajectory geometry values (no batch axis).
-                      Caller is expected to have stripped the batch axis
-                      (batches in the eval loop are single-trajectory).
-
-    Pipeline:
-        recombine zf → real/imag → complex 5D (vp, mu, s, x, y) →
-        forward FFT (x, y, norm='forward'; ifftshift on x) → gyaradax
-        ``get_integrals`` adiabatic path.
-
-    Overrides ``parseval`` with the Hermitian-symmetry factor
-    ``where(|krho|<1e-12, 1, 2)``.
+    ``df_batch`` is ``(B, 4, vp, mu, s, x, y)`` (separate-zf layout) or ``(B, 2, ...)``;
+    ``geometry`` is one trajectory's geometry, or with ``per_sample`` a geometry whose
+    leaves carry a leading batch axis. Returns ``(phi_spec, eflux_field)`` as host numpy
+    arrays of shapes ``(B, s, kx, ky)`` (complex) and ``(B, kx, ky)``; ``parseval`` is
+    replaced by the Hermitian factor ``where(|krho| < 1e-12, 1, 2)``.
     """
-    require_integrals(geometry_one)
+    require_integrals(geometry)
     df_batch = jnp.asarray(df_batch)
-    B = df_batch.shape[0]
-    # separate-zf (B, 4, ...) recombines to (B, 2, ...); a plain 2-channel df passes through
     df_rec = df_batch[:, :2] + df_batch[:, 2:] if df_batch.shape[1] == 4 else df_batch
     df_cplx = (df_rec[:, 0] + 1j * df_rec[:, 1]).astype(jnp.complex128)
-
-    geom = {k: jnp.asarray(v) for k, v in geometry_one.items()}
-    # batched geom (leaves carry leading batch axis matching B)? else single-traj path
-    krho = geom.get("krho")
-    if krho is not None and krho.ndim > 0 and krho.shape[0] == B:
-        # batched geom — collapse if all samples share trajectory, else vmap over both
-        if _same_traj(geom, B):
-            geom = _strip_batch_axis(geom, B)
-            geom["parseval"] = jnp.where(
-                jnp.abs(geom["krho"]) < 1e-12, 1.0, 2.0,
-            ).astype(jnp.float64)
-            phi, eflux = _gyaradax_integ_batched(df_cplx, geom)
-        else:
-            # per-sample geom: override parseval per row (vectorized)
-            geom["parseval"] = jnp.where(
-                jnp.abs(geom["krho"]) < 1e-12, 1.0, 2.0,
-            ).astype(jnp.float64)
-            phi, eflux = _gyaradax_integ_batched_geom(df_cplx, geom)
-    else:
-        # caller passed a single-trajectory geom (no batch axis)
-        geom["parseval"] = jnp.where(
-            jnp.abs(jnp.asarray(geom["krho"])) < 1e-12, 1.0, 2.0,
-        ).astype(jnp.float64)
-        phi, eflux = _gyaradax_integ_batched(df_cplx, geom)
-    return np.asarray(phi), np.asarray(eflux)
-
-
-@_x64
-def gyaradax_spectral_fields(
-    df_batch: jnp.ndarray,
-    geometry_one: dict,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Spectral potential + per-mode heat-flux field via gyaradax.
-
-    Same pipeline as ``gyaradax_flux_integrals`` (recombine zf → complex df →
-    forward FFT with the ifftshift-on-x convention) but keeps the per-mode
-    fields instead of reducing to scalars:
-
-    Returns ``(phi_spec, eflux_field)`` as host numpy arrays with shapes
-    ``(B, s, kx, ky)`` (complex) and ``(B, kx, ky)``.
-
-    Inputs:
-        df_batch:     ``(B, 4, vp, mu, s, x, y)`` spatial df (separate-zf
-                      channel-of-4 layout; a plain 2-channel df also works).
-        geometry_one: single-trajectory geometry dict (no batch axis).
-
-    Applies the same ``parseval`` override as ``gyaradax_flux_integrals``.
-    """
-    require_integrals(geometry_one)
-    df_batch = jnp.asarray(df_batch)
-    # recombine_zf only applies to the separate-zf channel-of-4 layout
-    df_rec = df_batch[:, :2] + df_batch[:, 2:] if df_batch.shape[1] == 4 else df_batch
-    df_cplx = (df_rec[:, 0] + 1j * df_rec[:, 1]).astype(jnp.complex128)
-
-    geom = {k: jnp.asarray(v) for k, v in geometry_one.items()}
-    geom["parseval"] = jnp.where(
-        jnp.abs(jnp.asarray(geom["krho"])) < 1e-12, 1.0, 2.0,
-    ).astype(jnp.float64)
-    phi, eflux = _gyaradax_spectral_batched(df_cplx, geom)
+    geom = {k: jnp.asarray(v) for k, v in geometry.items()}
+    geom["parseval"] = jnp.where(jnp.abs(geom["krho"]) < 1e-12, 1.0, 2.0).astype(jnp.float64)
+    fn = _gyaradax_spectral_per_sample if per_sample else _gyaradax_spectral_batched
+    phi, eflux = fn(df_cplx, geom)
     return np.asarray(phi), np.asarray(eflux)
 
 
 @jax.jit
 def _gyaradax_spectral_one(df_one, geom):
-    """Per-sample (spatial complex df, geom) → (phi_spec, eflux_field).
-
-    Same FFT convention as ``_gyaradax_integ_one`` but goes through the
-    gyaradax internals directly so ``calculate_fluxes`` can keep the
-    per-(kx, ky) flux field (``reduce=False``)."""
+    """Per-sample (spatial complex df, geom) → (phi_spec, per-(kx, ky) eflux field)."""
     from gyaradax.integrals import _phi_adiabatic, calculate_fluxes, geom_tensors
     spec = jnp.fft.fftn(df_one, axes=(-2, -1), norm="forward")
     spec = jnp.fft.ifftshift(spec, axes=-2)
@@ -196,53 +117,8 @@ def _zonal_correction(gt, geom, spec, phi):
     return phi.at[:, 0, 0].set(phi_new)
 
 
-# vmap with shared geom — evaluators integrate one trajectory at a time
 _gyaradax_spectral_batched = jax.jit(jax.vmap(_gyaradax_spectral_one, in_axes=(0, None)))
-
-
-@jax.jit
-def _gyaradax_integ_one(df_one, geom):
-    """Per-sample (spectral df, geom) → (phi, eflux). FFT inside so the
-    caller can stay in spatial layout. Jit'd once at module level."""
-    from gyaradax.integrals import get_integrals
-    spec = jnp.fft.fftn(df_one, axes=(-2, -1), norm="forward")
-    spec = jnp.fft.ifftshift(spec, axes=-2)
-    phi, (_pflux, eflux, _vflux) = get_integrals(
-        spec, geom, adiabatic_electrons=True,
-    )
-    return phi, eflux
-
-
-# vmap with shared geom (single trajectory in a batch) — the fast common case
-_gyaradax_integ_batched = jax.jit(jax.vmap(_gyaradax_integ_one, in_axes=(0, None)))
-# vmap with per-sample geom (handles mixed-trajectory batches at boundaries)
-_gyaradax_integ_batched_geom = jax.jit(jax.vmap(_gyaradax_integ_one, in_axes=(0, 0)))
-
-
-def _strip_batch_axis(geom: dict, batch_size: int) -> dict:
-    """Drop the leading batch axis from a geom dict whose leaves were stacked
-    across a batch (via ``get_batch_geometry``). Returns the geom of the first
-    sample — only safe when all samples share the same trajectory."""
-    out = {}
-    for k, v in geom.items():
-        arr = jnp.asarray(v)
-        if arr.ndim and arr.shape[0] == batch_size:
-            out[k] = arr[0]
-        else:
-            out[k] = arr
-    return out
-
-
-def _same_traj(geom: dict, batch_size: int) -> bool:
-    """Cheap heuristic — check if the batched geom's per-sample slices are
-    identical (i.e. all from the same trajectory)."""
-    krho = geom.get("krho")
-    if krho is None:
-        return False
-    arr = np.asarray(krho)
-    if arr.ndim == 0 or arr.shape[0] != batch_size:
-        return False
-    return bool(np.all(arr == arr[0:1]))
+_gyaradax_spectral_per_sample = jax.jit(jax.vmap(_gyaradax_spectral_one, in_axes=(0, 0)))
 
 
 _SCALAR_DEFAULTS = {

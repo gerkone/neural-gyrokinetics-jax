@@ -259,10 +259,10 @@ class CycloneDataset:
         flat = 0
         for fid, meta in self.metadata.items():
             timesteps = meta["timesteps"][offset:]
+            self.file_num_timesteps.append(len(timesteps))
             if tail_offset > 0:
                 timesteps = timesteps[:-tail_offset]
             n = len(timesteps[::subsample]) - bundle_seq_length * 2 + 1
-            self.file_num_timesteps.append(len(timesteps[::subsample]))
             for t_idx in range(max(0, n)):
                 self.flat_index_to_file_and_tstep[flat] = (fid, t_idx * subsample)
                 self.file_and_tstep_to_flat_index[(fid, t_idx * subsample)] = flat
@@ -374,10 +374,13 @@ class CycloneDataset:
     def _get_scale_shift(self, fid: int, field: str, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if self.normalization_scope == "sample" or self.normalization is None:
             return np.float32(1.0), np.float32(0.0)
+        if field not in self.normalization:
+            return np.float32(1.0), np.float32(0.0)
         key = "full" if self.normalization_scope == "dataset" else fid
         stats = self.stats.get(field, {}).get(key, {})
-        if not stats or field not in self.normalization:
-            return np.float32(1.0), np.float32(0.0)
+        if not stats:
+            raise KeyError(f"normalization lists {field!r} but there are no {field!r} stats "
+                           f"for {key!r}; add them to normalization_stats or drop the field")
         nt = self.normalization[field]["type"]
         if nt == "zscore":
             mean = np.asarray(stats["mean"], dtype=np.float32)
@@ -397,11 +400,6 @@ class CycloneDataset:
         x, field = self._unpack_field(df=df, phi=phi, flux=flux, fluxavg=fluxavg)
         scale, shift = self._get_scale_shift(fid, field, x)
         return (x - shift) / scale
-
-    def denormalize(self, fid: int, *, df=None, phi=None, flux=None, fluxavg=None) -> np.ndarray:
-        x, field = self._unpack_field(df=df, phi=phi, flux=flux, fluxavg=fluxavg)
-        scale, shift = self._get_scale_shift(fid, field, x)
-        return x * scale + shift
 
     def scale_shift(self, fids: Sequence[int], field: str, sample_ndim: int):
         """Per-batch ``(scale, shift)`` for ``field`` that broadcast against a
@@ -449,11 +447,6 @@ class CycloneDataset:
             return self._get_next_sample(fid, t_idx)
         return self._get_ae_sample(fid, t_idx)
 
-    def get_at_time(self, fid: int, t_idx: int, *, normalized: bool = True) -> CycloneSample:
-        if self.mode == "next":
-            return self._get_next_sample(int(fid), int(t_idx), normalized=normalized)
-        return self._get_ae_sample(int(fid), int(t_idx))
-
     def with_mode(self, mode: str) -> "CycloneDataset":
         view = copy.copy(self)
         view.mode = mode
@@ -481,6 +474,11 @@ class CycloneDataset:
         return {k: _f32(v) for k, v in out.items()}
 
     def num_ts(self, fid: int) -> int:
+        """Raw timesteps of trajectory ``fid`` after ``offset``, tail and subsampled ones included.
+
+        Comparable with ``timestep_index`` (a raw index); the frame at raw index
+        ``t < num_ts`` is on disk.
+        """
         return self.file_num_timesteps[int(fid)]
 
     def get_timestep(self, fid: int, t_idx: int) -> np.ndarray:
@@ -511,7 +509,7 @@ class CycloneDataset:
 
         return self._build_sample(fid, t_idx, df, phi, flux, timestep, meta)
 
-    def _get_next_sample(self, fid: int, t_idx: int, *, normalized: bool = True) -> CycloneSample:
+    def _get_next_sample(self, fid: int, t_idx: int) -> CycloneSample:
         meta = self.metadata[fid]
         original_t = t_idx + self.offset
         gt_t = original_t + self.bundle_seq_length
@@ -532,7 +530,7 @@ class CycloneDataset:
         y_flux = np.asarray(meta["flux"][gt_t], dtype=np.float32)
         y_fluxavg = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
         timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
-        if normalized and self.normalization is not None:
+        if self.normalization is not None:
             if df is not None:
                 df, y_df = self.normalize(fid, df=df), self.normalize(fid, df=y_df)
             if phi is not None:
@@ -590,11 +588,6 @@ class CycloneDataset:
         # parallel (s) grid spacing; None when the trajectory metadata doesn't carry it
         ds = self.metadata[fid].get("ds")
         return None if ds is None else float(ds)
-
-    def get_batch_geometry(self, file_indices: np.ndarray) -> dict[str, np.ndarray]:
-        geoms = [self.metadata[int(f)]["geometry"] for f in file_indices]
-        keys = geoms[0].keys()
-        return {k: np.stack([np.ascontiguousarray(g[k]) for g in geoms]) for k in keys}
 
 
     @staticmethod

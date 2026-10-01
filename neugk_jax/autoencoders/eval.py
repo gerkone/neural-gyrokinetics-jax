@@ -61,7 +61,7 @@ class AEEvaluator(BaseEvaluator):
     def __init__(self, cfg: Any, **kwargs):
         super().__init__(cfg, **kwargs)
         self.eval_integrals = bool(self.vcfg.get("eval_integrals", False))
-        self.eval_spectra = bool(self.vcfg.get("eval_spectra", False))
+        self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
         keys = ["df_mse", "df_rel_l2"]
         if self.eval_integrals:
             keys += ["phi_int_mse", "phi_int_rel_l2", "flux_int_mse", "flux_int_rel_err"]
@@ -77,14 +77,14 @@ class AEEvaluator(BaseEvaluator):
         geom = self.geometry if self.eval_integrals else None
         acc = self.zeros((*self.metric_keys, "_n"))
         plots: dict[str, Any] = {}
-        spectra: dict[int, tuple] = {}
+        spectra: dict[int, dict] = {}
         for plan, batch, _ in self.loader.iterate(self.ds, self.plans, self.load, self.place):
             tgt_int = None
             if self.eval_integrals:
                 if plan.number not in self._tgt_int:
-                    self._tgt_int[plan.number] = target_integrals(
-                        batch["df"], batch["file_index"], self.denorm, geom)
-                tgt_int = self._tgt_int[plan.number]
+                    self._tgt_int[plan.number] = jax.device_get(target_integrals(
+                        batch["df"], batch["file_index"], self.denorm, geom))
+                tgt_int = self.place(self._tgt_int[plan.number])
             acc, pred_d, tgt_d, phi = ae_eval_step(model, batch, acc, self.denorm, geom, tgt_int)
             if self.eval_spectra:
                 self._spectra(spectra, pred_d, tgt_d, plan)
@@ -92,19 +92,14 @@ class AEEvaluator(BaseEvaluator):
                 plots = self._plots(pred_d, tgt_d, phi, tgt_int, batch)
         sums = self.reduce(acc)
         metrics = {k: sums[k] / max(sums["_n"], 1.0) for k in self.metric_keys}
-        if spectra:
-            from neugk_jax.evaluate.metrics import merged_spectral_metrics
-            metrics.update(merged_spectral_metrics(spectra))
+        if self.eval_spectra:
+            metrics.update(self.spectral_metrics(spectra))
         return metrics, plots
 
     def _spectra(self, store, pred_d, tgt_d, plan) -> None:
         from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-        valid = plan.mask > 0
-        if not accumulate_spectral_diagnostics(store, pred_d, tgt_d, plan_fids(self.ds, plan),
-                                               self.ds, valid=valid):
-            if self.is_rank0:
-                print("[evaluate] eval_spectra requested but metadata has no 'ds'; skipping spectral metrics")
-            self.eval_spectra = False
+        accumulate_spectral_diagnostics(store, pred_d, tgt_d, plan_fids(self.ds, plan), self.ds,
+                                        valid=plan.mask > 0)
 
     @staticmethod
     def _plots(pred_d, tgt_d, phi, tgt_int, batch) -> dict[str, Any]:

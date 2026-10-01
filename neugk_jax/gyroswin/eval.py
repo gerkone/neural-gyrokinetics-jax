@@ -3,8 +3,9 @@
 Each validation sample is rolled out for up to ``n_eval_steps`` steps, capped per
 trajectory; step ``t`` targets are the next-step targets at ``timestep_index + t``.
 Logs ``{field}_x{t}`` per step (relative-norm MSE for df/phi, MSE for flux/fluxavg,
-optional ``phi_int``/``flux_int``), ``df_rel_l2_x{t}``/``phi_rel_l2_x{t}`` and the step
-means ``{field}``. Batches keep one shape; rollout steps beyond a trajectory are masked.
+optional ``phi_int`` (MSE of the integrated phi) and ``flux_int_rel_err``
+(``|eflux - flux| / |flux|`` of the integrated heat flux)), ``df_rel_l2_x{t}``/
+``phi_rel_l2_x{t}`` and the step means ``{field}``. Batches keep one shape; rollout steps beyond a trajectory are masked.
 """
 
 from __future__ import annotations
@@ -47,10 +48,11 @@ def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, denorm, geom, fi
         else:
             values[k] = per_sample_mse(pred_d[k], tgt_d[k])
     if geom is not None:
-        phi_i, (pflux, eflux, _) = integrate(geom, fids, pred_d["df"], pred_d["phi"],
-                                             real_potens=real_potens)
+        phi_i, (_, eflux, _) = integrate(geom, fids, pred_d["df"], pred_d["phi"],
+                                         real_potens=real_potens)
+        flux = tgt_d["flux"].reshape(-1)
         values["phi_int"] = per_sample_mse(phi_i, tgt_d["phi"].reshape(phi_i.shape))
-        values["flux_int"] = pflux**2 + (eflux - tgt_d["flux"].reshape(-1)) ** 2
+        values["flux_int_rel_err"] = jnp.abs(eflux - flux) / (jnp.abs(flux) + 1e-12)
     out = {k: acc[k].at[t].add(jnp.sum(v * live)) for k, v in values.items()}
     out["_n"] = acc["_n"].at[t].add(jnp.sum(live))
     return preds["df"], out, pred_d, tgt_d
@@ -74,7 +76,7 @@ class GyroSwinEvaluator(BaseEvaluator):
         names = []
         for k in self.fields:
             names += [k, f"{k}_rel_l2"] if k in ("df", "phi") else [k]
-        self.names = tuple(names + (["phi_int", "flux_int"] if self.eval_integrals else []))
+        self.names = tuple(names + (["phi_int", "flux_int_rel_err"] if self.eval_integrals else []))
 
     def load(self, ds, indices, read):
         return stack_fields(read(ds, indices), ("df", "conditioning", "file_index", "timestep",

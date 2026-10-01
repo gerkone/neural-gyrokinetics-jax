@@ -72,19 +72,20 @@ class DiffusionEvaluator(BaseEvaluator):
     """Sampling-based evaluator with per-trajectory flux UQ.
 
     ``val_ds`` serves df targets (mode "ae"); ``cond_slots`` selects the DiT conditioning
-    from the dataset's condition vector. ``steps``, ``n_samples``, ``subsample`` and
-    ``max_batches`` default to ``validation.eval_sample_steps`` / ``eval_n_samples`` /
-    ``val_subsample`` / ``eval_max_batches``.
+    from the dataset's condition vector. ``steps``, ``n_samples``, ``stride`` (every
+    ``stride``-th validation sample is evaluated) and ``max_batches`` default to
+    ``validation.eval_sample_steps`` / ``eval_n_samples`` / ``eval_stride`` /
+    ``eval_max_batches``.
     """
 
     def __init__(self, cfg: Any, *, val_ds: Any, autoencoder: Any, latent_scale: float,
                  cond_slots: Optional[np.ndarray] = None, steps: Optional[int] = None,
-                 n_samples: Optional[int] = None, subsample: Optional[int] = None,
+                 n_samples: Optional[int] = None, stride: Optional[int] = None,
                  max_batches: Optional[int] = None, method: str = "euler", **kwargs):
         vcfg = (cfg.get("validation") if hasattr(cfg, "get") else None) or {}
-        subsample = int(subsample or vcfg.get("val_subsample", 1))
+        stride = int(stride or vcfg.get("eval_stride", 1))
         max_batches = max_batches if max_batches is not None else vcfg.get("eval_max_batches")
-        super().__init__(cfg, val_ds=val_ds, indices=range(0, len(val_ds), subsample),
+        super().__init__(cfg, val_ds=val_ds, indices=range(0, len(val_ds), stride),
                          max_batches=max_batches, **kwargs)
         self.ae = replicate_local(self.dist, autoencoder)
         self.latent_scale = float(latent_scale)
@@ -93,7 +94,7 @@ class DiffusionEvaluator(BaseEvaluator):
         self.n_samples = int(n_samples or self.vcfg.get("eval_n_samples", 1))
         self.method = method
         self.eval_integrals = bool(self.vcfg.get("eval_integrals", True))
-        self.eval_spectra = bool(self.vcfg.get("eval_spectra", False))
+        self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
         self.metric_keys = ("df_mse", "df_rel_l2")
         self.traj_ids = [_traj_id(f) for f in val_ds.files]
 
@@ -128,9 +129,8 @@ class DiffusionEvaluator(BaseEvaluator):
                                                 phase="val sample", ts=ts))
         sums = self.reduce({**acc, **self._traj_sums(fluxes)})
         metrics = {k: sums[k] / max(sums["_n"], 1.0) for k in self.metric_keys}
-        if spectra:
-            from neugk_jax.evaluate.metrics import merged_spectral_metrics
-            metrics.update(merged_spectral_metrics(spectra))
+        if self.eval_spectra:
+            metrics.update(self.spectral_metrics(spectra))
         if self.eval_integrals:
             metrics.update(self._flux_metrics(sums, plots, avg_flux_confidence))
         return metrics, plots
@@ -176,7 +176,4 @@ class DiffusionEvaluator(BaseEvaluator):
 
     def _spectra(self, store, pred_d, tgt_d, fids, mask) -> None:
         from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-        if not accumulate_spectral_diagnostics(store, pred_d, tgt_d, fids, self.ds, valid=mask > 0):
-            if self.is_rank0:
-                print("[evaluate] eval_spectra requested but metadata has no 'ds'; skipping spectral metrics")
-            self.eval_spectra = False
+        accumulate_spectral_diagnostics(store, pred_d, tgt_d, fids, self.ds, valid=mask > 0)

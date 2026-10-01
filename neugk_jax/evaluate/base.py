@@ -137,14 +137,36 @@ class BaseEvaluator:
     def reduce(self, acc: dict) -> dict[str, float]:
         return self.sum_processes({k: float(v) for k, v in jax.device_get(acc).items()})
 
+    def spectra_available(self, requested: bool) -> bool:
+        """``requested`` unless a validation trajectory's metadata lacks the ``ds`` spacing."""
+        if requested and any(self.ds.get_ds(f) is None for f in range(len(self.ds.files))):
+            if self.is_rank0:
+                print("[evaluate] eval_spectra requested but metadata has no 'ds'; "
+                      "skipping spectral metrics")
+            return False
+        return requested
+
+    def spectral_metrics(self, store: dict) -> dict[str, float]:
+        """Spectral metrics of the per-trajectory sums of every process (collective)."""
+        from neugk_jax.evaluate import metrics as m
+        if self.dist.num_processes > 1:
+            n_ky = int(self.ds.resolution[-1])
+            packed = self.sum_process_arrays(m.pack_spectral_store(store, len(self.ds.files), n_ky))
+            store = m.unpack_spectral_store(packed, n_ky)
+        return m.merged_spectral_metrics(store)
+
+    def sum_process_arrays(self, arr: np.ndarray) -> np.ndarray:
+        if self.dist.num_processes <= 1:
+            return arr
+        from jax.experimental import multihost_utils
+        return np.asarray(multihost_utils.process_allgather(arr)).sum(axis=0)
+
     def sum_processes(self, host: dict[str, float]) -> dict[str, float]:
         """Sum host scalars over processes; every process passes the same key set."""
         if self.dist.num_processes <= 1:
             return host
-        from jax.experimental import multihost_utils
         keys = sorted(host)
-        arr = np.asarray([host[k] for k in keys], dtype=np.float64)
-        tot = np.asarray(multihost_utils.process_allgather(arr)).sum(axis=0)
+        tot = self.sum_process_arrays(np.asarray([host[k] for k in keys], dtype=np.float64))
         return {k: float(v) for k, v in zip(keys, tot)}
 
     def __call__(self, model: Any, *, epoch: int) -> tuple[dict[str, float], dict[str, Any]]:

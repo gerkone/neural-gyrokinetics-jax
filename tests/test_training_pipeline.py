@@ -10,7 +10,7 @@ import pytest
 
 from neugk_jax.training.checkpoint import AsyncCheckpointer, CheckpointState, load_checkpoint
 from neugk_jax.training.data import BatchLoader, eval_plans, train_plans
-from neugk_jax.training.ddp import init_distributed, shard_batch
+from neugk_jax.training.ddp import init_distributed, shard_local
 from neugk_jax.utils import TRACE_COUNTS
 
 
@@ -32,17 +32,20 @@ def _load(ds, indices, read):
 def test_eval_batches_keep_one_shape_and_mask_the_tail():
     ds = _Rows(7)
     dist = init_distributed()
-    plans = eval_plans(dist, range(len(ds)), 3)
+    # 3 rows per local device
+    bs = 3 * dist.local_device_count
+    plans = eval_plans(dist, range(len(ds)), bs)
     loader = BatchLoader(workers=2, prefetch=2)
     seen, shapes = [], set()
-    for plan, batch, _ in loader.iterate(ds, plans, _load, lambda b: shard_batch(dist, b)):
+    for plan, batch, _ in loader.iterate(ds, plans, _load, lambda b: shard_local(dist, b)):
         assert isinstance(batch["x"], jax.Array)
         shapes.add(batch["x"].shape)
         seen.extend(np.asarray(batch["i"])[plan.mask > 0].tolist())
     loader.close()
-    assert shapes == {(3, 3)}
-    assert plans[-1].mask.tolist() == [1.0, 0.0, 0.0]
-    assert plans[-1].indices.tolist() == [6, 6, 6]
+    tail = 7 % bs or bs
+    assert shapes == {(bs, 3)}
+    assert plans[-1].mask.tolist() == [1.0] * tail + [0.0] * (bs - tail)
+    assert plans[-1].indices.tolist() == list(range(7 - tail, 7)) + [6] * (bs - tail)
     assert seen == list(range(7))
 
 
@@ -109,3 +112,16 @@ def test_ae_train_step_does_not_retrace_across_epochs(tmp_path):
     assert TRACE_COUNTS["train_step:AERunner"] == 0 and TRACE_COUNTS["ae_eval_step"] == 0
     assert set(logs1) == {"total", "df"} and np.isfinite(logs2["total"])
     assert {"data_ms", "step_ms", "first_step_ms"} <= set(info)
+
+
+def test_local_view_places_unreplicated_arrays_on_the_local_mesh():
+    from neugk_jax.training.ddp import local_view, replicate_local
+
+    dist = init_distributed()
+    tree = {"single": jax.device_put(jnp.arange(4.0), jax.local_devices()[0]),
+            "replicated": replicate_local(dist, jnp.ones(3)), "static": 3}
+    out = local_view(dist, tree)
+    local = set(jax.local_devices())
+    assert out["single"].sharding.device_set == local
+    assert out["replicated"].sharding.device_set == local and out["static"] == 3
+    assert np.array_equal(np.asarray(out["single"]), np.arange(4.0))

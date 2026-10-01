@@ -78,11 +78,25 @@ def test_next_step_tail_offset_keeps_rollout_targets(two_trajs):
     ds = CycloneDataset(path=str(root), trajectories=["iteration_0"], fields_to_load=("df",),
                         mode="next", backend=NumpyBackend(), tail_offset=2, split="val")
     assert len(ds) == 6 - 2 - 1
-    last = ds[len(ds) - 1]
-    # every rollout step capped by num_ts still has a target on disk
-    steps = ds.num_ts(0) - int(last.timestep_index) - 1
-    for t in range(steps + 2):
-        ds.get_at_time(0, int(last.timestep_index) + t)
+    last = int(ds[len(ds) - 1].timestep_index)
+    # the tail keeps full rollouts: every step capped by num_ts has a target on disk
+    steps = ds.num_ts(0) - last - 1
+    assert steps >= 2
+    for t in range(steps):
+        ds.get_target(0, last + t)
+    with pytest.raises(FileNotFoundError):
+        ds.get_target(0, last + steps)
+
+
+def test_rollout_cap_with_subsample(two_trajs):
+    root, _ = two_trajs
+    ds = CycloneDataset(path=str(root), trajectories=["iteration_1"], fields_to_load=("df",),
+                        mode="next", backend=NumpyBackend(), tail_offset=2, split="val",
+                        subsample=2)
+    t0 = [int(ds[i].timestep_index) for i in range(len(ds))]
+    assert t0 == [0, 2]
+    # num_ts and timestep_index are both raw, so no sample loses its rollout
+    assert all(ds.num_ts(0) - t - 1 >= 2 for t in t0)
 
 
 def test_next_step_normalization(two_trajs):
@@ -90,13 +104,16 @@ def test_next_step_normalization(two_trajs):
     ds = CycloneDataset(path=str(root), trajectories=["iteration_0"], fields_to_load=("df", "phi"),
                         mode="next", backend=NumpyBackend(), normalization=_NORM,
                         normalization_stats=_stats())
-    s, raw = ds[2], ds.get_at_time(0, 2, normalized=False)
+    raw = CycloneDataset(path=str(root), trajectories=["iteration_0"],
+                         fields_to_load=("df", "phi"), mode="next", backend=NumpyBackend())[2]
+    s = ds[2]
     assert np.allclose(s.df, (raw.df - 0.5) / 2.0)
     assert np.allclose(s.y_df, (raw.y_df - 0.5) / 2.0)
     assert np.allclose(s.y_phi, (raw.y_phi + 0.5) / 3.0)
     assert s.y_flux == pytest.approx((metas[0]["flux"][3] - 1.0) / 2.0)
     assert s.y_fluxavg == pytest.approx((np.mean(metas[0]["flux"][1:][-80:]) + 1.0) / 4.0)
-    assert np.allclose(ds.denormalize(0, fluxavg=s.y_fluxavg), raw.y_fluxavg, atol=1e-6)
+    scale, shift = ds.scale_shift([0], "fluxavg", 0)
+    assert np.allclose(s.y_fluxavg * scale + shift, raw.y_fluxavg, atol=1e-6)
 
 
 def test_timestep_condition(two_trajs):

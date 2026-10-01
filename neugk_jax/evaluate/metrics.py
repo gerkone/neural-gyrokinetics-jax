@@ -103,77 +103,138 @@ def _diagnostics_from_fields(phi_spec, eflux, geom, ds) -> List[Dict[str, np.nda
     return out
 
 
+_ZF_KEYS = ("zfphi", "zfflow", "zfshear")
+
+
+def _rl2(p, g) -> float:
+    return float(np.linalg.norm(p - g) / (np.linalg.norm(g) + 1e-12))
+
+
+def spectral_sums(pred_diags: List[Dict[str, np.ndarray]],
+                  gt_diags: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+    """Additive per-trajectory statistics of paired snapshot diagnostics."""
+    out: Dict[str, np.ndarray] = {"n": np.asarray(float(len(pred_diags)))}
+    for key in ("kyspec", "qspec"):
+        out[f"{key}_p"] = np.stack([np.asarray(d[key], np.float64) for d in pred_diags]).sum(0)
+        out[f"{key}_g"] = np.stack([np.asarray(d[key], np.float64) for d in gt_diags]).sum(0)
+    if "zfphi" in pred_diags[0]:
+        for key in _ZF_KEYS:
+            out[f"{key}_rl2"] = np.asarray(sum(_rl2(p[key], g[key])
+                                               for p, g in zip(pred_diags, gt_diags)))
+        out["zf_er"] = np.asarray(sum(
+            float((p["zfphi"] ** 2).sum() / ((g["zfphi"] ** 2).sum() + 1e-12))
+            for p, g in zip(pred_diags, gt_diags)))
+    return out
+
+
+def add_spectral_sums(acc: Optional[Dict[str, np.ndarray]], new: Dict[str, np.ndarray]):
+    if acc is None:
+        return new
+    return {k: acc[k] + new[k] for k in acc}
+
+
+def metrics_from_spectral_sums(sums: Dict[str, np.ndarray]) -> Dict[str, float]:
+    """Pearson/Spearman/Wasserstein/L1 on the time-averaged ky and Q spectra, zonal-flow errors."""
+    n = float(sums["n"])
+    out: Dict[str, float] = {}
+    for key in ("kyspec", "qspec"):
+        p, g = sums[f"{key}_p"] / n, sums[f"{key}_g"] / n
+        out[f"{key}_pc"] = float(_pearson(p, g))
+        out[f"{key}_sc"] = float(_spearman(p, g))
+        out[f"{key}_l1"] = float(np.abs(p - g).sum())
+        out[f"{key}_rl2"] = float(np.linalg.norm(p - g) / (np.linalg.norm(g) + 1e-12))
+        out[f"{key}_rl1"] = float(np.abs(p - g).sum() / (np.abs(g).sum() + 1e-12))
+        pn, gn = p / (p.sum() + 1e-12), g / (g.sum() + 1e-12)
+        out[f"{key}_wd"] = float(_wasserstein_1d(pn, gn))
+    if "zf_er" in sums:
+        for key in _ZF_KEYS:
+            out[f"{key}_rl2"] = float(sums[f"{key}_rl2"]) / n
+        out["zf_energy_err"] = abs(float(sums["zf_er"]) / n - 1)
+    return out
+
+
 def time_averaged_spectral_metrics(
     pred_diags: List[Dict[str, np.ndarray]],
     gt_diags: List[Dict[str, np.ndarray]],
 ) -> Dict[str, float]:
-    """Pearson/Spearman/Wasserstein/L1 on the time-averaged ky and Q spectra."""
-    out: Dict[str, float] = {}
-    for key in ("kyspec", "qspec"):
-        p = np.stack([np.asarray(d[key]) for d in pred_diags], 0).mean(0)
-        g = np.stack([np.asarray(d[key]) for d in gt_diags], 0).mean(0)
-        out[f"{key}_pc"] = float(_pearson(p, g))
-        out[f"{key}_sc"] = float(_spearman(p, g))
-        out[f"{key}_l1"] = float(np.abs(p - g).sum())
-        out[f"{key}_rl2"] = float(np.linalg.norm(p - g) / (np.linalg.norm(g) + 1e-12))  # relative l2
-        out[f"{key}_rl1"] = float(np.abs(p - g).sum() / (np.abs(g).sum() + 1e-12))  # relative l1
-        pn, gn = p / (p.sum() + 1e-12), g / (g.sum() + 1e-12)
-        out[f"{key}_wd"] = float(_wasserstein_1d(pn, gn))
-    # zonal-flow fidelity (gkw diagnos_zfshear quantities): score per snapshot (rel-l2), average over time
-    for key in ("zfphi", "zfflow", "zfshear"):
-        if key in pred_diags[0]:
-            rl2 = [
-                float(np.linalg.norm(p[key] - g[key]) / (np.linalg.norm(g[key]) + 1e-12))
-                for p, g in zip(pred_diags, gt_diags)
-            ]
-            out[f"{key}_rl2"] = sum(rl2) / len(rl2)
-    if "zfphi" in pred_diags[0]:
-        er = [
-            float((p["zfphi"] ** 2).sum() / ((g["zfphi"] ** 2).sum() + 1e-12))
-            for p, g in zip(pred_diags, gt_diags)
-        ]
-        out["zf_energy_err"] = abs(sum(er) / len(er) - 1)  # |E_pred/E_gt - 1|
+    """Spectral metrics of one trajectory's paired snapshot diagnostics."""
+    return metrics_from_spectral_sums(spectral_sums(pred_diags, gt_diags))
+
+
+def spectral_sums_layout(n_ky: int) -> Dict[str, tuple]:
+    """Shapes of the :func:`spectral_sums` entries for ``n_ky`` binormal modes."""
+    return {"n": (), "kyspec_p": (n_ky,), "kyspec_g": (n_ky,), "qspec_p": (n_ky,),
+            "qspec_g": (n_ky,), **{f"{k}_rl2": () for k in _ZF_KEYS}, "zf_er": ()}
+
+
+def pack_spectral_store(store: Dict[int, Dict[str, np.ndarray]], n_files: int,
+                        n_ky: int) -> np.ndarray:
+    """Fixed-shape ``(n_files, D)`` array of per-trajectory sums (zeros where absent)."""
+    layout = spectral_sums_layout(n_ky)
+    out = np.zeros((n_files, sum(int(np.prod(s)) for s in layout.values())), np.float64)
+    for fid, sums in store.items():
+        out[fid] = np.concatenate([np.asarray(sums[k], np.float64).reshape(-1) for k in layout])
     return out
+
+
+def unpack_spectral_store(packed: np.ndarray, n_ky: int) -> Dict[int, Dict[str, np.ndarray]]:
+    layout = spectral_sums_layout(n_ky)
+    store = {}
+    for fid, row in enumerate(packed):
+        parts, i = {}, 0
+        for k, shape in layout.items():
+            size = int(np.prod(shape))
+            parts[k] = row[i:i + size].reshape(shape)
+            i += size
+        if parts["n"] > 0:
+            store[fid] = parts
+    return store
 
 
 # evaluator glue — shared between the ae and diffusion evaluators
 def accumulate_spectral_diagnostics(
-    store: Dict[int, tuple],
+    store: Dict[int, Dict[str, np.ndarray]],
     df_pred,
     df_tgt,
     file_idx: np.ndarray,
     val_ds: Any,
     valid: Optional[np.ndarray] = None,
 ) -> bool:
-    """Append per-snapshot pred/gt diagnostics to ``store``, grouped by trajectory.
+    """Add per-trajectory spectral sums of a pred/target batch into ``store``.
 
-    ``df_pred``/``df_tgt`` are denormalised batches (host or device); the spectral
-    fields are computed for the whole batch with each trajectory's geometry, so the
-    batch shape stays fixed, and only the small fields come to host. Rows where
-    ``valid`` is False are skipped. Returns ``False`` (without touching ``store``)
-    when the dataset metadata carries no ``ds`` so the caller can warn once.
+    ``df_pred``/``df_tgt`` are denormalised batches (host or device); each row's spectral
+    fields are computed once with its trajectory's geometry over the whole fixed-shape
+    batch, and only the small fields come to host. Rows where ``valid`` is False are
+    skipped. Returns ``False`` (without touching ``store``) when the dataset metadata
+    carries no ``ds`` so the caller can warn once.
     """
     from neugk_jax.evaluate.integrals import gyaradax_spectral_fields
     file_idx = np.asarray(file_idx)
     valid = np.ones(len(file_idx), bool) if valid is None else np.asarray(valid, bool)
-    for fid in np.unique(file_idx[valid]):
-        ds_val = val_ds.get_ds(int(fid))
-        if ds_val is None:
-            return False
+    fids = np.unique(file_idx[valid])
+    ds_vals = {int(f): val_ds.get_ds(int(f)) for f in fids}
+    if any(v is None for v in ds_vals.values()):
+        return False
+    if not len(fids):
+        return True
+    geoms = {int(f): {k: np.asarray(v) for k, v in val_ds.metadata[int(f)]["geometry"].items()}
+             for f in fids}
+    rows = [geoms[int(f) if int(f) in geoms else int(fids[0])] for f in file_idx]
+    batched = {k: np.stack([g[k] for g in rows]) for k in rows[0]}
+    fields = [gyaradax_spectral_fields(src, batched, per_sample=True) for src in (df_pred, df_tgt)]
+    for fid in fids:
         idx = np.where((file_idx == fid) & valid)[0]
-        geom = {k: np.asarray(v) for k, v in val_ds.metadata[int(fid)]["geometry"].items()}
-        p_list, g_list = store.setdefault(int(fid), ([], []))
-        for src, dst in ((df_pred, p_list), (df_tgt, g_list)):
-            phi_spec, eflux = gyaradax_spectral_fields(src, geom)
-            dst.extend(_diagnostics_from_fields(phi_spec[idx], eflux[idx], geom, ds_val))
+        geom, ds_val = geoms[int(fid)], ds_vals[int(fid)]
+        (pp, pe), (gp, ge) = fields
+        sums = spectral_sums(_diagnostics_from_fields(pp[idx], pe[idx], geom, ds_val),
+                             _diagnostics_from_fields(gp[idx], ge[idx], geom, ds_val))
+        store[int(fid)] = add_spectral_sums(store.get(int(fid)), sums)
     return True
 
 
-def merged_spectral_metrics(store: Dict[int, tuple]) -> Dict[str, float]:
+def merged_spectral_metrics(store: Dict[int, Dict[str, np.ndarray]]) -> Dict[str, float]:
     """Per-trajectory time-averaged spectral metrics, mean over trajectories."""
-    per_traj = [
-        time_averaged_spectral_metrics(p, g) for p, g in store.values() if p and g
-    ]
+    per_traj = [metrics_from_spectral_sums(s) for s in store.values() if float(s["n"]) > 0]
     if not per_traj:
         return {}
     return {k: float(np.mean([m[k] for m in per_traj])) for k in per_traj[0]}

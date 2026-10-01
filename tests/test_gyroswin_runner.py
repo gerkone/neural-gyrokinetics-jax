@@ -118,7 +118,7 @@ def test_gyroswin_integral_losses_train_and_eval(cyclone_dir):
     assert {"phi_int", "flux_int"} <= set(logs)
     assert all(np.isfinite(v) for v in logs.values())
     metrics, _ = r.evaluate(1)
-    assert np.isfinite(metrics["phi_int_x1"]) and np.isfinite(metrics["flux_int_x2"])
+    assert np.isfinite(metrics["phi_int_x1"]) and np.isfinite(metrics["flux_int_rel_err_x2"])
 
 
 def test_cross_losses_rejected(cyclone_dir):
@@ -164,8 +164,9 @@ def test_gyroswin_epochs_do_not_retrace(cyclone_dir):
     cfg = _cfg(cyclone_dir, {"df": 1.0, "phi": 0.1, "flux": 1.0},
                extra={"phi_int": 0.1, "flux_int": 0.1})
     r = GyroSwinRunner(cfg, output_path=cfg.output_path)
-    # 3 val samples at batch 2: the last batch is padded
-    assert r.evaluator.plans[-1].mask.tolist() == [1.0, 0.0]
+    # 3 val samples: the last batch is padded to the evaluator batch
+    bs = r.evaluator.batch_size
+    assert r.evaluator.plans[-1].mask.tolist() == [1.0] * (3 % bs or bs) + [0.0] * (-3 % bs)
     r.train_epoch(1, jr.PRNGKey(0))
     first, _ = r.evaluate(1)
     TRACE_COUNTS.clear()
@@ -173,7 +174,7 @@ def test_gyroswin_epochs_do_not_retrace(cyclone_dir):
     second, _ = r.evaluate(2)
     assert TRACE_COUNTS["train_step:GyroSwinRunner"] == 0
     assert TRACE_COUNTS["gyroswin_eval_step"] == 0
-    for k in ("df_rel_l2_x1", "phi_rel_l2_x2", "df_rel_l2", "flux_int_x1"):
+    for k in ("df_rel_l2_x1", "phi_rel_l2_x2", "df_rel_l2", "flux_int_rel_err_x1"):
         assert np.isfinite(second[k]), k
 
 

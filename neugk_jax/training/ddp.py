@@ -142,13 +142,19 @@ def replicate_local(dist: DistributedInfo, tree):
 
 
 def local_view(dist: DistributedInfo, tree):
-    """Process-local replicated view of globally replicated arrays (no copy of the shards)."""
+    """Process-local replicated view of replicated arrays.
+
+    Globally replicated arrays reuse their local shards; arrays on fewer devices are
+    copied onto the local mesh.
+    """
     mesh = dist.local_mesh
     rep = _replicated_sharding(mesh)
 
     def view(x):
         if not isinstance(x, jax.Array) or x.sharding.device_set == set(mesh.devices.flat):
             return x
+        if len(x.addressable_shards) != mesh.size:
+            return jax.device_put(x, rep)
         shards = [s.data for s in x.addressable_shards]
         if mesh.size == 1:
             return shards[0]

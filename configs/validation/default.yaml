@@ -7,4 +7,4 @@ eval_sampling: false       # diffusion: sample, decode and integrate (slow)
 eval_sample_steps: 50      # diffusion: euler steps per sample
 eval_n_samples: 1          # diffusion: samples per validation condition
 eval_max_batches: null     # diffusion: cap on sampling batches
-val_subsample: 1           # diffusion: stride over validation samples
+eval_stride: 1             # diffusion: evaluate every k-th validation sample

@@ -75,7 +75,7 @@ def test_dataset_construction(synthetic_dir):
     )
     assert len(ds.files) == 2
     assert ds.resolution == res
-    # per-file samples = file_num_timesteps - bundle_seq_length*2 + 1 = 8 - 2 + 1 = 7
+    # per-file samples = n_t - bundle_seq_length*2 + 1 = 8 - 2 + 1 = 7
     assert len(ds) == 7 * 2
 
 
@@ -130,7 +130,8 @@ def test_normalize_denormalize_roundtrip(synthetic_dir):
     # craft a synthetic field of known mean/std and roundtrip through normalize
     x = np.full((2, *ds.resolution), 5.0, dtype=np.float32)
     z = ds.normalize(0, df=x)
-    y = ds.denormalize(0, df=z)
+    scale, shift = ds.scale_shift([0], "df", x.ndim)
+    y = z * scale + shift
     assert np.allclose(y, x, atol=1e-5)
 
 
@@ -146,20 +147,6 @@ def test_separate_zf_doubles_channels(synthetic_dir):
     s = ds[0]
     # df channels doubled by separate_zf
     assert s.df.shape[0] == 4
-
-
-def test_get_batch_geometry(synthetic_dir):
-    root, _ = synthetic_dir
-    ds = CycloneDataset(
-        path=str(root), split="train",
-        trajectories=["iteration_001", "iteration_002"],
-        backend=NumpyBackend(),
-    )
-    file_idx = np.array([0, 1, 0])
-    g = ds.get_batch_geometry(file_idx)
-    # every key batched to size 3
-    for k, v in g.items():
-        assert v.shape[0] == 3, f"{k} not batched"
 
 
 def _assert_meta_equal(a: dict, b: dict):
@@ -249,3 +236,16 @@ def test_missing_cond_filter_field_excludes_trajectory(tmp_path):
     # iteration_002 lacks the filter field -> excluded rather than crash
     assert len(ds.files) == 1
     assert "iteration_001" in ds.files[0]
+
+
+def test_normalized_field_without_stats_raises(synthetic_dir):
+    root, _ = synthetic_dir
+    ds = CycloneDataset(
+        path=str(root), split="train", trajectories=["iteration_001"], fields_to_load=("df",),
+        normalization={"df": {"type": "zscore"}, "flux": {"type": "zscore"}},
+        normalization_stats={"df": {"full": {"mean": 0.0, "std": 1.0}}},
+        backend=NumpyBackend(),
+    )
+    ds.normalize(0, df=np.zeros((2, *ds.resolution), np.float32))
+    with pytest.raises(KeyError, match="flux"):
+        ds.normalize(0, flux=np.float32(1.0))
