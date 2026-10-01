@@ -65,18 +65,15 @@ def unfold_patches(
 
 
 def pad_amounts(spatial: Sequence[int], block_size: Sequence[int]) -> tuple[int, ...]:
-    """Per-axis right padding that makes each spatial size a multiple of its block."""
     return tuple(-s % b for s, b in zip(spatial, _normalize_patch(block_size)))
 
 
 def pad_to_blocks(x: jnp.ndarray, block_size: Sequence[int]) -> jnp.ndarray:
-    """Right-pad each leading spatial axis with zeros to a multiple of ``block_size``."""
     pads = pad_amounts(x.shape[: len(block_size)], block_size)
     return jnp.pad(x, [(0, p) for p in pads] + [(0, 0)] * (x.ndim - len(pads)))
 
 
 def unpad(x: jnp.ndarray, shape: Sequence[int]) -> jnp.ndarray:
-    """Crop the leading spatial axes back to ``shape``."""
     return x[tuple(slice(0, s) for s in shape)]
 
 
@@ -116,7 +113,6 @@ class PatchEmbed(eqx.Module):
 
 
 def merge_grid(grid_size: Sequence[int]) -> tuple[int, ...]:
-    """Grid after a ``PatchMerge``: every axis of size ≥ 2 halved, rounding up."""
     return tuple((g + 1) // 2 if g >= 2 else g for g in grid_size)
 
 

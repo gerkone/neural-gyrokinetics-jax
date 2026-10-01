@@ -180,7 +180,6 @@ class BaseRunner:
 
     @property
     def eval_batch_size(self) -> int:
-        """Per-device validation batch: ``validation.batch_size``, else the training one."""
         return self.vcfg.get("batch_size") or self.tcfg.batch_size
 
     def evaluator_kwargs(self) -> dict:
@@ -189,7 +188,6 @@ class BaseRunner:
         )
 
     def build_data(self, mode: str, **kwargs) -> None:
-        """Train and val datasets of ``mode`` from the ``dataset`` config."""
         self.train_ds, self.val_ds = build_splits(
             self.cfg.dataset, dist=self.dist, mode=mode, **kwargs
         )

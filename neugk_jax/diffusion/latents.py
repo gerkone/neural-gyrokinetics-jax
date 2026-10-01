@@ -124,7 +124,6 @@ def precompute_latents(
     if not cache_file.exists() and jax.process_index() == 0:
         latents_dict = _encode_all(dataset, encode_fn, batch_size)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        # the sidecar lands first, so a cache is never visible without it
         if meta is not None:
             write_cache_meta(cache_file, meta)
         atomic_write(

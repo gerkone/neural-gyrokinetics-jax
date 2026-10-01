@@ -27,23 +27,32 @@ from neugk_jax.utils import recombine_zf, to_dict
 
 
 def validation_cfg(cfg) -> dict:
-    """The ``validation`` section of a run config as a plain dict."""
     return to_dict(cfg.get("validation")) if hasattr(cfg, "get") else {}
 
 
-def geometry_table(ds, fids: Optional[Sequence[int]] = None) -> dict[str, np.ndarray]:
-    """Stacked :func:`precompute_geometry` tensors of trajectories ``fids`` (default: all)."""
-    fids = range(len(ds.files)) if fids is None else fids
-    geoms = []
-    for f in fids:
-        g = ds.metadata[int(f)].get("geometry")
-        require_geometry(g)
-        geoms.append(precompute_geometry(g))
-    return {k: np.stack([g[k] for g in geoms]) for k in geoms[0]}
+class GeometryCache:
+    """:func:`precompute_geometry` tensors of a dataset's trajectories, computed once each."""
+
+    def __init__(self, ds):
+        self.ds = ds
+        self._geoms: dict[int, dict] = {}
+
+    def _one(self, fid: int) -> dict:
+        if fid not in self._geoms:
+            g = self.ds.metadata[fid].get("geometry")
+            require_geometry(g)
+            self._geoms[fid] = precompute_geometry(g)
+        return self._geoms[fid]
+
+    def stack(self, fids: Sequence[int]) -> dict[str, np.ndarray]:
+        rows = [self._one(int(f)) for f in fids]
+        return {k: np.stack([r[k] for r in rows]) for k in rows[0]}
+
+    def table(self) -> dict[str, np.ndarray]:
+        return self.stack(range(len(self.ds.files)))
 
 
 def recon_metrics(pred, x, pred_d, tgt_d) -> dict:
-    """``df_mse`` of the normalized pair and ``df_rel_l2`` of the denormalized, zf-recombined pair."""
     return {
         "df_mse": per_sample_mse(pred, x),
         "df_rel_l2": per_sample_rel_l2(recombine_zf(pred_d, axis=1), recombine_zf(tgt_d, axis=1)),
@@ -72,8 +81,11 @@ class BaseEvaluator:
     """Owns the fixed evaluation batch plan, the device tables and metric reduction.
 
     ``batch_size`` is per local device. Subclasses define ``metric_keys`` and
-    ``__call__(model, *, epoch) -> (metrics, plots)``.
+    ``__call__(model, *, epoch) -> (metrics, plots)``; ``validation.eval_integrals``
+    defaults to their ``integrals_default``.
     """
+
+    integrals_default: bool = False
 
     def __init__(
         self,
@@ -97,6 +109,7 @@ class BaseEvaluator:
             self.dist, idx, self.batch_size, max_batches, val_ds.flat_index_to_file_and_tstep
         )
         self.norm = replicate_local(self.dist, val_ds.norm)
+        self.eval_integrals = bool(self.vcfg.get("eval_integrals", self.integrals_default))
         self._geometry = None
 
     @property
@@ -106,7 +119,7 @@ class BaseEvaluator:
     @property
     def geometry(self) -> dict:
         if self._geometry is None:
-            self._geometry = replicate_local(self.dist, geometry_table(self.ds))
+            self._geometry = replicate_local(self.dist, GeometryCache(self.ds).table())
         return self._geometry
 
     def place(self, batch):
@@ -122,18 +135,15 @@ class BaseEvaluator:
         return self.sum_processes({k: float(v) for k, v in jax.device_get(acc).items()})
 
     def finalize(self, sums: Mapping[str, float], keys: Sequence[str]) -> dict[str, float]:
-        """Per-sample means of the accumulated ``keys`` (``_n`` holds the sample count)."""
         return {k: sums[k] / max(sums["_n"], 1.0) for k in keys}
 
     def spectra(self, store: dict, pred_d, tgt_d, plan) -> None:
-        """Add the plan's per-trajectory spectral sums of a denormalized pair into ``store``."""
         from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
 
         accumulate_spectral_diagnostics(store, pred_d, tgt_d, plan.fids, self.ds, plan.mask > 0)
 
     @staticmethod
     def plot_time(batch) -> np.ndarray:
-        """Time of the first batch row, the plotted snapshot."""
         return np.asarray(jax.device_get(batch["timestep"][:1])).reshape(-1)
 
     def spectra_available(self, requested: bool) -> bool:

@@ -27,7 +27,6 @@ def has_header(bits: str) -> bool:
 
 
 def payload_size(bits: str, n_elems: int) -> int:
-    """Number of payload elements (16-bit or byte values) holding ``n_elems`` values."""
     return (n_elems + 1) // 2 if bits == "i4" else n_elems
 
 
@@ -130,6 +129,5 @@ def read(path: str, bits: str, n_elems: int) -> np.ndarray:
 
 
 def roundtrip(arr_f32: np.ndarray, bits: str) -> np.ndarray:
-    """``arr_f32`` at ``bits`` precision, as fp32 of the same shape."""
     payload, scale = quantize(arr_f32.ravel(), bits)
     return dequantize(payload, scale, bits, arr_f32.size).reshape(arr_f32.shape)

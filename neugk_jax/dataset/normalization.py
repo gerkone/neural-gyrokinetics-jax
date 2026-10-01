@@ -15,7 +15,6 @@ class _StatsUnpickler(pickle.Unpickler):
     """Unpickles stats pickles that reference a ``RunningMeanStd`` class."""
 
     def find_class(self, module, name):
-        # the stats class carries the same buffers and pickle restores __dict__ directly
         if name == "RunningMeanStd" and module.startswith(("neugk.", "neugk_jax.")):
             return RunningStats
         return super().find_class(module, name)

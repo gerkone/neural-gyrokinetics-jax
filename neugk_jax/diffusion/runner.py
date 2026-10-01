@@ -23,7 +23,7 @@ from neugk_jax.diffusion.latents import (
     latent_cache_path,
     load_precomputed_latents,
 )
-from neugk_jax.training.build import build_dit
+from neugk_jax.models.build import build_dit
 from neugk_jax.training.runner import BaseRunner, conditioning_slots
 from neugk_jax.utils import to_dict
 
@@ -77,7 +77,8 @@ def check_ae_dataset(ae_dataset: dict, dataset: dict) -> None:
 
 def load_autoencoder(path, *, resolution=None, dataset: dict | None = None):
     """AE of a run directory or checkpoint file; ``dataset`` is checked against the run's."""
-    from neugk_jax.translate import build_ae_from_config, load_or_translate
+    from neugk_jax.models.build import build_ae_from_config
+    from neugk_jax.translate import load_or_translate
 
     ae_file = resolve_ae_checkpoint(path)
     ae_cfg = to_dict(str(ae_file.parent / "config.yaml"))
@@ -189,7 +190,7 @@ class FlowMatchingRunner(BaseRunner):
         )
         if not self.vcfg.get("eval_sampling", False):
             return None
-        # the sampled latents are scored against the df snapshots of the val split
+        # sampled latents are scored against the df snapshots
         kwargs = {**self.evaluator_kwargs(), "val_ds": self.val_ds.with_mode("ae")}
         return DiffusionEvaluator(
             self.cfg,

@@ -138,7 +138,6 @@ class QueryPool(eqx.Module):
 
 
 def velocity_pool(pool: QueryPool, df: jnp.ndarray, *, key=None, inference: bool = True):
-    """Pool the velocity tokens of a ``(vp, [mu,] s, x, y, C)`` df latent to ``(s, x, y, out)``."""
     pattern = "vp s x y c -> (s x y) vp c" if df.ndim == 5 else "vp mu s x y c -> (s x y) (vp mu) c"
     out = pool(rearrange(df, pattern), key=key, inference=inference)
     return out.reshape(*df.shape[-4:-1], -1)

@@ -6,7 +6,7 @@ import jax
 import jax.random as jr
 
 from neugk_jax.losses import df_loss
-from neugk_jax.training.build import build_ae
+from neugk_jax.models.build import build_ae
 from neugk_jax.training.runner import BaseRunner
 
 

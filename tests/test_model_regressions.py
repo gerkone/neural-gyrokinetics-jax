@@ -107,7 +107,7 @@ def test_ae_backbone_has_no_dead_middle():
 def test_ae_dit_builders_accept_mappings(tmp_path):
     import yaml
 
-    from neugk_jax.translate import build_ae_from_config, build_dit_from_config
+    from neugk_jax.models.build import build_ae_from_config, build_dit_from_config
 
     ae_cfg = {
         "model": {

@@ -47,7 +47,6 @@ class AEEvaluator(BaseEvaluator):
 
     def __init__(self, cfg: Any, **kwargs):
         super().__init__(cfg, **kwargs)
-        self.eval_integrals = bool(self.vcfg.get("eval_integrals", False))
         self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
         keys = ["df_mse", "df_rel_l2"]
         if self.eval_integrals:

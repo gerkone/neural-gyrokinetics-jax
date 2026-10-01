@@ -454,7 +454,7 @@ class FieldSolver:
 
 
 def _new_stats() -> RunningStats:
-    # the stored dataset statistics are seeded with a 1e-4 prior count
+    # prior count of the stored dataset statistics
     return RunningStats(prior_count=1e-4)
 
 

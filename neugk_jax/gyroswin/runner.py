@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import jax
 import jax.random as jr
-import numpy as np
 
-from neugk_jax.evaluate.base import geometry_table
+from neugk_jax.evaluate.base import GeometryCache
+from neugk_jax.gyroswin.eval import N_EVAL_STEPS
 from neugk_jax.losses import integral_losses
-from neugk_jax.training.build import build_gyroswin
+from neugk_jax.models.build import build_gyroswin
 from neugk_jax.training.data import stack_fields
 from neugk_jax.training.loss_scheduler import DATA_LOSSES, LossConfig, compute_multi_task_loss
 from neugk_jax.training.runner import BaseRunner
@@ -30,7 +30,7 @@ class GyroSwinRunner(BaseRunner):
         if self.loss_cfg.integrals:
             fields |= {"df", "phi"}
         # the val split ends n_eval_steps frames early; those frames are rollout targets
-        tail = int(self.vcfg.get("n_eval_steps", 1))
+        tail = int(self.vcfg.get("n_eval_steps", N_EVAL_STEPS))
         self.build_data(
             "next",
             fields=tuple(sorted(fields)),
@@ -38,28 +38,15 @@ class GyroSwinRunner(BaseRunner):
             val_overrides={"tail_offset": tail},
         )
         self.separate_zf_loss = bool(m.get("extra_zf_loss", False) and self.train_ds.separate_zf)
-        self._geom: dict[int, dict] = {}
+        self.geometry = GeometryCache(self.train_ds)
 
     def build_model(self, key):
-        model = build_gyroswin(self.cfg, self.train_ds, key=key)
-        if model.flux_key != self.loss_cfg.flux_key:
-            raise ValueError(
-                f"model flux head {model.flux_key!r} != loss flux key "
-                f"{self.loss_cfg.flux_key!r}"
-            )
-        return model
+        return build_gyroswin(self.cfg, self.train_ds, key=key)
 
     def step_context(self) -> dict:
         if not self.loss_cfg.integrals:
             return {}
         return {"norm": self.train_ds.norm}
-
-    def geometry(self, fids) -> dict:
-        for f in set(int(f) for f in fids) - set(self._geom):
-            self._geom[f] = {k: v[0] for k, v in geometry_table(self.train_ds, [f]).items()}
-        return {
-            k: np.stack([self._geom[int(f)][k] for f in fids]) for k in self._geom[int(fids[0])]
-        }
 
     def step_extras(self, step: int) -> dict:
         return {"weights": self.loss_cfg.weights_at(step, self.total_steps)}
@@ -70,7 +57,7 @@ class GyroSwinRunner(BaseRunner):
             ("df", "conditioning", "file_index", *(f"y_{k}" for k in DATA_LOSSES)),
         )
         if self.loss_cfg.integrals:
-            batch["geom"] = self.geometry(np.asarray(batch["file_index"]))
+            batch["geom"] = self.geometry.stack(batch["file_index"])
         return batch
 
     def loss_fn(self, model, batch, key):

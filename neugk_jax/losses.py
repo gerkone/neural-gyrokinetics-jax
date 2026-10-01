@@ -21,7 +21,6 @@ def per_sample_rel_l2(p, t, eps: float = 1e-12):
 
 
 def per_sample_rel_norm_mse(p, t, eps: float = 1e-4):
-    """``||p - t||² / (||t||² + eps)`` per sample (batch axis 0)."""
     return jnp.sum(_flat(p - t) ** 2, axis=-1) / (jnp.sum(_flat(t) ** 2, axis=-1) + eps)
 
 
@@ -34,7 +33,6 @@ def masked_mean(values, mask):
 
 
 def relative_norm_mse(pred: jnp.ndarray, target: jnp.ndarray, eps: float = 1e-4) -> jnp.ndarray:
-    """Batch mean of :func:`per_sample_rel_norm_mse`; 1-10 when the target is z-scored."""
     assert pred.shape == target.shape, f"shape mismatch {pred.shape} != {target.shape}"
     return jnp.mean(per_sample_rel_norm_mse(pred, target, eps))
 

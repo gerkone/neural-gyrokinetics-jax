@@ -25,6 +25,7 @@ from neugk_jax.utils import recombine_zf, traced_jit
 
 # outputs the integrated heat flux is checked against
 INTEGRAL_OUTPUTS = {"df", "phi", "flux"}
+N_EVAL_STEPS = 1
 
 
 @traced_jit("gyroswin_eval_step")
@@ -58,10 +59,9 @@ class GyroSwinEvaluator(BaseEvaluator):
     def __init__(self, cfg: Any, *, outputs: Optional[Sequence[str]] = None, **kwargs):
         super().__init__(cfg, **kwargs)
         ds = self.ds
-        self.n_eval = int(self.vcfg.get("n_eval_steps", 1))
+        self.n_eval = int(self.vcfg.get("n_eval_steps", N_EVAL_STEPS))
         outputs = tuple(outputs or ("df", "phi"))
         self.fields = tuple(k for k in DATA_LOSSES if k in outputs)
-        self.eval_integrals = bool(self.vcfg.get("eval_integrals", False))
         if self.eval_integrals and set(outputs) != INTEGRAL_OUTPUTS:
             warnings.warn(
                 f"validation.eval_integrals needs the outputs {sorted(INTEGRAL_OUTPUTS)}, the "

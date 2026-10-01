@@ -9,9 +9,9 @@ import jax.random as jr
 import pytest
 import yaml
 
-from neugk_jax.gyroswin.models.gyroswin import build_gyroswin_from_config
 from neugk_jax.gyroswin.models.x_layers import FluxDecoder
-from neugk_jax.translate import iter_leaves
+from neugk_jax.models.build import build_gyroswin_from_config
+from neugk_jax.translate import named_leaves
 
 RES = [8, 2, 4, 10, 8]
 CFG = {
@@ -66,7 +66,7 @@ def _build(tmp_path, edit=None):
 def test_flux_decoder_conditioning_changes_output():
     left, right = jr.normal(jr.PRNGKey(1), (3, 2, 16)), jr.normal(jr.PRNGKey(2), (5, 8))
     head = FluxDecoder([16], [8], 2, 1, key=jr.PRNGKey(0), n_cond=3)
-    names = [n for n, _ in iter_leaves(head)]
+    names = [n for n, _ in named_leaves(head)]
     assert "blocks.0.cond_embed.mlp.0.inner.weight" in names
     assert "blocks.0.conditioning.0.modulation.inner.weight" in names
     a = head([head.mix(0, left, right, jnp.array([0.1, 0.2, 0.3]))])
@@ -119,4 +119,4 @@ def test_builder_accepts_mappings(tmp_path):
     ref = _build(tmp_path)
     for src in (copy.deepcopy(CFG), OmegaConf.create(copy.deepcopy(CFG))):
         model = build_gyroswin_from_config(src, key=jr.PRNGKey(0))
-        assert [n for n, _ in iter_leaves(model)] == [n for n, _ in iter_leaves(ref)]
+        assert [n for n, _ in named_leaves(model)] == [n for n, _ in named_leaves(ref)]

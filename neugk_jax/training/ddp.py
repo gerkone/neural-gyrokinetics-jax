@@ -77,7 +77,6 @@ def init_distributed(*, axis_name: str = "dp") -> DistributedInfo:
 
 
 def barrier(name: str) -> None:
-    """Wait for every process to reach ``name`` (no-op with one process)."""
     if jax.process_count() > 1:
         from jax.experimental import multihost_utils
 

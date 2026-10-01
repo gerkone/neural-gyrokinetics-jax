@@ -114,6 +114,8 @@ class DiffusionEvaluator(BaseEvaluator):
     ``eval_max_batches``.
     """
 
+    integrals_default = True
+
     def __init__(
         self,
         cfg: Any,
@@ -142,7 +144,6 @@ class DiffusionEvaluator(BaseEvaluator):
         self.cond_slots = cond_slots
         self.steps = int(steps or self.vcfg.get("eval_sample_steps", 50))
         self.n_samples = int(n_samples or self.vcfg.get("eval_n_samples", 1))
-        self.eval_integrals = bool(self.vcfg.get("eval_integrals", True))
         self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
         self.metric_keys = ("df_mse", "df_rel_l2")
         self.traj_ids = [_traj_id(f) for f in val_ds.files]

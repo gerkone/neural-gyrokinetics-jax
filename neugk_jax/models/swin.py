@@ -36,14 +36,12 @@ def _shift_size(grid_size, window_size, eff_window, shift: bool) -> tuple[int, .
 
 
 def window_partition(x: jnp.ndarray, window_size: Sequence[int]) -> jnp.ndarray:
-    """``(*spatial, dim) → (num_windows, prod(window), dim)``."""
     return fold_patches(x, window_size).reshape(-1, math.prod(window_size), x.shape[-1])
 
 
 def window_reverse(
     windows: jnp.ndarray, window_size: Sequence[int], spatial: Sequence[int]
 ) -> jnp.ndarray:
-    """Inverse of window_partition."""
     grid = tuple(s // w for s, w in zip(spatial, window_size))
     dim = windows.shape[-1]
     return unfold_patches(windows.reshape(*grid, -1), window_size, out_channels=dim)

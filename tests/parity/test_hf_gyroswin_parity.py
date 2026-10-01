@@ -46,7 +46,7 @@ def state(hf_large_weights):
 
 @pytest.fixture(scope="module")
 def translated(state):
-    from neugk_jax.gyroswin.models import build_release_gyroswin
+    from neugk_jax.models.build import build_release_gyroswin
     from neugk_jax.translate import translate_gyroswin
 
     return translate_gyroswin(build_release_gyroswin(CONFIG, key=jr.PRNGKey(0)), state)

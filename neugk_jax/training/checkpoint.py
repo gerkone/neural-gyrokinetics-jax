@@ -124,6 +124,11 @@ class AsyncCheckpointer:
             raise err
 
 
+def load_meta(path: str | os.PathLike) -> dict:
+    with open(path, "rb") as f:
+        return pickle.load(f).get("meta") or {}
+
+
 def save_model_only(path: str | os.PathLike, model) -> None:
     write_bundle(
         path, {"model_leaves": _to_numpy_tree(jax.device_get(eqx.filter(model, eqx.is_array)))}

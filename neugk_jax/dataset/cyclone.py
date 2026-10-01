@@ -33,7 +33,6 @@ DEFAULT_CONDITIONS = tuple(COND_META_KEYS)
 
 
 def avg_flux(flux) -> float:
-    """Mean heat flux of the last ``FLUX_AVG_WINDOW`` steps, the first step excluded."""
     return float(np.mean(np.asarray(flux)[1:][-FLUX_AVG_WINDOW:]))
 
 
@@ -155,7 +154,6 @@ class CycloneDataset:
         if not self.files:
             raise RuntimeError(f"no trajectories found under {path}")
 
-        # metadata loads are I/O bound and tiny
         with ThreadPoolExecutor(max_workers=8) as ex:
             metas = list(ex.map(backend.read_metadata, self.files))
         self.metadata: dict[int, dict] = {}
@@ -258,7 +256,6 @@ class CycloneDataset:
         return out
 
     def get_target(self, fid: int, t_idx: int) -> dict[str, np.ndarray]:
-        """Normalized next-step targets of ``(fid, t_idx)`` without reading the input."""
         fid, t_idx = int(fid), int(t_idx)
         with self.backend.open(self.files[fid]) as handle:
             return self._targets(handle, fid, t_idx)

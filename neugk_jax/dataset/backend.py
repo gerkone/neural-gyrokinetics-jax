@@ -63,7 +63,6 @@ def complete_geometry(geometry: dict) -> dict:
 
 
 def frame_name(kind: str, t: int) -> str:
-    """Name of the ``kind`` (``timestep`` or ``poten``) frame at raw index ``t``."""
     return f"{kind}_{int(t):05d}"
 
 
@@ -107,7 +106,6 @@ def _unflatten_meta(z):
 
 
 def meta_path(base: str) -> Optional[str]:
-    """Existing metadata file of ``base`` (``.npz`` preferred over ``.pkl``), else None."""
     for ext in (".npz", ".pkl"):
         if os.path.exists(base + ext):
             return base + ext
@@ -304,7 +302,7 @@ class KvikIOBackend(NumpyBackend):
         with cp.cuda.Device(self.rank):
             gpu = cp.empty(n_elems, dtype=buf_dtype)
             with kvikio.CuFile(path, "r") as fh:
-                # the payload goes to its own buffer so the device array stays aligned
+                # payload only, after the scale header
                 fh.read(gpu, file_offset=header)
         arr = jdlp.from_dlpack(gpu.reshape(shape))
         if bits == "bf16":
