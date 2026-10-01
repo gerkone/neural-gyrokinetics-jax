@@ -139,32 +139,20 @@ _gyaradax_spectral_batched = jax.jit(jax.vmap(_gyaradax_spectral_one, in_axes=(0
 _gyaradax_spectral_per_sample = jax.jit(jax.vmap(_gyaradax_spectral_one, in_axes=(0, 0)))
 
 
-_SCALAR_DEFAULTS = {
-    "mas": 1.0,
-    "tmp": 1.0,
-    "d2X": 1.0,
-    "signz": 1.0,
-    "signB": 1.0,
-    "adiabatic": 1.0,
-    "de": 1.0,
-    "vthrat": 1.0,
-    "beta": 0.0,
-    "nlapar": 0.0,
-    "nlbpar": 0.0,
-}
-
-
 @_f64
 def precompute_geometry(geometry: dict, dtype=np.float32) -> dict[str, np.ndarray]:
     """Broadcast-ready geometry tensors for :func:`flux_integral` (one trajectory).
 
     Computed in float64 (Bessel / scaled-I0 gyroaverage terms included) and cast
     to ``dtype``. Tensors are laid out against a ``(vp, mu, s, x, y)`` df;
-    species scalars must be single-species and become 0-d arrays.
+    species scalars must be single-species and become 0-d arrays; missing ones take
+    the :func:`complete_geometry` defaults.
     """
     from jax.scipy.special import bessel_jn, i0e
 
-    g = {k: np.asarray(v, dtype=np.float64) for k, v in geometry.items()}
+    from neugk_jax.dataset.backend import GEOMETRY_DEFAULTS, complete_geometry
+
+    g = {k: np.asarray(v, dtype=np.float64) for k, v in complete_geometry(geometry).items()}
     out = {
         "krho": g["krho"].reshape(1, 1, 1, 1, -1),
         "ints": g["ints"].reshape(1, 1, -1, 1, 1),
@@ -176,8 +164,8 @@ def precompute_geometry(geometry: dict, dtype=np.float32) -> dict[str, np.ndarra
     }
     for k in ("bn", "efun", "rfun", "bt_frac"):
         out[k] = g[k].reshape(1, 1, -1, 1, 1)
-    for k, default in _SCALAR_DEFAULTS.items():
-        v = g.get(k, np.asarray(default))
+    for k in GEOMETRY_DEFAULTS:
+        v = g[k]
         if v.size != 1:
             raise ValueError(
                 f"flux_integral is single-species; geometry[{k!r}] has shape {v.shape}"

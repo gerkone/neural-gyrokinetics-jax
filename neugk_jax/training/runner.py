@@ -35,7 +35,7 @@ from neugk_jax.training.ddp import (
 )
 from neugk_jax.training.logging import Logger
 from neugk_jax.training.schedulers import warmup_cosine
-from neugk_jax.utils import config_dict, count_trace
+from neugk_jax.utils import config_dict, count_trace, progress
 
 
 def weight_decay_mask(params, exclude):
@@ -253,10 +253,7 @@ class BaseRunner:
             self.train_ds, plans, self.load_batch, lambda b: shard_batch(self.dist, b)
         )
         show = self.dist.is_rank0 and (self.cfg.get("logging") or {}).get("tqdm", False)
-        if show:
-            from tqdm import tqdm
-
-            batches = tqdm(batches, total=len(plans), desc=f"epoch {epoch}")
+        batches = progress(batches, show, total=len(plans), desc=f"epoch {epoch}")
         acc, waits = None, []
         t_start = t_first = time.perf_counter()
         step0 = (epoch - 1) * self.steps_per_epoch

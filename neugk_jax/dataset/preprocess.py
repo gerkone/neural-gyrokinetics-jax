@@ -11,15 +11,8 @@ Modes (``python -m neugk_jax.dataset.preprocess --mode=<mode>``):
 * ``gyaradax``: gyaradax run folders (``step_*.npz`` + ``config.yaml`` + ``geometry.pkl``)
   to the same layout, with heat-flux verification.
 * ``quantize``: side-by-side quantized siblings of the fp32 shards (``.bf16.bin``,
-  ``.fp16.bin``, ``.i8.bin``, ``.i4.bin``) read by the dataloader's ``prefer_dtype`` path.
-
-Quantized layout per file::
-
-    fp16 / bf16:   raw 16-bit values, no header
-    i8:            float32 scale (4 bytes) || raw int8 values
-    i4:            float32 scale (4 bytes) || raw uint8 nibble-packed
-                   (two int4 values per byte: low nibble = index 2k,
-                    high nibble = index 2k+1)
+  ``.fp16.bin``, ``.i8.bin``, ``.i4.bin``, layout in :mod:`neugk_jax.dataset.quant`) read
+  by the dataloader's ``prefer_dtype`` path.
 
 Usage::
 
@@ -55,144 +48,22 @@ from typing import Iterable, Optional, Sequence
 
 import numpy as np
 
+from neugk_jax.dataset import quant
+from neugk_jax.dataset.backend import (
+    LIGHT_DROP_KEYS,
+    NumpyBackend,
+    expand_spec,
+    frame_name,
+    load_meta,
+    meta_path,
+    save_meta,
+)
+from neugk_jax.utils import atomic_write, progress
+
 RAW_ROOT = os.environ.get("NEUGK_RAW_ROOT")
 TARGET_DIR = os.environ.get("NEUGK_TARGET_DIR")
 KVIKIO_SUBDIR = "preprocessed_kvikio"
-LIGHT_DROP_KEYS = (
-    "df_min",
-    "df_max",
-    "df_var",
-    "df_mean",
-    "df_std",
-    "phi_min",
-    "phi_max",
-    "phi_var",
-)
 PHI_STAT_KEYS = ("phi_mean", "phi_var", "phi_std", "phi_min", "phi_max")
-
-_DTYPE_SUFFIX = {
-    "fp16": ".fp16.bin",
-    "bf16": ".bf16.bin",
-    "i8": ".i8.bin",
-    "i4": ".i4.bin",
-}
-
-
-def quantized_sibling(fp32_path: str, bits: str) -> str:
-    # foo.bin -> foo.<dtype>.bin
-    if not fp32_path.endswith(".bin"):
-        return fp32_path + _DTYPE_SUFFIX[bits]
-    return fp32_path[:-4] + _DTYPE_SUFFIX[bits]
-
-
-def quantize_array(arr_f32: np.ndarray, bits: str) -> tuple[np.ndarray, np.float32 | None]:
-    """Quantize a flat fp32 array to ``bits`` precision.
-
-    Returns ``(payload, scale)``. ``scale`` is ``None`` for IEEE 16-bit
-    formats (the dtype itself encodes magnitude). For int8/int4 it's the
-    per-tensor symmetric quantization scale (``max(|x|) / qmax``).
-    """
-    if bits == "fp16":
-        return arr_f32.astype(np.float16), None
-    if bits == "bf16":
-        from ml_dtypes import bfloat16
-
-        return arr_f32.astype(bfloat16), None
-    if bits == "i8":
-        qmax = 127
-        mx = float(np.max(np.abs(arr_f32)))
-        scale = np.float32(mx / qmax) if mx > 0 else np.float32(1.0)
-        q = np.clip(np.round(arr_f32 / scale), -128, 127).astype(np.int8)
-        return q, scale
-    if bits == "i4":
-        qmax = 7
-        mx = float(np.max(np.abs(arr_f32)))
-        scale = np.float32(mx / qmax) if mx > 0 else np.float32(1.0)
-        q = np.clip(np.round(arr_f32 / scale), -8, 7).astype(np.int8)
-        # nibble-pack: two int4 values per byte, low nibble = idx 2k, high = 2k+1
-        if q.size % 2:
-            q = np.concatenate([q, np.zeros(1, dtype=np.int8)])
-        lo = (q[0::2].astype(np.uint8)) & 0x0F
-        hi = (q[1::2].astype(np.uint8)) & 0x0F
-        packed = (hi << 4) | lo
-        return packed.astype(np.uint8), scale
-    raise ValueError(f"unknown bits={bits!r}; expected one of {list(_DTYPE_SUFFIX)}")
-
-
-def dequantize_array(
-    payload: np.ndarray, scale: np.float32 | None, bits: str, n_elems: int
-) -> np.ndarray:
-    """Inverse of :func:`quantize_array` — returns fp32."""
-    if bits == "fp16":
-        return payload.astype(np.float32)
-    if bits == "bf16":
-        return payload.astype(np.float32)
-    if bits == "i8":
-        return payload.astype(np.float32) * float(scale)
-    if bits == "i4":
-        lo = payload & 0x0F
-        hi = (payload >> 4) & 0x0F
-        # sign-extend 4-bit two's complement
-        lo = np.where(lo >= 8, lo.astype(np.int8) - 16, lo.astype(np.int8))
-        hi = np.where(hi >= 8, hi.astype(np.int8) - 16, hi.astype(np.int8))
-        out = np.empty(payload.size * 2, dtype=np.int8)
-        out[0::2] = lo
-        out[1::2] = hi
-        out = out[:n_elems]
-        return out.astype(np.float32) * float(scale)
-    raise ValueError(f"unknown bits={bits!r}")
-
-
-def write_quantized(dst: str, payload: np.ndarray, scale: np.float32 | None) -> int:
-    """Atomic-ish write of one quantized shard. Returns bytes written."""
-    tmp = dst + ".tmp"
-    with open(tmp, "wb") as f:
-        if scale is not None:
-            f.write(np.float32(scale).tobytes())
-        f.write(payload.tobytes())
-    n = os.path.getsize(tmp)
-    os.replace(tmp, dst)
-    return n
-
-
-def read_quantized(path: str, bits: str, n_elems: int) -> np.ndarray:
-    """Read and dequantize a quantized shard."""
-    with open(path, "rb") as f:
-        scale = None
-        if bits in ("i8", "i4"):
-            scale = np.frombuffer(f.read(4), dtype=np.float32)[0]
-        if bits == "fp16":
-            payload = np.frombuffer(f.read(), dtype=np.float16)
-        elif bits == "bf16":
-            from ml_dtypes import bfloat16
-
-            payload = np.frombuffer(f.read(), dtype=bfloat16)
-        elif bits == "i8":
-            payload = np.frombuffer(f.read(), dtype=np.int8)
-        elif bits == "i4":
-            payload = np.frombuffer(f.read(), dtype=np.uint8)
-        else:
-            raise ValueError(f"unknown bits={bits!r}")
-    return dequantize_array(payload, scale, bits, n_elems)
-
-
-def expand_spec(spec) -> list[str]:
-    """Expand one brace pattern (``iteration_{0-3,7}``) or pass an explicit list through."""
-    if isinstance(spec, (list, tuple)) and len(spec) != 1:
-        return list(spec)
-    s = spec[0] if isinstance(spec, (list, tuple)) else spec
-    m = re.match(r"^(.*?)\{([^}]+)\}(.*?)$", s)
-    if not m:
-        return [s]
-    prefix, ranges_str, suffix = m.groups()
-    nums = []
-    for part in ranges_str.split(","):
-        if "-" in part:
-            lo, hi = map(int, part.split("-"))
-            nums.extend(range(lo, hi + 1))
-        else:
-            nums.append(int(part))
-    return [f"{prefix}{n}{suffix}" for n in nums]
 
 
 def resolve_traj_dirs(root_dir: str, spec=None) -> list[str]:
@@ -217,7 +88,7 @@ def _src_bins(data_dir: str) -> list[str]:
     for name in os.listdir(data_dir):
         if not name.endswith(".bin"):
             continue
-        if any(name.endswith(suf) for suf in _DTYPE_SUFFIX.values()):
+        if any(name.endswith(suf) for suf in quant.SUFFIX.values()):
             continue
         if not (name.startswith("timestep_") or name.startswith("poten_")):
             continue
@@ -226,12 +97,11 @@ def _src_bins(data_dir: str) -> list[str]:
 
 
 def _quantize_file(src: str, bits: str, force: bool) -> tuple[str, int, str]:
-    dst = quantized_sibling(src, bits)
+    dst = quant.sibling(src, bits)
     if os.path.exists(dst) and not force:
         return src, 0, "skip"
-    arr = np.fromfile(src, dtype=np.float32)
-    payload, scale = quantize_array(arr, bits)
-    return src, write_quantized(dst, payload, scale), "written"
+    payload, scale = quant.quantize(np.fromfile(src, dtype=np.float32), bits)
+    return src, quant.write(dst, payload, scale), "written"
 
 
 def _process_traj(traj_dir: str, bits: str, force: bool) -> tuple[str, int, int, int]:
@@ -521,10 +391,6 @@ def realspace_to_solver_df(df: np.ndarray) -> np.ndarray:
     return np.fft.ifftshift(spec, axes=(3,)).astype(np.complex64)
 
 
-def _numeric_geometry(geometry: dict) -> dict:
-    return {k: np.asarray(v) for k, v in geometry.items() if np.asarray(v).dtype.kind in "fiub"}
-
-
 def _eflux_ky(g: dict, spec, phi, apar, bpar):
     import jax.numpy as jnp
 
@@ -567,7 +433,7 @@ class FieldSolver:
         if not FieldSolver._jits:
             FieldSolver._jits["solve"] = jax.jit(flux_integral)
             FieldSolver._jits["spectrum"] = jax.jit(_flux_spectrum)
-        gt = precompute_geometry(_numeric_geometry(geometry), dtype=self.dtype)
+        gt = precompute_geometry(geometry, dtype=self.dtype)
         with jax.enable_x64(x64):
             self.geom = {k: jnp.asarray(v) for k, v in gt.items()}
 
@@ -635,24 +501,10 @@ def _stats_dict(prefix: str, stats, dtype=None) -> dict:
     }
 
 
-def _meta_path(base: str) -> Optional[str]:
-    for ext in (".npz", ".pkl"):
-        if os.path.exists(base + ext):
-            return base + ext
-    return None
-
-
-def _save_meta_atomic(base: str, meta: dict, ext: str = ".pkl") -> None:
-    from neugk_jax.dataset.backend import save_meta
-
-    save_meta(base + ".tmp", meta, ext)
-    os.replace(base + ".tmp" + ext, base + ext)
-
-
 def write_metadata(traj_dir: str, metadata: dict) -> None:
-    _save_meta_atomic(os.path.join(traj_dir, "metadata"), metadata)
+    save_meta(os.path.join(traj_dir, "metadata"), metadata, ".pkl")
     light = {k: v for k, v in metadata.items() if k not in LIGHT_DROP_KEYS}
-    _save_meta_atomic(os.path.join(traj_dir, "metadata_light"), light)
+    save_meta(os.path.join(traj_dir, "metadata_light"), light, ".pkl")
 
 
 def _write_bin(path: str, arr: np.ndarray) -> None:
@@ -661,20 +513,10 @@ def _write_bin(path: str, arr: np.ndarray) -> None:
 
 
 def _merge_old_metadata(traj_dir: str, metadata: dict) -> dict:
-    from neugk_jax.dataset.backend import load_meta
-
     old = load_meta(os.path.join(traj_dir, "metadata"))
     if old is None:
         return metadata
     return {**metadata, **{k: v for k, v in old.items() if k not in metadata}}
-
-
-def _progress(it, show: bool, **kwargs):
-    if not show:
-        return it
-    from tqdm import tqdm
-
-    return tqdm(it, **kwargs)
 
 
 def preprocess(
@@ -701,25 +543,18 @@ def preprocess(
     ``"field_solve"`` (the field solve of the stored df) or ``"gkw"`` (the ``Poten`` dump).
     ``max_timesteps`` truncates the trajectory (data, series and statistics consistently).
     """
-    from neugk_jax.dataset.backend import NumpyBackend
-
     assert spatial_ifft, "only the real-space (ifft) layout is supported"
     assert phi_source in ("field_solve", "gkw"), phi_source
     if "Lin" in filename:
         raise ValueError(f"{filename}: linear runs are not converted by preprocess")
-    backend = NumpyBackend()
     if root is None:
         raise ValueError("preprocess needs the raw GKW root (root= or $NEUGK_RAW_ROOT)")
     target_dir = root if target_dir is None else target_dir
     dir_in = f"{root}/{raw_subdir}/{filename}"
     dir_out = os.path.join(target_dir, KVIKIO_SUBDIR)
     os.makedirs(dir_out, exist_ok=True)
-    out_path = backend.format_path(
-        os.path.join(dir_out, filename.replace("/", "_")),
-        spatial_ifft,
-        split_into_bands,
-        real_potens=True,
-    )
+    backend = NumpyBackend(split_into_bands=split_into_bands)
+    out_path = backend.trajectory_path(os.path.join(dir_out, filename.replace("/", "_")))
     if backend.exists(out_path) and not (metadata_only or geometry_only):
         return out_path, True
 
@@ -774,7 +609,7 @@ def preprocess(
     solver = FieldSolver(geometry, x64=x64)
     df_stats, phi_stats, flux_stats = _running_stats(), _running_stats(), _running_stats()
     os.makedirs(os.path.join(out_path, "data"), exist_ok=True)
-    it = _progress(
+    it = progress(
         enumerate(zip(ks, potens)),
         show_tqdm,
         desc=filename,
@@ -818,8 +653,8 @@ def preprocess(
         flux_stats.update(fluxes[idx])
         phi_stats.update(phi)
         if not metadata_only:
-            _write_bin(os.path.join(out_path, "data", f"timestep_{idx:05d}.bin"), knth)
-            _write_bin(os.path.join(out_path, "data", f"poten_{idx:05d}.bin"), phi)
+            _write_bin(os.path.join(out_path, "data", frame_name("timestep", idx) + ".bin"), knth)
+            _write_bin(os.path.join(out_path, "data", frame_name("poten", idx) + ".bin"), phi)
 
     metadata.update(_stats_dict("df", df_stats, np.float32))
     metadata.update(_stats_dict("phi", phi_stats, np.float32))
@@ -856,8 +691,6 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
     phi statistics are recomputed in both metadata files. Trajectories with a ``DONE``
     marker in their backup are skipped.
     """
-    from neugk_jax.dataset.backend import NumpyBackend, load_meta, save_meta
-
     name = os.path.basename(traj_dir.rstrip("/"))
     bdir = os.path.join(backup_dir, name)
     if os.path.exists(os.path.join(bdir, "DONE")):
@@ -867,7 +700,7 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
     potens = sorted(glob.glob(os.path.join(data, "poten_[0-9][0-9][0-9][0-9][0-9].bin")))
     metas = [
         p
-        for p in (_meta_path(os.path.join(traj_dir, m)) for m in ("metadata", "metadata_light"))
+        for p in (meta_path(os.path.join(traj_dir, m)) for m in ("metadata", "metadata_light"))
         if p is not None
     ]
     for p in potens + metas:
@@ -880,12 +713,10 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
     solver = FieldSolver(meta["geometry"], x64=x64)
     stats = _running_stats()
     for p in potens:
-        idx = os.path.basename(p)[6:11]
-        df = np.fromfile(os.path.join(data, f"timestep_{idx}.bin"), dtype=np.float32).reshape(shape)
-        phi = solver(df)[0]
+        df_path = os.path.join(data, os.path.basename(p).replace("poten_", "timestep_"))
+        phi = solver(np.fromfile(df_path, dtype=np.float32).reshape(shape))[0]
         assert phi.nbytes == os.path.getsize(p), (p, phi.shape)
-        phi.tofile(p + ".tmp")
-        os.replace(p + ".tmp", p)
+        atomic_write(p, phi.tofile)
         stats.update(phi)
 
     new = _stats_dict("phi", stats)
@@ -894,8 +725,7 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
         m = load_meta(base)
         for k in [k for k in new if k in m]:
             m[k] = np.asarray(new[k], dtype=np.asarray(m[k]).dtype)
-        save_meta(base + ".tmp", m, ext)
-        os.replace(base + ".tmp" + ext, mp)
+        save_meta(base, m, ext)
     with open(os.path.join(bdir, "DONE"), "w") as f:
         f.write(f"{len(potens)}\n")
     return f"{name}: rewrote {len(potens)} potentials"
@@ -916,18 +746,13 @@ def preprocess_gyaradax(
     """
     from omegaconf import OmegaConf
 
-    from neugk_jax.dataset.backend import NumpyBackend
-
-    backend = NumpyBackend()
     traj_dir = str(traj_dir)
     name = os.path.basename(os.path.normpath(traj_dir))
     if target_dir is None:
         raise ValueError("preprocess_gyaradax needs target_dir (or $NEUGK_TARGET_DIR)")
     dir_out = os.path.join(target_dir, KVIKIO_SUBDIR)
     os.makedirs(dir_out, exist_ok=True)
-    out_path = backend.format_path(
-        os.path.join(dir_out, name), spatial_ifft=True, split_into_bands=None, real_potens=True
-    )
+    out_path = NumpyBackend().trajectory_path(os.path.join(dir_out, name))
 
     cfg = OmegaConf.load(os.path.join(traj_dir, "config.yaml"))
     with open(os.path.join(traj_dir, "geometry.pkl"), "rb") as fh:
@@ -959,13 +784,12 @@ def preprocess_gyaradax(
     steps = sorted(glob.glob(os.path.join(traj_dir, "step_*.npz")))
     if not steps:
         raise FileNotFoundError(f"no step_*.npz dumps in {traj_dir}")
-    solve_geom = {"de": np.array(1.0), **_numeric_geometry(np_geom)}
-    solver = FieldSolver(solve_geom, x64=x64)
+    solver = FieldSolver(np_geom, x64=x64)
 
     times, fluxes, kyspecs, fluxspecs = [], [], [], []
     df_stats, phi_stats, flux_stats = _running_stats(), _running_stats(), _running_stats()
     os.makedirs(os.path.join(out_path, "data"), exist_ok=True)
-    for idx, step_path in _progress(
+    for idx, step_path in progress(
         enumerate(steps), show_tqdm, total=len(steps), desc=name, leave=False
     ):
         d = np.load(step_path)
@@ -985,8 +809,10 @@ def preprocess_gyaradax(
         phi_stats.update(phi)
         flux_stats.update(reported)
         if not metadata_only:
-            _write_bin(os.path.join(out_path, "data", f"timestep_{idx:05d}.bin"), df_real)
-            _write_bin(os.path.join(out_path, "data", f"poten_{idx:05d}.bin"), phi)
+            _write_bin(
+                os.path.join(out_path, "data", frame_name("timestep", idx) + ".bin"), df_real
+            )
+            _write_bin(os.path.join(out_path, "data", frame_name("poten", idx) + ".bin"), phi)
 
     metadata = {
         "timesteps": np.asarray(times),
@@ -1053,8 +879,6 @@ def _run_preprocess(args) -> None:
             elif was_skipped:
                 skipped.append(name)
             else:
-                from neugk_jax.dataset.backend import load_meta
-
                 meta = load_meta(os.path.join(out_path, "metadata"))
                 msg = f"{out_path}: {len(meta['timesteps'])} points"
                 if "df_mean" in meta:
@@ -1123,7 +947,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     g = ap.add_argument_group("quantize")
     g.add_argument(
         "--bits",
-        choices=tuple(_DTYPE_SUFFIX),
+        choices=tuple(quant.SUFFIX),
         default="bf16",
         help="quantization target (fp16 / bf16 / i8 / i4)",
     )
@@ -1165,8 +989,6 @@ def main(argv: Iterable[str] | None = None) -> None:
     elif args.mode == "gyaradax":
         if not args.gyaradax_dirs:
             ap.error("--mode=gyaradax requires --gyaradax-dirs")
-        from neugk_jax.dataset.backend import load_meta
-
         for traj_dir in args.gyaradax_dirs:
             out = preprocess_gyaradax(
                 traj_dir,

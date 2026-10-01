@@ -20,6 +20,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from neugk_jax.utils import atomic_write
+
 
 def _to_numpy_tree(tree):
     return jax.tree_util.tree_map(lambda x: np.asarray(x) if isinstance(x, jax.Array) else x, tree)
@@ -57,12 +59,8 @@ def host_bundle(state: CheckpointState) -> dict:
 
 
 def write_bundle(path: str | os.PathLike, bundle: dict) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, path)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, lambda f: pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL))
 
 
 def save_checkpoint(path: str | os.PathLike, state: CheckpointState) -> None:

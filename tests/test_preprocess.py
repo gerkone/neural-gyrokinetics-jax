@@ -133,8 +133,11 @@ def test_stream_stats_matches_seeded_running_mean_std():
 
 
 def test_expand_spec_and_resolve(tmp_path):
-    assert P.expand_spec("it_{0-2,5}_x") == ["it_0_x", "it_1_x", "it_2_x", "it_5_x"]
-    assert P.expand_spec(["a", "b"]) == ["a", "b"]
+    from neugk_jax.dataset.backend import expand_spec
+
+    assert expand_spec("it_{0-2,5}_x") == ["it_0_x", "it_1_x", "it_2_x", "it_5_x"]
+    assert expand_spec(["a", "b"]) == ["a", "b"]
+    assert expand_spec(["b_{1-2}"]) == ["b_1", "b_2"]
     for n in ("b_ifft_realpotens", "a_ifft_realpotens", "c_other"):
         (tmp_path / n).mkdir()
     assert [os.path.basename(p) for p in P.resolve_traj_dirs(str(tmp_path))] == [
@@ -166,13 +169,18 @@ def test_gkw_text_readers(tmp_path):
 
 @pytest.mark.parametrize("bits", ["bf16", "fp16", "i8", "i4"])
 def test_quantize_roundtrip(tmp_path, bits):
+    from neugk_jax.dataset import quant
+
     x = np.random.default_rng(6).standard_normal(1001).astype(np.float32)
-    payload, scale = P.quantize_array(x, bits)
-    dst = str(tmp_path / "timestep_00000.bin")
-    P.write_quantized(P.quantized_sibling(dst, bits), payload, scale)
-    y = P.read_quantized(P.quantized_sibling(dst, bits), bits, x.size)
+    payload, scale = quant.quantize(x, bits)
+    dst = quant.sibling(str(tmp_path / "timestep_00000.bin"), bits)
+    quant.write(dst, payload, scale)
+    y = quant.read(dst, bits, x.size)
     tol = {"bf16": 1e-2, "fp16": 1e-3, "i8": 2e-2, "i4": 0.3}[bits]
     assert np.max(np.abs(y - x)) <= tol * np.max(np.abs(x))
+    np.testing.assert_array_equal(quant.roundtrip(x, bits), y)
+    with pytest.raises(IOError):
+        quant.read(dst, bits, x.size + 2)
 
 
 def test_field_solver_spectrum_sums_to_flux_and_matches_flux_integral():

@@ -31,9 +31,7 @@ def _rel_norm_mse(p, y, eps: float = 1e-4):
 
 
 @eqx.filter_jit
-def gyroswin_eval_step(
-    model, x, cond, tgt, fids, live, t, acc, denorm, geom, fields, real_potens: bool
-):
+def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, denorm, geom, fields):
     """One rollout step; adds the ``live``-masked metric sums at row ``t`` of ``acc``."""
     count_trace("gyroswin_eval_step")
     preds = jax.vmap(lambda xi, ci: model(xi, ci, inference=True))(x, cond)
@@ -52,9 +50,7 @@ def gyroswin_eval_step(
         else:
             values[k] = per_sample_mse(pred_d[k], tgt_d[k])
     if geom is not None:
-        phi_i, (_, eflux, _) = integrate(
-            geom, fids, pred_d["df"], pred_d["phi"], real_potens=real_potens
-        )
+        phi_i, (_, eflux, _) = integrate(geom, fids, pred_d["df"], pred_d["phi"])
         flux = tgt_d["flux"].reshape(-1)
         values["phi_int"] = per_sample_mse(phi_i, tgt_d["phi"].reshape(phi_i.shape))
         values["flux_int_rel_err"] = jnp.abs(eflux - flux) / (jnp.abs(flux) + 1e-12)
@@ -79,7 +75,6 @@ class GyroSwinEvaluator(BaseEvaluator):
             "phi",
             "flux",
         }
-        self.real_potens = bool(ds.real_potens)
         self.t_slot = ds.conditions.index("timestep") if "timestep" in ds.conditions else None
         names = []
         for k in self.fields:
@@ -132,7 +127,6 @@ class GyroSwinEvaluator(BaseEvaluator):
                     self.denorm,
                     geom,
                     self.fields,
-                    self.real_potens,
                 )
                 if plan.number == 0 and t == 0 and self.is_rank0:
                     plots = self._plots(pred_d, tgt_d, batch)

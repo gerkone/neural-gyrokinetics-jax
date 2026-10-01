@@ -1,12 +1,14 @@
-"""Generic utilities: config conversion, trace counting, separate/recombine zonal flow, running stats."""
+"""Generic utilities: config conversion, trace counting, atomic writes, progress bars,
+separate/recombine zonal flow, running stats."""
 
 from __future__ import annotations
 
 import math
+import os
 from collections import Counter
 from dataclasses import dataclass
+from typing import Callable
 
-import jax.numpy as jnp
 import numpy as np
 from omegaconf import OmegaConf
 
@@ -27,31 +29,41 @@ def config_dict(cfg) -> dict:
     return dict(cfg)
 
 
+def atomic_write(path, write: Callable, mode: str = "wb") -> None:
+    """Write ``path`` through ``write(file)`` into a temporary sibling, then rename it into place."""
+    path = os.fspath(path)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, mode) as f:
+        write(f)
+    os.replace(tmp, path)
+
+
+def progress(it, show: bool, **kwargs):
+    """``it`` wrapped in a tqdm bar when ``show``."""
+    if not show:
+        return it
+    from tqdm import tqdm
+
+    return tqdm(it, **kwargs)
+
+
 def separate_zf(x, axis: int = 0):
-    """Separate Zonal Flow (ZF) and non-ZF components.
+    """Separate Zonal Flow (ZF) and non-ZF components of a numpy or jax array.
 
     Layout: ``[zf, x - zf]`` along ``axis``. ZF is the **mean** over the
     last axis (ky), broadcast back; the "rest" is ``x - zf`` (so the
     decomposition is exact, ``zf + rest == x``).
-
-    Works on both numpy and jax arrays — picks the right namespace via
-    duck typing.
     """
-    if isinstance(x, jnp.ndarray):
-        zf = jnp.broadcast_to(x.mean(axis=-1, keepdims=True), x.shape)
-        return jnp.concatenate([zf, x - zf], axis=axis)
-    zf = np.broadcast_to(x.mean(axis=-1, keepdims=True), x.shape)
-    return np.concatenate([zf, x - zf], axis=axis)
+    xp = x.__array_namespace__()
+    zf = xp.broadcast_to(x.mean(axis=-1, keepdims=True), x.shape)
+    return xp.concatenate([zf, x - zf], axis=axis)
 
 
 def recombine_zf(x, axis: int = 0):
     """Inverse of ``separate_zf``: ``[zf, non_zf]`` → ``zf + non_zf``."""
     if x.shape[axis] <= 2 or x.shape[axis] % 2 != 0:
         return x
-    if isinstance(x, jnp.ndarray):
-        zf, non_zf = jnp.split(x, 2, axis=axis)
-    else:
-        zf, non_zf = np.split(x, 2, axis=axis)
+    zf, non_zf = x.__array_namespace__().split(x, 2, axis=axis)
     return zf + non_zf
 
 

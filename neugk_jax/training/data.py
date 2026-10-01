@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterator, Optional, Sequence
 
 import numpy as np
 
-from neugk_jax.dataset.cyclone import CycloneSample, collate
+from neugk_jax.dataset.cyclone import CycloneSample
 from neugk_jax.training.ddp import DistributedInfo, eval_batch_owner, process_batch_indices
 
 
@@ -59,13 +59,16 @@ def eval_plans(
 
 
 def stack_fields(samples: Sequence[CycloneSample], fields: Sequence[str]) -> dict[str, Any]:
-    """Stack the named sample fields (device arrays stay on device, host ints become int32)."""
-    b = collate(samples)
+    """Stack the named sample fields in their array namespace; host ints become int32.
+
+    Device arrays (``KvikIOBackend`` frames) stay on device; absent fields are left out.
+    """
     out = {}
     for f in fields:
-        v = getattr(b, f)
-        if v is None:
+        vals = [getattr(s, f) for s in samples]
+        if vals[0] is None:
             continue
+        v = vals[0].__array_namespace__().stack(vals)
         if isinstance(v, np.ndarray) and v.dtype.kind in "iu":
             v = v.astype(np.int32)
         out[f] = v

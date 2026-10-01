@@ -58,7 +58,6 @@ class GyroSwinRunner(BaseRunner):
             val_overrides={"tail_offset": tail},
         )
         self.separate_zf_loss = bool(m.get("extra_zf_loss", False) and self.train_ds.separate_zf)
-        self.real_potens = bool(cfg.dataset.get("real_potens", True))
         self._geom: dict[int, dict] = {}
 
     def build_model(self, key):
@@ -116,7 +115,6 @@ class GyroSwinRunner(BaseRunner):
                 norm("phi", preds["phi"], fids) if "phi" in preds else None,
                 norm("phi", tgts["phi"], fids),
                 norm("flux", tgts["flux"], fids),
-                real_potens=self.real_potens,
             )
         return gyroswin_loss(
             preds,

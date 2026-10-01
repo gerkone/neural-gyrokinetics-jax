@@ -46,8 +46,6 @@ def integral_losses(
     pred_phi: Optional[jnp.ndarray],
     tgt_phi: jnp.ndarray,
     tgt_flux: jnp.ndarray,
-    *,
-    real_potens: bool = True,
 ) -> dict[str, jnp.ndarray]:
     """Physics-integral losses on denormalized batches.
 
@@ -60,14 +58,10 @@ def integral_losses(
     from neugk_jax.utils import recombine_zf
 
     pred_df = recombine_zf(pred_df, axis=1)
-
-    def one(g, d, p):
-        return flux_integral(g, d, p, real_potens=real_potens)
-
     if pred_phi is None:
-        phi_int, (pflux, eflux, _) = jax.vmap(lambda g, d: one(g, d, None))(geom_t, pred_df)
+        phi_int, (pflux, eflux, _) = jax.vmap(flux_integral)(geom_t, pred_df)
     else:
-        phi_int, (pflux, eflux, _) = jax.vmap(one)(geom_t, pred_df, pred_phi)
+        phi_int, (pflux, eflux, _) = jax.vmap(flux_integral)(geom_t, pred_df, pred_phi)
     tgt_phi = tgt_phi.reshape(phi_int.shape)
     return {
         "phi_int": jnp.mean((phi_int - tgt_phi) ** 2),

@@ -5,8 +5,8 @@ returns precomputed latents (after running ``precompute_latents``);
 ``mode="next"`` additionally returns next-step targets (``y_df``, ``y_phi``,
 ``y_flux``, ``y_fluxavg``) for autoregressive training.
 
-Returns host-side numpy arrays in a frozen ``CycloneSample`` dataclass.
-JAX consumes them via ``jnp.asarray`` when the dataloader stacks a batch.
+Returns a frozen ``CycloneSample`` dataclass; the frames carry the array type of the
+backend (host numpy, or device jax for ``KvikIOBackend``), the scalars are numpy.
 """
 
 from __future__ import annotations
@@ -21,19 +21,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.dataset.backend import DataBackend, KvikIOBackend, resolve_trajectories
+from neugk_jax.dataset.backend import DataBackend, expand_spec
 from neugk_jax.utils import RunningMeanStd
 from neugk_jax.utils import separate_zf as separate_zf_fn
 
 
 def _f32(x):
-    if x is None:
-        return None
-    return x.astype(jnp.float32) if isinstance(x, jax.Array) else np.asarray(x).astype(np.float32)
+    return None if x is None else x.astype(np.float32)
 
 
 class _StatsUnpickler(pickle.Unpickler):
@@ -71,42 +67,6 @@ class CycloneSample:
     y_fluxavg: np.ndarray | None = None
 
 
-def collate(batch: Sequence[CycloneSample]) -> CycloneSample:
-    """Stack a list of samples into a batched ``CycloneSample``.
-
-    Detects the array flavour from the first sample's ``df``: ``jax.Array``
-    inputs (kvikio + ``return_jax=True``) are stacked via ``jnp.stack`` to
-    keep the batch on GPU; everything else goes through ``np.stack``.
-    """
-    use_jax = isinstance(batch[0].df, jax.Array)
-    stacker = jnp.stack if use_jax else np.stack
-
-    def stack(key: str):
-        vals = [getattr(s, key) for s in batch]
-        if vals[0] is None:
-            return None
-        return stacker(vals)
-
-    return CycloneSample(
-        df=stack("df"),
-        phi=stack("phi"),
-        flux=stack("flux"),
-        avg_flux=stack("avg_flux"),
-        timestep=stack("timestep"),
-        file_index=stack("file_index"),
-        timestep_index=stack("timestep_index"),
-        conditioning=stack("conditioning"),
-        itg=stack("itg"),
-        dg=stack("dg"),
-        s_hat=stack("s_hat"),
-        q=stack("q"),
-        y_df=stack("y_df"),
-        y_phi=stack("y_phi"),
-        y_flux=stack("y_flux"),
-        y_fluxavg=stack("y_fluxavg"),
-    )
-
-
 class CycloneDataset:
     """Map-style dataset over preprocessed gyrokinetics trajectories.
 
@@ -114,9 +74,10 @@ class CycloneDataset:
     ----------
     path, trajectories
         Directory + trajectory spec (string with ``{1-5,7}`` ranges or list).
+    backend
+        The :class:`DataBackend` reading the trajectories (see ``make_backend``).
     split
-        ``"train"`` or ``"val"``. ``val`` may use ``partial_holdouts`` to
-        carve out the tail of each trajectory.
+        ``"train"`` or ``"val"``.
     fields_to_load
         Subset of ``("df", "phi")`` to read from disk. ``flux`` is always
         derivable from metadata.
@@ -130,12 +91,8 @@ class CycloneDataset:
     normalization, normalization_scope, normalization_stats
         Normalization config, its scope (``"dataset"`` or per-trajectory),
         and optional precomputed stats.
-    separate_zf, decouple_mu
+    separate_zf
         Optional channel-axis preprocessing matching the AE config.
-    lightweight_metadata
-        Read ``metadata_light.pkl`` instead of the full pickle (~900x smaller —
-        the full one carries per-element df moments). Requires
-        ``normalization_stats``, since the per-trajectory moments are then absent.
     bundle_seq_length
         Time-bundling stride. Default ``1`` (one timestep per sample).
     offset
@@ -146,27 +103,21 @@ class CycloneDataset:
         self,
         *,
         path: str,
+        backend: DataBackend,
         split: str = "train",
         trajectories: Optional[Any] = None,
-        partial_holdouts: Optional[dict] = None,
         fields_to_load: Sequence[str] = ("df",),
         conditions: Sequence[str] = ("itg", "dg", "s_hat", "q"),
         mode: str = "ae",
         normalization: Optional[dict] = None,
         normalization_scope: str = "dataset",
         normalization_stats: Optional[dict | str] = None,
-        spatial_ifft: bool = True,
-        real_potens: bool = True,
         cond_filters: Optional[dict] = None,
         bundle_seq_length: int = 1,
         offset: int = 0,
         tail_offset: int = 0,
         subsample: int = 1,
         separate_zf: bool = False,
-        decouple_mu: bool = False,
-        lightweight_metadata: bool = False,
-        backend: Optional[DataBackend] = None,
-        num_workers: int = 0,
         rank: int = 0,
     ):
         assert split in ("train", "val")
@@ -182,66 +133,32 @@ class CycloneDataset:
         self.normalization = normalization
         self.normalization_scope = normalization_scope
         self.normalization_stats = normalization_stats
-        self.spatial_ifft = spatial_ifft
-        self.real_potens = real_potens
         self.cond_filters = cond_filters or {}
         self.bundle_seq_length = bundle_seq_length
         self.offset = offset
         self.tail_offset = tail_offset
         self.subsample = subsample
         self.separate_zf = separate_zf
-        self.decouple_mu = decouple_mu
-        self.lightweight_metadata = lightweight_metadata
-        if lightweight_metadata and normalization is not None and normalization_stats is None:
-            raise ValueError(
-                "lightweight_metadata drops the per-trajectory df moments; pass "
-                "normalization_stats or disable it"
-            )
-        # default to KvikIOBackend for gpu-direct reads; falls back to NumpyBackend transparently
-        self.backend = backend or KvikIOBackend(rank=rank)
-        self.num_workers = num_workers
+        self.backend = backend
         self.rank = rank
-        self.partial_holdouts = partial_holdouts or {}
 
         # latent storage (mode="diff"); filled by precompute_latents()
         self.precomputed_latents: dict[tuple[int, int], dict] | None = None
         self.latent_stats: RunningMeanStd | None = None
 
-        if trajectories is not None:
-            if split == "val" and self.partial_holdouts:
-                raw = [os.path.join(path, k) for k in self.partial_holdouts]
-            else:
-                raw = resolve_trajectories(path, trajectories)
-        else:
+        if trajectories is None:
             raw = [
-                os.path.join(path, n)
-                for n in os.listdir(path)
-                if self.backend.is_valid(os.path.join(path, n))
+                p for p in (os.path.join(path, n) for n in os.listdir(path)) if backend.is_valid(p)
             ]
-        self.files = sorted(
-            {
-                self.backend.format_path(f, spatial_ifft, None, real_potens)
-                for f in raw
-                if self.backend.is_valid(
-                    self.backend.format_path(f, spatial_ifft, None, real_potens)
-                )
-            }
-        )
+        else:
+            raw = [os.path.join(path, n) for n in expand_spec(trajectories)]
+        self.files = sorted({p for p in map(backend.trajectory_path, raw) if backend.is_valid(p)})
         if not self.files:
             raise RuntimeError(f"no trajectories found under {path}")
 
-        # metadata loads are I/O bound and tiny; cap workers at 16
-        with ThreadPoolExecutor(max_workers=max(1, min(16, num_workers or 8))) as ex:
-            metas = list(
-                ex.map(
-                    lambda f: self.backend.read_metadata(
-                        f,
-                        self.fields_to_load,
-                        lightweight=lightweight_metadata,
-                    ),
-                    self.files,
-                )
-            )
+        # metadata loads are I/O bound and tiny
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            metas = list(ex.map(backend.read_metadata, self.files))
         self.metadata: dict[int, dict] = {}
         kept_files = []
         # metadata keys _build_sample hard-requires, plus any non-alias conditioning field
@@ -250,9 +167,6 @@ class CycloneDataset:
         for fp, meta in zip(self.files, metas):
             if not self._passes_cond_filter(meta):
                 continue
-            # ood trajectories use "fluxes" key instead of "flux" — normalise here
-            if "flux" not in meta and "fluxes" in meta:
-                meta["flux"] = meta["fluxes"]
             missing = sorted(k for k in required if k not in meta)
             if missing:
                 # traj missing a conditioning/metadata field -> exclude it rather than crash
@@ -265,7 +179,6 @@ class CycloneDataset:
         self.files = kept_files
 
         self.flat_index_to_file_and_tstep: dict[int, tuple[int, int]] = {}
-        self.file_and_tstep_to_flat_index: dict[tuple[int, int], int] = {}
         self.file_num_timesteps: list[int] = []
         flat = 0
         for fid, meta in self.metadata.items():
@@ -276,12 +189,11 @@ class CycloneDataset:
             n = len(timesteps[::subsample]) - bundle_seq_length * 2 + 1
             for t_idx in range(max(0, n)):
                 self.flat_index_to_file_and_tstep[flat] = (fid, t_idx * subsample)
-                self.file_and_tstep_to_flat_index[(fid, t_idx * subsample)] = flat
                 flat += 1
         self.length = flat
 
         # resolution: assume same across files
-        self.resolution = tuple(int(r) for r in self.metadata[0]["resolution"])
+        self.resolution = tuple(self.metadata[0]["resolution"])
         self.df_shape = (2, *self.resolution)
         self.phi_resolution = (self.resolution[3], self.resolution[2], self.resolution[4])
 
@@ -379,9 +291,7 @@ class CycloneDataset:
             }
         return out
 
-    def _get_scale_shift(
-        self, fid: int, field: str, x: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def _get_scale_shift(self, fid: int, field: str) -> tuple[np.ndarray, np.ndarray]:
         if self.normalization_scope == "sample" or self.normalization is None:
             return np.float32(1.0), np.float32(0.0)
         if field not in self.normalization:
@@ -410,7 +320,7 @@ class CycloneDataset:
 
     def normalize(self, fid: int, *, df=None, phi=None, flux=None, fluxavg=None) -> np.ndarray:
         x, field = self._unpack_field(df=df, phi=phi, flux=flux, fluxavg=fluxavg)
-        scale, shift = self._get_scale_shift(fid, field, x)
+        scale, shift = self._get_scale_shift(fid, field)
         return (x - shift) / scale
 
     def scale_shift(self, fids: Sequence[int], field: str, sample_ndim: int):
@@ -420,8 +330,7 @@ class CycloneDataset:
         Shared statistics (dataset scope, or none) are returned without a batch
         axis; per-trajectory statistics are stacked along a leading batch axis.
         """
-        dummy = np.zeros((1,) * sample_ndim, dtype=np.float32)
-        pairs = [self._get_scale_shift(int(f), field, dummy) for f in fids]
+        pairs = [self._get_scale_shift(int(f), field) for f in fids]
         shared = self.normalization is None or self.normalization_scope in ("dataset", "sample")
         if shared:
             scale, shift = pairs[0]
@@ -474,14 +383,13 @@ class CycloneDataset:
         gt_t = t_idx + self.offset + self.bundle_seq_length
         out: dict[str, np.ndarray] = {}
         with self.backend.open(self.files[fid]) as handle:
-            gt_str = str(gt_t).zfill(5)
             if "df" in self.fields_to_load:
-                y_df = self.backend.read_df(handle, gt_str, self.df_shape, [0, 1])
+                y_df = self.backend.read_df(handle, gt_t, self.df_shape)
                 if self.separate_zf:
                     y_df = separate_zf_fn(y_df, axis=0)
                 out["df"] = y_df
             if "phi" in self.fields_to_load:
-                out["phi"] = self.backend.read_phi(handle, gt_str, self.phi_resolution)
+                out["phi"] = self.backend.read_phi(handle, gt_t, self.phi_resolution)
         out["flux"] = np.asarray(meta["flux"][gt_t], dtype=np.float32)
         out["fluxavg"] = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
         if self.normalization is not None:
@@ -507,22 +415,19 @@ class CycloneDataset:
         f_path = self.files[fid]
         df = phi = None
         with self.backend.open(f_path) as handle:
-            t_str = str(original_t).zfill(5)
             if "df" in self.fields_to_load:
-                df = self.backend.read_df(handle, t_str, self.df_shape, [0, 1])
+                df = self.backend.read_df(handle, original_t, self.df_shape)
                 if self.separate_zf:
                     df = separate_zf_fn(df, axis=0)
             if "phi" in self.fields_to_load:
-                phi = self.backend.read_phi(handle, t_str, self.phi_resolution)
+                phi = self.backend.read_phi(handle, original_t, self.phi_resolution)
 
         flux = np.asarray(meta["flux"][original_t], dtype=np.float32)
         timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
         if df is not None and self.normalization is not None:
-            df = self.normalize(fid, df=df)
-            df = df.astype(jnp.float32) if isinstance(df, jax.Array) else df.astype(np.float32)
+            df = _f32(self.normalize(fid, df=df))
         if phi is not None and self.normalization is not None:
-            phi = self.normalize(fid, phi=phi)
-            phi = phi.astype(jnp.float32) if isinstance(phi, jax.Array) else phi.astype(np.float32)
+            phi = _f32(self.normalize(fid, phi=phi))
 
         return self._build_sample(fid, t_idx, df, phi, flux, timestep, meta)
 
@@ -532,16 +437,15 @@ class CycloneDataset:
         gt_t = original_t + self.bundle_seq_length
         df = y_df = phi = y_phi = None
         with self.backend.open(self.files[fid]) as handle:
-            t_str, gt_str = str(original_t).zfill(5), str(gt_t).zfill(5)
             if "df" in self.fields_to_load:
-                df = self.backend.read_df(handle, t_str, self.df_shape, [0, 1])
-                y_df = self.backend.read_df(handle, gt_str, self.df_shape, [0, 1])
+                df = self.backend.read_df(handle, original_t, self.df_shape)
+                y_df = self.backend.read_df(handle, gt_t, self.df_shape)
                 if self.separate_zf:
                     df = separate_zf_fn(df, axis=0)
                     y_df = separate_zf_fn(y_df, axis=0)
             if "phi" in self.fields_to_load:
-                phi = self.backend.read_phi(handle, t_str, self.phi_resolution)
-                y_phi = self.backend.read_phi(handle, gt_str, self.phi_resolution)
+                phi = self.backend.read_phi(handle, original_t, self.phi_resolution)
+                y_phi = self.backend.read_phi(handle, gt_t, self.phi_resolution)
 
         flux = np.asarray(meta["flux"][original_t], dtype=np.float32)
         y_flux = np.asarray(meta["flux"][gt_t], dtype=np.float32)
@@ -619,7 +523,3 @@ class CycloneDataset:
         # parallel (s) grid spacing; None when the trajectory metadata doesn't carry it
         ds = self.metadata[fid].get("ds")
         return None if ds is None else float(ds)
-
-    @staticmethod
-    def collate(batch: Sequence[CycloneSample]) -> CycloneSample:
-        return collate(batch)

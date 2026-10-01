@@ -1,14 +1,16 @@
-"""I/O backend for the cyclone preprocessed dataset (.bin per-timestep).
+"""Trajectory readers of the preprocessed cyclone dataset.
 
-``NumpyBackend`` reads with plain ``np.fromfile``; ``KvikIOBackend`` wraps
-cupy + kvikio for GPU-direct reads where available, gated behind an import
-guard. All readers return host-side ``numpy`` arrays — JAX consumes them via
-``jnp.asarray(...)`` when batching, which is zero-copy on a single host.
+A backend owns every on-disk detail of a trajectory: the directory or file name, the
+metadata files and their key conventions, the geometry defaults, the per-timestep shards
+(fp32 or a quantized sibling) and the array type handed back. ``NumpyBackend`` and
+``H5Backend`` return host ``numpy`` arrays, ``KvikIOBackend`` device ``jax`` arrays read
+GPU-direct. :func:`make_backend` builds the backend of a ``dataset`` config.
 """
 
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import os
 import pickle
 import re
@@ -16,6 +18,68 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional, Sequence
 
 import numpy as np
+
+from neugk_jax.dataset import quant
+from neugk_jax.utils import atomic_write
+
+# metadata keys left out of metadata_light (the per-element df and phi moments)
+LIGHT_DROP_KEYS = (
+    "df_min",
+    "df_max",
+    "df_var",
+    "df_mean",
+    "df_std",
+    "phi_min",
+    "phi_max",
+    "phi_var",
+)
+# geometry scalars absent from a trajectory: single species, electrostatic, adiabatic electrons
+GEOMETRY_DEFAULTS = {
+    "mas": 1.0,
+    "tmp": 1.0,
+    "d2X": 1.0,
+    "signz": 1.0,
+    "signB": 1.0,
+    "adiabatic": 1.0,
+    "de": 1.0,
+    "vthrat": 1.0,
+    "beta": 0.0,
+    "nlapar": 0.0,
+    "nlbpar": 0.0,
+}
+
+
+def complete_geometry(geometry: dict) -> dict:
+    """Numeric geometry entries with :data:`GEOMETRY_DEFAULTS` for the missing scalars.
+
+    ``ffun`` (the flux-surface function, absent for cyclone s-α at ε→0) defaults to ones.
+    """
+    g = {k: np.asarray(v) for k, v in geometry.items() if np.asarray(v).dtype.kind in "fiub"}
+    for k, v in GEOMETRY_DEFAULTS.items():
+        g.setdefault(k, np.array(v, dtype=np.float64))
+    if "ffun" not in g and "ints" in g:
+        g["ffun"] = np.ones_like(g["ints"], dtype=np.float64)
+    return g
+
+
+def frame_name(kind: str, t: int) -> str:
+    """Name of the ``kind`` (``timestep`` or ``poten``) frame at raw index ``t``."""
+    return f"{kind}_{int(t):05d}"
+
+
+def expand_spec(spec) -> list[str]:
+    """Trajectory names of a spec: one brace pattern (``iteration_{0-3,7}``) or a list of them."""
+    if isinstance(spec, (list, tuple)):
+        return [n for s in spec for n in expand_spec(s)]
+    m = re.match(r"^(.*?)\{([^}]+)\}(.*?)$", spec)
+    if not m:
+        return [spec]
+    prefix, ranges, suffix = m.groups()
+    nums = []
+    for part in ranges.split(","):
+        lo, _, hi = part.partition("-")
+        nums.extend(range(int(lo), int(hi or lo) + 1))
+    return [f"{prefix}{n}{suffix}" for n in nums]
 
 
 def _flatten_meta(meta):
@@ -33,43 +97,39 @@ def _flatten_meta(meta):
 def _unflatten_meta(z):
     meta, geom = {}, {}
     for k in z.files:
-        v = z[k]
         if k.startswith("geometry/"):
-            geom[k[len("geometry/") :]] = v
-        elif k == "resolution":
-            meta["resolution"] = tuple(int(x) for x in np.atleast_1d(v))
+            geom[k[len("geometry/") :]] = z[k]
         else:
-            meta[k] = v
+            meta[k] = z[k]
     if geom:
         meta["geometry"] = geom
     return meta
 
 
-def _meta_ext(base):
-    if os.path.exists(base + ".npz"):
-        return ".npz"
-    if os.path.exists(base + ".pkl"):
-        return ".pkl"
+def meta_path(base: str) -> Optional[str]:
+    """Existing metadata file of ``base`` (``.npz`` preferred over ``.pkl``), else None."""
+    for ext in (".npz", ".pkl"):
+        if os.path.exists(base + ext):
+            return base + ext
     return None
 
 
-def load_meta(base):
-    ext = _meta_ext(base)
-    if ext == ".npz":
-        with np.load(base + ".npz", allow_pickle=False) as z:
+def load_meta(base: str) -> Optional[dict]:
+    path = meta_path(base)
+    if path is None:
+        return None
+    if path.endswith(".npz"):
+        with np.load(path, allow_pickle=False) as z:
             return _unflatten_meta(z)
-    if ext == ".pkl":
-        with open(base + ".pkl", "rb") as f:
-            return pickle.load(f)
-    return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-def save_meta(base, meta, ext):
+def save_meta(base: str, meta: dict, ext: str) -> None:
     if ext == ".npz":
-        np.savez(base + ".npz", **_flatten_meta(meta))
+        atomic_write(base + ext, lambda f: np.savez(f, **_flatten_meta(meta)))
     else:
-        with open(base + ".pkl", "wb") as f:
-            pickle.dump(meta, f)
+        atomic_write(base + ext, lambda f: pickle.dump(meta, f))
 
 
 def read_bin(file: str, shape: tuple, dtype=np.float32) -> np.ndarray:
@@ -81,44 +141,17 @@ def read_bin(file: str, shape: tuple, dtype=np.float32) -> np.ndarray:
     return arr.reshape(shape)
 
 
-_DTYPE_SUFFIX = {
-    "fp16": ".fp16.bin",
-    "bf16": ".bf16.bin",
-    "i8": ".i8.bin",
-    "i4": ".i4.bin",
-}
-
-
-def _quantized_sibling(fp32_path: str, dtype: str) -> str:
-    suf = _DTYPE_SUFFIX[dtype]
-    return fp32_path[:-4] + suf if fp32_path.endswith(".bin") else fp32_path + suf
-
-
-def _quantize_roundtrip(arr_f32: np.ndarray, dtype: str) -> np.ndarray:
-    from neugk_jax.dataset.preprocess import dequantize_array, quantize_array
-
-    payload, scale = quantize_array(arr_f32, dtype)
-    return dequantize_array(payload, scale, dtype, arr_f32.size).astype(np.float32, copy=False)
-
-
-def _resolve_dtyped_path(fp32_path: str, prefer_dtype: str | None) -> tuple[str, str]:
-    """Pick the path to actually read from.
-
-    ``prefer_dtype`` is one of ``fp32`` / ``fp16`` / ``bf16`` / ``i8`` /
-    ``i4`` (or ``None`` / ``False`` for fp32). Falls back to fp32 silently
-    when the preferred sibling is missing.
-
-    Returns ``(path, mode)`` where ``mode`` is one of ``fp32``, ``fp16``,
-    ``bf16``, ``i8``, ``i4``.
-    """
-    if prefer_dtype and prefer_dtype != "fp32":
-        cand = _quantized_sibling(fp32_path, prefer_dtype)
-        if os.path.exists(cand):
-            return cand, prefer_dtype
-    return fp32_path, "fp32"
-
-
 class DataBackend(ABC):
+    """Reader of one trajectory layout.
+
+    ``read_metadata`` returns the metadata with the dataset conventions applied: ``flux``
+    (not ``fluxes``), ``resolution`` as a tuple of ints and the geometry completed by
+    :func:`complete_geometry`. ``read_df`` / ``read_phi`` return float32 frames.
+    """
+
+    @abstractmethod
+    def trajectory_path(self, path: str) -> str: ...
+
     @abstractmethod
     def is_valid(self, path: str) -> bool: ...
 
@@ -126,41 +159,29 @@ class DataBackend(ABC):
     def exists(self, path: str) -> bool: ...
 
     @abstractmethod
-    def format_path(
-        self,
-        path: str,
-        spatial_ifft: bool,
-        split_into_bands: Optional[int] = None,
-        real_potens: bool = True,
-    ) -> str: ...
-
-    @abstractmethod
-    def read_metadata(
-        self,
-        path: str,
-        input_fields: Sequence[str] = ("df",),
-        lightweight: bool = False,
-    ) -> dict: ...
+    def _read_metadata(self, path: str) -> dict: ...
 
     @abstractmethod
     @contextlib.contextmanager
     def open(self, path: str): ...
 
     @abstractmethod
-    def read_df(
-        self,
-        f: Any,
-        timestamp: str,
-        shape: Sequence[int],
-        active_keys: Optional[Sequence[int]] = None,
-    ) -> np.ndarray: ...
+    def _read(self, handle: Any, kind: str, t: int, shape: Sequence[int]): ...
 
-    @abstractmethod
-    def read_phi(self, f: Any, timestamp: str, shape: Sequence[int]) -> np.ndarray: ...
+    def read_metadata(self, path: str) -> dict:
+        meta = self._read_metadata(path)
+        if "flux" not in meta and "fluxes" in meta:
+            meta["flux"] = meta.pop("fluxes")
+        meta["resolution"] = tuple(int(r) for r in np.atleast_1d(meta["resolution"]))
+        if meta.get("geometry") is not None:
+            meta["geometry"] = complete_geometry(meta["geometry"])
+        return meta
 
-    def read_field(self, f: Any, name: str, shape: Sequence[int]) -> np.ndarray:
-        # reads an arbitrary named data/<name>.bin shard, no timestep index
-        raise NotImplementedError
+    def read_df(self, handle: Any, t: int, shape: Sequence[int]):
+        return self._read(handle, "timestep", t, tuple(shape))
+
+    def read_phi(self, handle: Any, t: int, shape: Sequence[int]):
+        return self._read(handle, "poten", t, tuple(shape))
 
 
 class NumpyBackend(DataBackend):
@@ -168,322 +189,130 @@ class NumpyBackend(DataBackend):
 
     Directory layout::
 
-        traj_dir/
-        ├── metadata.pkl
-        ├── metadata_light.pkl  (optional)
+        traj_dir/                    (<name>_ifft_realpotens, or _ifft with real_potens=False)
+        ├── metadata.{npz,pkl}
+        ├── metadata_light.{npz,pkl}  (optional)
         └── data/
             ├── timestep_00000.bin
-            ├── timestep_00001.bin
             ├── timestep_00000.bf16.bin  (optional, ``preprocess --mode=quantize``)
             ├── poten_00000.bin
             └── ...
 
-    ``prefer_dtype`` (``fp16``/``bf16``/``i8``/``i4``) reads the quantized sibling
-    when present and otherwise the fp32 shard (round-tripped through the preferred
-    dtype when ``quantize_fallback``).
-    """
-
-    def __init__(self, *, prefer_dtype: str | None = None, quantize_fallback: bool = True):
-        self.prefer_dtype = prefer_dtype or "fp32"
-        # if true and the preferred sibling is missing, read fp32 and round-trip through the preferred dtype on-the-fly
-        self.quantize_fallback = quantize_fallback
-
-    def _strip_h5(self, path: str) -> str:
-        return path.removesuffix("/").removesuffix(".h5")
-
-    def is_valid(self, path: str) -> bool:
-        return os.path.isdir(self._strip_h5(path))
-
-    def exists(self, path: str) -> bool:
-        path = self._strip_h5(path)
-        # a trajectory is present if it has full or lightweight metadata, in either npz or pkl
-        return any(
-            _meta_ext(os.path.join(path, n)) is not None for n in ("metadata", "metadata_light")
-        )
-
-    def format_path(
-        self,
-        path: str,
-        spatial_ifft: bool,
-        split_into_bands: Optional[int] = None,
-        real_potens: bool = True,
-    ) -> str:
-        path = self._strip_h5(path)
-        if spatial_ifft:
-            if split_into_bands:
-                tag = f"_ifft_separate_zf_{split_into_bands}bands_realpotens"
-            else:
-                tag = "_ifft_realpotens" if real_potens else "_ifft"
-            if tag not in path:
-                path = path + tag
-        return path
-
-    def read_metadata(
-        self,
-        path: str,
-        input_fields: Sequence[str] = ("df",),
-        lightweight: bool = False,
-    ) -> dict:
-        path = self._strip_h5(path)
-        # metadata is stored as npz (safe, no pickle) or pkl; prefer npz, fall back to the lightweight file when the full one is absent
-        light_base = os.path.join(path, "metadata_light")
-        full_base = os.path.join(path, "metadata")
-        if (lightweight or _meta_ext(full_base) is None) and _meta_ext(light_base) is not None:
-            meta = load_meta(light_base)
-        else:
-            meta = load_meta(full_base)
-            if lightweight:
-                drop = {
-                    "df_min",
-                    "df_max",
-                    "df_var",
-                    "df_mean",
-                    "df_std",
-                    "phi_min",
-                    "phi_max",
-                    "phi_var",
-                }
-                meta = {k: v for k, v in meta.items() if k not in drop}
-        # fill in missing geometry scalars with safe defaults
-        if "geometry" in meta:
-            g = meta["geometry"]
-            # missing species/field flags default to electrostatic with adiabatic electrons
-            for k, v in (
-                ("adiabatic", 1.0),
-                ("de", 1.0),
-                ("beta", 0.0),
-                ("nlapar", 0.0),
-                ("nlbpar", 0.0),
-            ):
-                if k not in g:
-                    g[k] = np.array(v, dtype=np.float64)
-            # gyaradax needs ffun (flux-surface function); stub with ones for cyclone s-α at ε→0
-            if "ffun" not in g and "ints" in g:
-                g["ffun"] = np.ones_like(np.asarray(g["ints"]), dtype=np.float64)
-        return meta
-
-    @contextlib.contextmanager
-    def open(self, path: str):
-        # yield the directory path as the "file handle" for per-timestep reads
-        yield self._strip_h5(path)
-
-    def _read_dtyped(self, fp32_path: str, shape: Sequence[int]) -> np.ndarray:
-        """Read fp32 or a quantized sibling; always returns fp32 numpy.
-
-        Quantized formats (fp16/bf16/i8/i4) are dequantized inline on the
-        host so downstream code (normalize, separate_zf, FFT integrals)
-        stays fp32-only.
-
-        When ``prefer_dtype`` is set but the sibling is missing and
-        ``quantize_fallback=True``, the fp32 file is read and immediately
-        round-tripped through the preferred dtype — the model sees identical
-        precision whether the on-disk shard exists or not.
-        """
-        path, mode = _resolve_dtyped_path(fp32_path, self.prefer_dtype)
-        if mode == "fp32" and self.prefer_dtype not in (None, "fp32") and self.quantize_fallback:
-            # fp32 sibling exists but bf16/fp16/... was requested → quantize on-the-fly
-            arr = read_bin(path, tuple(shape))
-            return _quantize_roundtrip(arr.ravel(), self.prefer_dtype).reshape(shape)
-        if mode == "fp32":
-            return read_bin(path, tuple(shape))
-        from neugk_jax.dataset.preprocess import read_quantized
-
-        expected = int(np.prod(shape))
-        arr = read_quantized(path, mode, expected)
-        if arr.size != expected:
-            raise IOError(f"{path}: expected {expected} {mode} elements, got {arr.size}")
-        return arr.reshape(shape).astype(np.float32, copy=False)
-
-    def read_df(
-        self,
-        f_dir: str,
-        timestamp: str,
-        shape: Sequence[int],
-        active_keys: Optional[Sequence[int]] = None,
-    ) -> np.ndarray:
-        fp = os.path.join(f_dir, "data", f"timestep_{timestamp}.bin")
-        k = self._read_dtyped(fp, tuple(shape))
-        if active_keys is None or (len(active_keys) == 2 and tuple(active_keys) == (0, 1)):
-            return k
-        return k[list(active_keys)]
-
-    def read_phi(self, f_dir: str, timestamp: str, shape: Sequence[int]) -> np.ndarray:
-        fp = os.path.join(f_dir, "data", f"poten_{timestamp}.bin")
-        return self._read_dtyped(fp, tuple(shape))
-
-    def read_field(self, f_dir: str, name: str, shape: Sequence[int]) -> np.ndarray:
-        fp = name if os.path.isabs(name) else os.path.join(f_dir, "data", f"{name}.bin")
-        return self._read_dtyped(fp, tuple(shape))
-
-
-class KvikIOBackend(NumpyBackend):
-    """GPU-direct reads via cupy + kvikio (NVIDIA GDS).
-
-    Two modes:
-
-    * ``return_jax=True`` (default): returns a ``jax.Array`` on GPU via
-      ``jax.dlpack.from_dlpack(cp_arr.toDlpack())``. Zero-copy from cupy.
-      Requires the dataloader to run single-process (``num_workers=0``).
-    * ``return_jax=False``: copies back to host as ``numpy.ndarray``.
-      Slower per-sample but compatible with multi-worker dataloaders. Use
-      this when num_workers > 0 or when running on a node without GPUs.
-
-    Falls back to ``NumpyBackend`` (``np.fromfile``) if cupy / kvikio aren't
-    installed or ``use_kvikio=False``.
+    ``prefer_dtype`` (``fp16``/``bf16``/``i8``/``i4``) reads the quantized sibling when
+    present and otherwise the fp32 shard round-tripped through that dtype, so the model sees
+    the same precision either way. ``lightweight_metadata`` reads ``metadata_light`` (no
+    per-element moments) when it exists. ``split_into_bands`` names the zonal-flow band
+    layout written by ``preprocess --split-into-bands``.
     """
 
     def __init__(
         self,
-        rank: int = 0,
         *,
-        use_kvikio: bool = True,
-        return_jax: bool = True,
-        prefer_dtype: str | None = None,
+        prefer_dtype: Optional[str] = None,
+        real_potens: bool = True,
+        split_into_bands: Optional[int] = None,
+        lightweight_metadata: bool = False,
     ):
-        super().__init__(prefer_dtype=prefer_dtype)
-        self.rank = rank
-        self.use_kvikio = use_kvikio
-        self.return_jax = return_jax
-        if use_kvikio:
-            try:
-                import cupy  # noqa: F401
-                import kvikio  # noqa: F401
-            except ImportError:
-                self.use_kvikio = False
-                self.return_jax = False
+        self.prefer_dtype = prefer_dtype or "fp32"
+        self.real_potens = real_potens
+        self.split_into_bands = split_into_bands
+        self.lightweight_metadata = lightweight_metadata
 
-    def _cp_read(self, file: str, shape: tuple, *, dtype="fp32"):
-        """kvikio CuFile read into a cupy buffer. The on-disk layout varies
-        with ``dtype``; we read the raw bytes into a buffer of the right
-        size and let the caller reinterpret/dequantize."""
-        import cupy as cp
-        import kvikio
-
-        n_elems = int(np.prod(shape))
-        if dtype == "fp32":
-            buf_dtype, buf_size = cp.float32, n_elems
-        elif dtype in ("fp16", "bf16"):
-            buf_dtype, buf_size = cp.uint16, n_elems  # 2 bytes/elem; reinterpret post-DLPack
-        elif dtype == "i8":
-            # 4-byte fp32 scale header + n_elems int8 values
-            buf_dtype, buf_size = cp.int8, n_elems + 4
-        elif dtype == "i4":
-            # 4-byte fp32 scale header + ceil(n_elems / 2) packed uint8 nibbles
-            buf_dtype, buf_size = cp.uint8, ((n_elems + 1) // 2) + 4
+    def trajectory_path(self, path: str) -> str:
+        path = path.removesuffix("/").removesuffix(".h5")
+        if self.split_into_bands:
+            tag = f"_ifft_separate_zf_{self.split_into_bands}bands_realpotens"
         else:
-            raise ValueError(f"unknown dtype={dtype!r}")
-        with cp.cuda.Device(self.rank):
-            gpu = cp.empty(buf_size, dtype=buf_dtype)
-            with kvikio.CuFile(file, "r") as fh:
-                fh.read(gpu)
-        return gpu
+            tag = "_ifft_realpotens" if self.real_potens else "_ifft"
+        return path if tag in path else path + tag
 
-    def _dequantize_gpu(self, gpu, mode: str, shape: tuple):
-        """Turn a raw cupy buffer into an fp32 jax.Array (or numpy if
-        ``return_jax=False``). Handles the per-dtype layout described in
-        :mod:`neugk_jax.dataset.preprocess`.
-        """
+    def is_valid(self, path: str) -> bool:
+        return os.path.isdir(path)
+
+    def exists(self, path: str) -> bool:
+        # a trajectory is present if it has full or lightweight metadata
+        return any(meta_path(os.path.join(path, n)) for n in ("metadata", "metadata_light"))
+
+    def _read_metadata(self, path: str) -> dict:
+        light, full = os.path.join(path, "metadata_light"), os.path.join(path, "metadata")
+        if (self.lightweight_metadata or meta_path(full) is None) and meta_path(light):
+            return load_meta(light)
+        meta = load_meta(full)
+        if self.lightweight_metadata:
+            meta = {k: v for k, v in meta.items() if k not in LIGHT_DROP_KEYS}
+        return meta
+
+    @contextlib.contextmanager
+    def open(self, path: str):
+        # the directory path is the handle of per-timestep reads
+        yield path
+
+    def _read(self, handle: str, kind: str, t: int, shape: tuple):
+        fp32 = os.path.join(handle, "data", frame_name(kind, t) + ".bin")
+        path, bits = quant.resolve(fp32, self.prefer_dtype)
+        if bits != self.prefer_dtype:
+            # no quantized sibling: quantize the fp32 shard on the fly
+            return self._output(quant.roundtrip(read_bin(fp32, shape), self.prefer_dtype))
+        return self._read_file(path, bits, shape)
+
+    def _read_file(self, path: str, bits: str, shape: tuple):
+        if bits == "fp32":
+            return read_bin(path, shape)
+        return quant.read(path, bits, int(np.prod(shape))).reshape(shape)
+
+    def _output(self, arr: np.ndarray):
+        return arr
+
+
+def kvikio_available() -> bool:
+    return all(importlib.util.find_spec(m) is not None for m in ("cupy", "kvikio"))
+
+
+class KvikIOBackend(NumpyBackend):
+    """GPU-direct reads via cupy + kvikio (NVIDIA GDS) into device ``jax`` arrays.
+
+    Shards are read into a cupy buffer on device ``rank`` and handed to jax zero-copy over
+    DLPack (fp32 / fp16 / bf16 / i8); i4 shards and on-the-fly quantization go through the
+    host. Requires the dataloader to run in-process. Same layout and options as
+    ``NumpyBackend``.
+    """
+
+    def __init__(self, rank: int = 0, **kwargs):
+        super().__init__(**kwargs)
+        self.rank = rank
+
+    def _output(self, arr: np.ndarray):
+        import jax.numpy as jnp
+
+        return jnp.asarray(arr)
+
+    def _read_file(self, path: str, bits: str, shape: tuple):
         import cupy as cp
         import jax.dlpack as jdlp
         import jax.lax as lax
         import jax.numpy as jnp
+        import kvikio
 
         n_elems = int(np.prod(shape))
-        if mode == "fp32":
-            if self.return_jax:
-                return jdlp.from_dlpack(gpu.reshape(shape))
-            return cp.asnumpy(gpu.reshape(shape))
-        if mode == "fp16":
-            f16 = gpu.view(cp.float16).reshape(shape)
-            if self.return_jax:
-                return jdlp.from_dlpack(f16).astype(jnp.float32)
-            return cp.asnumpy(f16).astype(np.float32)
-        if mode == "bf16":
-            u16 = gpu.reshape(shape)
-            if self.return_jax:
-                a = jdlp.from_dlpack(u16)
-                return lax.bitcast_convert_type(a, jnp.bfloat16).astype(jnp.float32)
-            # host fallback
-            from ml_dtypes import bfloat16
-
-            return cp.asnumpy(u16).view(bfloat16).astype(np.float32)
-        if mode == "i8":
-            # split header / payload on device
-            scale = float(cp.asnumpy(gpu[:4]).view(np.float32)[0])
-            payload = gpu[4:].view(cp.int8).reshape(shape)
-            if self.return_jax:
-                a = jdlp.from_dlpack(payload).astype(jnp.float32)
-                return a * jnp.float32(scale)
-            return cp.asnumpy(payload).astype(np.float32) * np.float32(scale)
-        if mode == "i4":
-            # dequantize on host — i4 unpacking is fiddly and not a hot path
-            scale = float(cp.asnumpy(gpu[:4]).view(np.float32)[0])
-            packed = cp.asnumpy(gpu[4:].view(cp.uint8))
-            from neugk_jax.dataset.preprocess import dequantize_array
-
-            arr = dequantize_array(packed, np.float32(scale), "i4", n_elems).reshape(shape)
-            if self.return_jax:
-                return jnp.asarray(arr)
-            return arr
-        raise ValueError(f"unknown mode={mode!r}")
-
-    def _read(self, file: str, shape: tuple):
-        path, mode = _resolve_dtyped_path(file, self.prefer_dtype)
-        # on-the-fly quantize fallback: fp32 on disk but bf16/fp16/... requested
-        if mode == "fp32" and self.prefer_dtype not in (None, "fp32") and self.quantize_fallback:
-            if not self.use_kvikio:
-                arr = read_bin(path, shape)
-            else:
-                gpu = self._cp_read(path, tuple(shape), dtype="fp32")
-                # round-trip through host to apply the quantization
-                import cupy as cp
-
-                arr = cp.asnumpy(gpu).reshape(shape)
-            quantized = _quantize_roundtrip(arr.ravel(), self.prefer_dtype).reshape(shape)
-            if self.return_jax and self.use_kvikio:
-                import jax.numpy as jnp
-
-                return jnp.asarray(quantized)
-            return quantized
-        if not self.use_kvikio:
-            if mode == "fp32":
-                return read_bin(path, shape)
-            from neugk_jax.dataset.preprocess import read_quantized
-
-            n_elems = int(np.prod(shape))
-            return read_quantized(path, mode, n_elems).reshape(shape).astype(np.float32, copy=False)
-        gpu = self._cp_read(path, tuple(shape), dtype=mode)
-        return self._dequantize_gpu(gpu, mode, tuple(shape))
-
-    def read_df(
-        self,
-        f_dir: str,
-        timestamp: str,
-        shape: Sequence[int],
-        active_keys: Optional[Sequence[int]] = None,
-    ):
-        fp = os.path.join(f_dir, "data", f"timestep_{timestamp}.bin")
-        k = self._read(fp, tuple(shape))
-        if active_keys is None or (len(active_keys) == 2 and tuple(active_keys) == (0, 1)):
-            return k
-        return k[list(active_keys)]
-
-    def read_phi(self, f_dir: str, timestamp: str, shape: Sequence[int]):
-        fp = os.path.join(f_dir, "data", f"poten_{timestamp}.bin")
-        return self._read(fp, tuple(shape))
-
-    def read_field(self, f_dir: str, name: str, shape: Sequence[int]):
-        fp = name if os.path.isabs(name) else os.path.join(f_dir, "data", f"{name}.bin")
-        return self._read(fp, tuple(shape))
-
-
-_GEOMETRY_DEFAULTS = (
-    ("adiabatic", 1.0),
-    ("de", 1.0),
-    ("beta", 0.0),
-    ("nlapar", 0.0),
-    ("nlbpar", 0.0),
-)
+        if bits == "i4":
+            return self._output(quant.read(path, bits, n_elems).reshape(shape))
+        header = quant.HEADER_BYTES if quant.has_header(bits) else 0
+        buf_dtype = {"fp32": cp.float32, "fp16": cp.float16, "bf16": cp.uint16, "i8": cp.int8}[bits]
+        expected = header + n_elems * np.dtype(buf_dtype).itemsize
+        if os.path.getsize(path) != expected:
+            raise IOError(f"{path}: expected {expected} bytes, got {os.path.getsize(path)}")
+        with cp.cuda.Device(self.rank):
+            gpu = cp.empty(n_elems, dtype=buf_dtype)
+            with kvikio.CuFile(path, "r") as fh:
+                # the payload goes to its own buffer so the device array stays aligned
+                fh.read(gpu, file_offset=header)
+        arr = jdlp.from_dlpack(gpu.reshape(shape))
+        if bits == "bf16":
+            return lax.bitcast_convert_type(arr, jnp.bfloat16).astype(jnp.float32)
+        if bits == "i8":
+            scale = np.fromfile(path, dtype=np.float32, count=1)[0]
+            return arr.astype(jnp.float32) * jnp.float32(scale)
+        return arr.astype(jnp.float32)
 
 
 class H5Backend(DataBackend):
@@ -497,105 +326,72 @@ class H5Backend(DataBackend):
         ├── metadata/{timesteps, flux|fluxes, ion_temp_grad, density_grad, s_hat, q, resolution}
         └── geometry/<key>
 
-    ``fluxes`` is read as ``flux``; a uniform parallel grid without ``ds`` gets
-    ``ds = ints[0]``. Missing electrostatic geometry flags get the ``NumpyBackend`` defaults.
+    A uniform parallel grid without ``ds`` gets ``ds = ints[0]``.
     """
 
+    def trajectory_path(self, path: str) -> str:
+        return path if path.endswith(".h5") else path + ".h5"
+
     def is_valid(self, path: str) -> bool:
-        return os.path.isfile(self.format_path(path, True))
+        return os.path.isfile(path)
 
     def exists(self, path: str) -> bool:
         return self.is_valid(path)
 
-    def format_path(
-        self,
-        path: str,
-        spatial_ifft: bool,
-        split_into_bands: Optional[int] = None,
-        real_potens: bool = True,
-    ) -> str:
-        return path if path.endswith(".h5") else path + ".h5"
-
-    def read_metadata(
-        self,
-        path: str,
-        input_fields: Sequence[str] = ("df",),
-        lightweight: bool = False,
-    ) -> dict:
+    def _read_metadata(self, path: str) -> dict:
         import h5py
 
-        with h5py.File(self.format_path(path, True), "r") as f:
+        with h5py.File(path, "r") as f:
             meta = {k: np.asarray(v[()]) for k, v in f["metadata"].items()}
-            geom = (
-                {k: np.asarray(v[()]) for k, v in f["geometry"].items()}
-                if "geometry" in f
-                else None
-            )
-        if "flux" not in meta and "fluxes" in meta:
-            meta["flux"] = meta.pop("fluxes")
-        meta["resolution"] = tuple(int(r) for r in np.atleast_1d(meta["resolution"]))
-        if geom is not None:
-            for k, v in _GEOMETRY_DEFAULTS:
-                geom.setdefault(k, np.array(v, dtype=np.float64))
-            if "ffun" not in geom and "ints" in geom:
-                geom["ffun"] = np.ones_like(geom["ints"], dtype=np.float64)
-            ints = np.asarray(geom.get("ints", ()), np.float64)
-            # uniform parallel grid: the s quadrature weight is the grid spacing
-            if "ds" not in meta and ints.size and np.allclose(ints, ints[0]):
-                meta["ds"] = np.float64(ints[0])
-            meta["geometry"] = geom
+            if "geometry" in f:
+                meta["geometry"] = {k: np.asarray(v[()]) for k, v in f["geometry"].items()}
+        ints = np.asarray(meta.get("geometry", {}).get("ints", ()), np.float64)
+        # uniform parallel grid: the s quadrature weight is the grid spacing
+        if "ds" not in meta and ints.size and np.allclose(ints, ints[0]):
+            meta["ds"] = np.float64(ints[0])
         return meta
 
     @contextlib.contextmanager
     def open(self, path: str):
         import h5py
 
-        f = h5py.File(self.format_path(path, True), "r")
+        f = h5py.File(path, "r")
         try:
             yield f
         finally:
             f.close()
 
-    @staticmethod
-    def _read(f, name: str, shape: Sequence[int]) -> np.ndarray:
+    def _read(self, f, kind: str, t: int, shape: tuple) -> np.ndarray:
+        name = f"data/{frame_name(kind, t)}"
         if name not in f:
             raise FileNotFoundError(f"{f.filename} has no {name}")
         arr = np.asarray(f[name][()], dtype=np.float32)
         if arr.size != int(np.prod(shape)):
             raise IOError(
-                f"{f.filename}:{name}: expected {int(np.prod(shape))} elements, " f"got {arr.size}"
+                f"{f.filename}:{name}: expected {int(np.prod(shape))} elements, got {arr.size}"
             )
-        return arr.reshape(tuple(shape))
-
-    def read_df(
-        self,
-        f,
-        timestamp: str,
-        shape: Sequence[int],
-        active_keys: Optional[Sequence[int]] = None,
-    ) -> np.ndarray:
-        k = self._read(f, f"data/timestep_{timestamp}", shape)
-        if active_keys is None or tuple(active_keys) == (0, 1):
-            return k
-        return k[list(active_keys)]
-
-    def read_phi(self, f, timestamp: str, shape: Sequence[int]) -> np.ndarray:
-        return self._read(f, f"data/poten_{timestamp}", shape)
+        return arr.reshape(shape)
 
 
-def resolve_trajectories(path: str, trajectories) -> list[str]:
-    """Expand a trajectories spec (string with ``{1-5}`` ranges, or list)."""
-    if isinstance(trajectories, str):
-        match = re.match(r"^(.*?)\{([^}]+)\}(.*?)$", trajectories)
-        if not match:
-            return [os.path.join(path, trajectories)]
-        prefix, ranges_str, suffix = match.groups()
-        nums = []
-        for part in ranges_str.split(","):
-            if "-" in part:
-                lo, hi = map(int, part.split("-"))
-                nums.extend(range(lo, hi + 1))
-            else:
-                nums.append(int(part))
-        return [os.path.join(path, f"{prefix}{n}{suffix}") for n in nums]
-    return [os.path.join(path, t) for t in trajectories]
+def make_backend(
+    dcfg,
+    *,
+    local_rank: int = 0,
+    prefer_dtype: Optional[str] = None,
+    lightweight_metadata: bool = False,
+) -> DataBackend:
+    """Backend named by ``dataset.backend`` (``kvikio``, ``numpy`` or ``h5``).
+
+    ``kvikio`` falls back to ``numpy`` when cupy or kvikio are not installed.
+    """
+    name = dcfg.get("backend", "kvikio")
+    if name == "h5":
+        return H5Backend()
+    kwargs = dict(
+        prefer_dtype=prefer_dtype,
+        real_potens=bool(dcfg.get("real_potens", True)),
+        lightweight_metadata=lightweight_metadata,
+    )
+    if name == "kvikio" and kvikio_available():
+        return KvikIOBackend(rank=local_rank, **kwargs)
+    return NumpyBackend(**kwargs)

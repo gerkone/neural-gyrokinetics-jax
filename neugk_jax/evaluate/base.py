@@ -75,13 +75,13 @@ def per_sample_rel_l2(p, t, eps: float = 1e-12):
     return jnp.linalg.norm(p - t, axis=-1) / (jnp.linalg.norm(t, axis=-1) + eps)
 
 
-def integrate(geom, fids, df, phi=None, *, real_potens: bool = True):
+def integrate(geom, fids, df, phi=None):
     """Batched flux integral of a denormalized df (separate-zf layouts are recombined)."""
     g = jax.tree_util.tree_map(lambda a: a[fids], geom)
     df = recombine_zf(df, axis=1)
     if phi is None:
-        return jax.vmap(lambda gi, d: flux_integral(gi, d, real_potens=real_potens))(g, df)
-    return jax.vmap(lambda gi, d, p: flux_integral(gi, d, p, real_potens=real_potens))(g, df, phi)
+        return jax.vmap(flux_integral)(g, df)
+    return jax.vmap(flux_integral)(g, df, phi)
 
 
 def accumulate(acc: dict, values: Mapping[str, jnp.ndarray], weight) -> dict:

@@ -19,16 +19,8 @@ from typing import Callable, Optional
 import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.utils import RunningMeanStd
-
-
-def _tqdm(*args, **kwargs):
-    try:
-        from tqdm import tqdm
-
-        return tqdm(*args, **kwargs)
-    except ImportError:
-        return args[0] if args else iter(())
+from neugk_jax.training.ddp import barrier
+from neugk_jax.utils import RunningMeanStd, atomic_write, progress
 
 
 def latent_cache_path(
@@ -80,10 +72,8 @@ def latent_cache_meta(
 
 
 def write_cache_meta(cache_file: str | Path, meta: dict) -> None:
-    path = cache_meta_path(cache_file)
-    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(meta, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    text = json.dumps(meta, indent=2, sort_keys=True)
+    atomic_write(cache_meta_path(cache_file), lambda f: f.write(text), mode="w")
 
 
 def check_cache_meta(cache_file: str | Path, meta: Optional[dict]) -> None:
@@ -106,15 +96,6 @@ def check_cache_meta(cache_file: str | Path, meta: Optional[dict]) -> None:
             f"preprocessing:\n{lines}\ndelete it to re-encode, or point "
             "dataset.latents_cache_* at a matching cache"
         )
-
-
-def _barrier(name: str) -> None:
-    import jax
-
-    if jax.process_count() > 1:
-        from jax.experimental import multihost_utils
-
-        multihost_utils.sync_global_devices(name)
 
 
 def precompute_latents(
@@ -142,20 +123,22 @@ def precompute_latents(
     if not cache_file.exists() and jax.process_index() == 0:
         latents_dict = _encode_all(dataset, encode_fn, batch_size)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_file.with_name(cache_file.name + f".tmp{os.getpid()}")
-        with open(tmp, "wb") as f:
-            pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        # the sidecar lands first, so a cache is never visible without it
         if meta is not None:
             write_cache_meta(cache_file, meta)
-        os.replace(tmp, cache_file)
-    _barrier(f"latents:{cache_file.name}")
+        atomic_write(
+            cache_file, lambda f: pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+    barrier(f"latents:{cache_file.name}")
     load_precomputed_latents(dataset, cache_file, latent_shape=latent_shape, meta=meta)
 
 
 def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
     latents_dict: dict[tuple[int, int], dict] = {}
     n = len(dataset)
-    for start in _tqdm(range(0, n, batch_size), desc=f"precompute {dataset.split} latents"):
+    for start in progress(
+        range(0, n, batch_size), True, desc=f"precompute {dataset.split} latents"
+    ):
         samples = [dataset[i] for i in range(start, min(start + batch_size, n))]
         # pad the tail so the encoder sees one batch shape
         padded = samples + [samples[-1]] * (batch_size - len(samples))
