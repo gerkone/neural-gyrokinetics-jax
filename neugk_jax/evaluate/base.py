@@ -1,5 +1,5 @@
-"""Evaluator base: fixed-shape batch iteration, on-device denormalization, flux integrals and
-masked metric accumulation with cross-process sync over a fixed key set.
+"""Evaluator base: fixed-shape batch iteration, the dataset normalization table on device, flux
+integrals and masked metric accumulation with cross-process sync over a fixed key set.
 
 Each evaluator is built once per run; its batch plan, normalization and geometry tables
 are fixed, and its per-batch forward is a module-level jitted function.
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional, Sequence
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -24,35 +23,6 @@ from neugk_jax.training.ddp import (
     shard_local,
 )
 from neugk_jax.utils import config_dict, recombine_zf
-
-# sample ndim (without batch) per normalized field
-FIELD_NDIM = {"df": 6, "phi": 3, "flux": 0, "fluxavg": 0}
-
-
-class Denorm(eqx.Module):
-    """Per-field ``(scale, shift)``: shared arrays, or per-trajectory tables gathered by file index."""
-
-    params: dict
-    shared: bool = eqx.field(static=True)
-
-    @classmethod
-    def from_dataset(cls, ds, fields: Sequence[str]) -> "Denorm":
-        shared = ds.normalization is None or ds.normalization_scope in ("dataset", "sample")
-        fids = [0] if shared else list(range(len(ds.files)))
-        params = {
-            k: tuple(jnp.asarray(a) for a in ds.scale_shift(fids, k, FIELD_NDIM[k])) for k in fields
-        }
-        return cls(params, shared)
-
-    def scale_shift(self, field: str, fids):
-        scale, shift = self.params[field]
-        if not self.shared:
-            scale, shift = scale[fids], shift[fids]
-        return scale, shift
-
-    def __call__(self, field: str, x, fids):
-        scale, shift = self.scale_shift(field, fids)
-        return x * scale + shift
 
 
 def geometry_table(ds, fids: Optional[Sequence[int]] = None) -> dict[str, np.ndarray]:
@@ -100,8 +70,6 @@ class BaseEvaluator:
     ``__call__(model, *, epoch) -> (metrics, plots)``.
     """
 
-    denorm_fields: tuple[str, ...] = ("df",)
-
     def __init__(
         self,
         cfg: Any,
@@ -121,7 +89,7 @@ class BaseEvaluator:
         self.loader = loader or BatchLoader()
         idx = range(len(val_ds)) if indices is None else indices
         self.plans = eval_plans(self.dist, idx, self.batch_size, max_batches)
-        self.denorm = replicate_local(self.dist, Denorm.from_dataset(val_ds, self.denorm_fields))
+        self.norm = replicate_local(self.dist, val_ds.norm)
         self._geometry = None
 
     @property

@@ -14,9 +14,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-import pickle
 import warnings
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
@@ -24,22 +22,13 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 from neugk_jax.dataset.backend import DataBackend, expand_spec
-from neugk_jax.utils import RunningMeanStd
+from neugk_jax.dataset.normalization import NormTable, load_stats, metadata_stats
+from neugk_jax.utils import RunningStats
 from neugk_jax.utils import separate_zf as separate_zf_fn
 
 
 def _f32(x):
     return None if x is None else x.astype(np.float32)
-
-
-class _StatsUnpickler(pickle.Unpickler):
-    """Unpickles stats pickles that reference ``neugk.*.RunningMeanStd``."""
-
-    def find_class(self, module, name):
-        # the jax twin carries the same buffers and pickle restores __dict__ directly
-        if module.startswith("neugk.") and name == "RunningMeanStd":
-            return RunningMeanStd
-        return super().find_class(module, name)
 
 
 @dataclass(frozen=True)
@@ -144,7 +133,7 @@ class CycloneDataset:
 
         # latent storage (mode="diff"); filled by precompute_latents()
         self.precomputed_latents: dict[tuple[int, int], dict] | None = None
-        self.latent_stats: RunningMeanStd | None = None
+        self.latent_stats: RunningStats | None = None
 
         if trajectories is None:
             raw = [
@@ -197,8 +186,17 @@ class CycloneDataset:
         self.df_shape = (2, *self.resolution)
         self.phi_resolution = (self.resolution[3], self.resolution[2], self.resolution[4])
 
-        # normalisation stats: prefer normalization_stats if provided, fall back to per-trajectory metadata moments
-        self.stats = self._build_stats()
+        # normalization_stats when given, else the per-trajectory metadata moments
+        if isinstance(normalization_stats, (str, os.PathLike)):
+            self.stats = load_stats(normalization_stats, normalization)
+        elif normalization_stats is not None:
+            self.stats = normalization_stats
+        else:
+            self.stats = metadata_stats(self.metadata, self.fields_to_load) if normalization else {}
+        ndims = {"df": len(self.df_shape), "phi": len(self.phi_resolution), "flux": 0, "fluxavg": 0}
+        self.norm = NormTable.from_stats(
+            self.stats, normalization, normalization_scope, len(self.files), ndims
+        )
 
     def _passes_cond_filter(self, meta: dict) -> bool:
         for cond_name, cond_range in self.cond_filters.items():
@@ -216,149 +214,6 @@ class CycloneDataset:
             if not any(lo <= cond <= hi for lo, hi in cond_range):
                 return False
         return True
-
-    def _build_stats(self) -> dict[str, dict]:
-        """Construct ``stats[field][fid|'full']`` from metadata moments.
-
-        ``normalization_stats`` can be:
-
-        * a ``dict`` already in the ``stats[field][key]`` form — used as-is;
-        * a ``str`` / ``Path`` pointing at a stats pickle: ``RunningMeanStd`` per
-          field, reduced with the per-field ``agg_axes`` from ``self.normalization``
-          into the aggregation the model config requests, or a pickled dict already
-          in the ``stats[field][key]`` form (used as-is).
-        """
-        if isinstance(self.normalization_stats, (str, os.PathLike)):
-            return self._load_stats_pkl(self.normalization_stats)
-        if self.normalization_stats is not None:
-            return self.normalization_stats
-        if self.normalization is None:
-            return {}
-        out: dict[str, dict] = {k: defaultdict(dict) for k in self.fields_to_load}
-        agg: dict[str, RunningMeanStd] = {k: RunningMeanStd() for k in self.fields_to_load}
-        for fid, meta in self.metadata.items():
-            for k in self.fields_to_load:
-                if f"{k}_mean" in meta:
-                    mean = meta[f"{k}_mean"]
-                    var = meta[f"{k}_std"] ** 2
-                    mn = meta.get(f"{k}_min", mean)
-                    mx = meta.get(f"{k}_max", mean)
-                    out[k][fid] = {"mean": mean, "std": np.sqrt(var), "min": mn, "max": mx}
-                    n = len(meta["timesteps"])
-                    agg[k].update(mean, var, mn, mx, count=n)
-        for k in self.fields_to_load:
-            if agg[k].count:
-                out[k]["full"] = {
-                    "mean": np.asarray(agg[k].mean, dtype=np.float32),
-                    "std": np.asarray(np.sqrt(agg[k].var), dtype=np.float32),
-                    "min": np.asarray(agg[k].min, dtype=np.float32),
-                    "max": np.asarray(agg[k].max, dtype=np.float32),
-                }
-        return out
-
-    def _load_stats_pkl(self, path) -> dict[str, dict]:
-        """Load a ``RunningMeanStd`` pickle and apply per-field ``agg_axes``.
-
-        Returns the stats dict in our internal format
-        (``stats[field]['full']`` with mean / std / min / max numpy arrays).
-        """
-        with open(path, "rb") as f:
-            raw = _StatsUnpickler(f).load()
-        if all(isinstance(v, dict) for v in raw.values()):
-            return {str(k): v for k, v in raw.items()}
-        out: dict[str, dict] = {}
-        for k, rms in raw.items():
-            mean = np.asarray(rms.mean, dtype=np.float64)
-            var = np.asarray(rms.var, dtype=np.float64)
-            mn = np.asarray(rms.min, dtype=np.float64)
-            mx = np.asarray(rms.max, dtype=np.float64)
-            agg = None
-            if self.normalization and k in self.normalization:
-                agg = self.normalization[k].get("agg_axes")
-            if agg:
-                agg = tuple(int(a) for a in agg)
-                # keepdims so the result broadcasts directly against the data tensor
-                new_mean = mean.mean(axis=agg, keepdims=True)
-                new_var = var.mean(axis=agg, keepdims=True) + mean.var(axis=agg, keepdims=True)
-                new_min = mn.min(axis=agg, keepdims=True)
-                new_max = mx.max(axis=agg, keepdims=True)
-                mean, var, mn, mx = new_mean, new_var, new_min, new_max
-            out.setdefault(k, {})["full"] = {
-                "mean": mean.astype(np.float32),
-                "std": np.sqrt(var).astype(np.float32),
-                "min": mn.astype(np.float32),
-                "max": mx.astype(np.float32),
-            }
-        return out
-
-    def _get_scale_shift(self, fid: int, field: str) -> tuple[np.ndarray, np.ndarray]:
-        if self.normalization_scope == "sample" or self.normalization is None:
-            return np.float32(1.0), np.float32(0.0)
-        if field not in self.normalization:
-            return np.float32(1.0), np.float32(0.0)
-        key = "full" if self.normalization_scope == "dataset" else fid
-        stats = self.stats.get(field, {}).get(key, {})
-        if not stats:
-            raise KeyError(
-                f"normalization lists {field!r} but there are no {field!r} stats "
-                f"for {key!r}; add them to normalization_stats or drop the field"
-            )
-        nt = self.normalization[field]["type"]
-        if nt == "zscore":
-            mean = np.asarray(stats["mean"], dtype=np.float32)
-            std = np.asarray(stats["std"], dtype=np.float32)
-            return std, mean
-        if nt == "minmax":
-            lo = np.asarray(stats["min"], dtype=np.float32)
-            hi = np.asarray(stats["max"], dtype=np.float32)
-            beta1 = self.normalization[field].get("minmax_beta1", 8)
-            beta2 = self.normalization[field].get("minmax_beta2", 4)
-            scale = (hi - lo) / beta1
-            shift = lo + scale * beta2
-            return scale, shift
-        raise ValueError(nt)
-
-    def normalize(self, fid: int, *, df=None, phi=None, flux=None, fluxavg=None) -> np.ndarray:
-        x, field = self._unpack_field(df=df, phi=phi, flux=flux, fluxavg=fluxavg)
-        scale, shift = self._get_scale_shift(fid, field)
-        return (x - shift) / scale
-
-    def scale_shift(self, fids: Sequence[int], field: str, sample_ndim: int):
-        """Per-batch ``(scale, shift)`` for ``field`` that broadcast against a
-        batch of ``sample_ndim``-dimensional samples.
-
-        Shared statistics (dataset scope, or none) are returned without a batch
-        axis; per-trajectory statistics are stacked along a leading batch axis.
-        """
-        pairs = [self._get_scale_shift(int(f), field) for f in fids]
-        shared = self.normalization is None or self.normalization_scope in ("dataset", "sample")
-        if shared:
-            scale, shift = pairs[0]
-            return np.asarray(scale, np.float32), np.asarray(shift, np.float32)
-
-        def stack(arrs):
-            out = []
-            for a in arrs:
-                a = np.asarray(a, np.float32)
-                # match the sample rank (pad or drop leading unit axes) so the batch axis lines up
-                while a.ndim > sample_ndim and a.shape[0] == 1:
-                    a = a[0]
-                out.append(a.reshape((1,) * (sample_ndim - a.ndim) + a.shape))
-            return np.stack(out)
-
-        return stack([p[0] for p in pairs]), stack([p[1] for p in pairs])
-
-    @staticmethod
-    def _unpack_field(*, df=None, phi=None, flux=None, fluxavg=None):
-        if df is not None:
-            return df, "df"
-        if phi is not None:
-            return phi, "phi"
-        if flux is not None:
-            return flux, "flux"
-        if fluxavg is not None:
-            return fluxavg, "fluxavg"
-        raise ValueError("provide exactly one of df, phi, flux, fluxavg")
 
     def __len__(self) -> int:
         return self.length
@@ -392,9 +247,7 @@ class CycloneDataset:
                 out["phi"] = self.backend.read_phi(handle, gt_t, self.phi_resolution)
         out["flux"] = np.asarray(meta["flux"][gt_t], dtype=np.float32)
         out["fluxavg"] = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
-        if self.normalization is not None:
-            out = {k: self.normalize(fid, **{k: v}) for k, v in out.items()}
-        return {k: _f32(v) for k, v in out.items()}
+        return {k: _f32(self.norm.normalize(k, v, fid)) for k, v in out.items()}
 
     def num_ts(self, fid: int) -> int:
         """Raw timesteps of trajectory ``fid`` after ``offset``, tail and subsampled ones included.
@@ -425,9 +278,9 @@ class CycloneDataset:
         flux = np.asarray(meta["flux"][original_t], dtype=np.float32)
         timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
         if df is not None and self.normalization is not None:
-            df = _f32(self.normalize(fid, df=df))
+            df = _f32(self.norm.normalize("df", df, fid))
         if phi is not None and self.normalization is not None:
-            phi = _f32(self.normalize(fid, phi=phi))
+            phi = _f32(self.norm.normalize("phi", phi, fid))
 
         return self._build_sample(fid, t_idx, df, phi, flux, timestep, meta)
 
@@ -452,12 +305,13 @@ class CycloneDataset:
         y_fluxavg = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
         timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
         if self.normalization is not None:
+            norm = self.norm.normalize
             if df is not None:
-                df, y_df = self.normalize(fid, df=df), self.normalize(fid, df=y_df)
+                df, y_df = norm("df", df, fid), norm("df", y_df, fid)
             if phi is not None:
-                phi, y_phi = self.normalize(fid, phi=phi), self.normalize(fid, phi=y_phi)
-            y_flux = self.normalize(fid, flux=y_flux)
-            y_fluxavg = self.normalize(fid, fluxavg=y_fluxavg)
+                phi, y_phi = norm("phi", phi, fid), norm("phi", y_phi, fid)
+            y_flux = norm("flux", y_flux, fid)
+            y_fluxavg = norm("fluxavg", y_fluxavg, fid)
         sample = self._build_sample(fid, t_idx, _f32(df), _f32(phi), flux, timestep, meta)
         return dataclasses.replace(
             sample,

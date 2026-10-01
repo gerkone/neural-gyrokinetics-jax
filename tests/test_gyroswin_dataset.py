@@ -155,8 +155,7 @@ def test_next_step_normalization(two_trajs):
     assert np.allclose(s.y_phi, (raw.y_phi + 0.5) / 3.0)
     assert s.y_flux == pytest.approx((metas[0]["flux"][3] - 1.0) / 2.0)
     assert s.y_fluxavg == pytest.approx((np.mean(metas[0]["flux"][1:][-80:]) + 1.0) / 4.0)
-    scale, shift = ds.scale_shift([0], "fluxavg", 0)
-    assert np.allclose(s.y_fluxavg * scale + shift, raw.y_fluxavg, atol=1e-6)
+    assert np.allclose(ds.norm.denormalize("fluxavg", s.y_fluxavg, 0), raw.y_fluxavg, atol=1e-6)
 
 
 def test_timestep_condition(two_trajs):
@@ -196,6 +195,15 @@ def test_scale_shift_batches_per_trajectory_stats(two_trajs):
         normalization_stats=stats,
         normalization_scope="trajectory",
     )
-    scale, shift = ds.scale_shift([0, 1, 0], "flux", 0)
+    scale, shift = ds.norm.scale_shift("flux", np.asarray([0, 1, 0]))
     assert scale.shape == (3,) and np.allclose(scale, [2.0, 3.0, 2.0])
     assert np.allclose(shift, [1.0, 0.0, 1.0])
+    with pytest.raises(ValueError, match="normalization_scope"):
+        CycloneDataset(
+            path=str(root),
+            trajectories=["iteration_0"],
+            backend=NumpyBackend(),
+            normalization=_NORM,
+            normalization_stats=stats,
+            normalization_scope="sample",
+        )

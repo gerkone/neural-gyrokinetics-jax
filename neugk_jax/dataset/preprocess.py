@@ -58,12 +58,11 @@ from neugk_jax.dataset.backend import (
     meta_path,
     save_meta,
 )
-from neugk_jax.utils import atomic_write, progress
+from neugk_jax.utils import RunningStats, atomic_write, progress
 
 RAW_ROOT = os.environ.get("NEUGK_RAW_ROOT")
 TARGET_DIR = os.environ.get("NEUGK_TARGET_DIR")
 KVIKIO_SUBDIR = "preprocessed_kvikio"
-PHI_STAT_KEYS = ("phi_mean", "phi_var", "phi_std", "phi_min", "phi_max")
 
 
 def resolve_traj_dirs(root_dir: str, spec=None) -> list[str]:
@@ -454,51 +453,13 @@ class FieldSolver:
             return np.asarray(out, dtype=np.float64)
 
 
-class StreamStats:
-    """Elementwise running mean/var/min/max over single samples, updated in place in float64.
-
-    Seeded with a prior of count ``1e-4`` and unit variance, the convention of the stored
-    dataset statistics.
-    """
-
-    def __init__(self, prior_count: float = 1e-4):
-        self.count = prior_count
-        self.mean = self.var = self.min = self.max = None
-        self._d = None
-
-    def update(self, x) -> None:
-        x = np.asarray(x)
-        if self.mean is None:
-            shape = x.shape
-            self.mean, self.var = np.zeros(shape), np.ones(shape)
-            self.min, self.max = np.full(shape, np.inf), np.full(shape, -np.inf)
-            self._d = np.empty(shape)
-        c, n1 = self.count, self.count + 1.0
-        d = self._d
-        np.subtract(x, self.mean, out=d)
-        self.mean += d * (1.0 / n1)
-        self.var *= c / n1
-        np.multiply(d, d, out=d)
-        d *= c / (n1 * n1)
-        self.var += d
-        np.minimum(self.min, x, out=self.min)
-        np.maximum(self.max, x, out=self.max)
-        self.count = n1
+def _new_stats() -> RunningStats:
+    # the stored dataset statistics are seeded with a 1e-4 prior count
+    return RunningStats(prior_count=1e-4)
 
 
-def _running_stats():
-    return StreamStats()
-
-
-def _stats_dict(prefix: str, stats, dtype=None) -> dict:
-    cast = (lambda x: np.asarray(x, dtype=dtype)) if dtype is not None else np.asarray
-    return {
-        f"{prefix}_mean": cast(stats.mean),
-        f"{prefix}_var": cast(stats.var),
-        f"{prefix}_std": cast(np.sqrt(stats.var)),
-        f"{prefix}_min": cast(stats.min),
-        f"{prefix}_max": cast(stats.max),
-    }
+def _stats_dict(prefix: str, stats: RunningStats, dtype=None) -> dict:
+    return {f"{prefix}_{k}": v for k, v in stats.moments(dtype).items()}
 
 
 def write_metadata(traj_dir: str, metadata: dict) -> None:
@@ -607,7 +568,7 @@ def preprocess(
         return out_path, False
 
     solver = FieldSolver(geometry, x64=x64)
-    df_stats, phi_stats, flux_stats = _running_stats(), _running_stats(), _running_stats()
+    df_stats, phi_stats, flux_stats = _new_stats(), _new_stats(), _new_stats()
     os.makedirs(os.path.join(out_path, "data"), exist_ok=True)
     it = progress(
         enumerate(zip(ks, potens)),
@@ -649,9 +610,9 @@ def preprocess(
         assert rel < 1e-2, f"poten {pot} does not match the field solve of {k} (rel-L2 {rel:.3e})"
         phi = phi_int if phi_source == "field_solve" else phi_gkw
 
-        df_stats.update(knth)
-        flux_stats.update(fluxes[idx])
-        phi_stats.update(phi)
+        df_stats.push(knth)
+        flux_stats.push(fluxes[idx])
+        phi_stats.push(phi)
         if not metadata_only:
             _write_bin(os.path.join(out_path, "data", frame_name("timestep", idx) + ".bin"), knth)
             _write_bin(os.path.join(out_path, "data", frame_name("poten", idx) + ".bin"), phi)
@@ -711,13 +672,13 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
     meta = NumpyBackend().read_metadata(traj_dir)
     shape = (2, *meta["resolution"])
     solver = FieldSolver(meta["geometry"], x64=x64)
-    stats = _running_stats()
+    stats = _new_stats()
     for p in potens:
         df_path = os.path.join(data, os.path.basename(p).replace("poten_", "timestep_"))
         phi = solver(np.fromfile(df_path, dtype=np.float32).reshape(shape))[0]
         assert phi.nbytes == os.path.getsize(p), (p, phi.shape)
         atomic_write(p, phi.tofile)
-        stats.update(phi)
+        stats.push(phi)
 
     new = _stats_dict("phi", stats)
     for mp in metas:
@@ -787,7 +748,7 @@ def preprocess_gyaradax(
     solver = FieldSolver(np_geom, x64=x64)
 
     times, fluxes, kyspecs, fluxspecs = [], [], [], []
-    df_stats, phi_stats, flux_stats = _running_stats(), _running_stats(), _running_stats()
+    df_stats, phi_stats, flux_stats = _new_stats(), _new_stats(), _new_stats()
     os.makedirs(os.path.join(out_path, "data"), exist_ok=True)
     for idx, step_path in progress(
         enumerate(steps), show_tqdm, total=len(steps), desc=name, leave=False
@@ -805,9 +766,9 @@ def preprocess_gyaradax(
         kyspecs.append(np.asarray(d["ky_spec"], dtype=np.float32))
         times.append(float(d["time"]))
         fluxes.append(reported)
-        df_stats.update(df_real)
-        phi_stats.update(phi)
-        flux_stats.update(reported)
+        df_stats.push(df_real)
+        phi_stats.push(phi)
+        flux_stats.push(reported)
         if not metadata_only:
             _write_bin(
                 os.path.join(out_path, "data", frame_name("timestep", idx) + ".bin"), df_real

@@ -117,19 +117,25 @@ def test_split_modes_recombine_and_check():
         assert P.check_ifft(parts, np.stack([raw.real, raw.imag]), zf_separated=True)
 
 
-def test_stream_stats_matches_seeded_running_mean_std():
-    from neugk_jax.utils import RunningMeanStd
+def test_running_stats_push_matches_merge():
+    from neugk_jax.utils import RunningStats
 
     xs = np.random.default_rng(5).standard_normal((6, 3, 4)) * 1e-3 + 0.2
-    ref = RunningMeanStd()
-    ref.count = 1e-4
-    got = P.StreamStats()
+    ref, got = RunningStats(prior_count=1e-4), RunningStats(prior_count=1e-4)
     for x in xs:
-        ref.update(x, np.zeros_like(x), x, x)
-        got.update(x)
+        ref.merge(x, np.zeros_like(x), x, x)
+        got.push(x)
     for name in ("mean", "var", "min", "max"):
         np.testing.assert_allclose(getattr(got, name), getattr(ref, name), rtol=1e-12)
     np.testing.assert_allclose(got.mean, xs.sum(0) / (len(xs) + 1e-4), rtol=1e-12)
+    scalar = RunningStats(prior_count=1e-4)
+    for x in xs[:, 0, 0]:
+        scalar.push(x)
+    np.testing.assert_allclose(scalar.mean, got.mean[0, 0], rtol=1e-12)
+    pooled = got.moments(axes=(1,))
+    np.testing.assert_allclose(
+        pooled["var"], got.var.mean(1, keepdims=True) + got.mean.var(1, keepdims=True)
+    )
 
 
 def test_expand_spec_and_resolve(tmp_path):
@@ -216,7 +222,10 @@ def _synthetic_traj(root, n=3):
         "geometry": _geometry(),
         "timesteps": np.arange(n, dtype=float),
         "extra": "kept",
-        **{k: np.zeros((NKX, NS, NKY), np.float32) for k in P.PHI_STAT_KEYS},
+        **{
+            f"phi_{k}": np.zeros((NKX, NS, NKY), np.float32)
+            for k in ("mean", "var", "std", "min", "max")
+        },
         "df_mean": np.zeros(1, np.float32),
     }
     P.write_metadata(traj, meta)

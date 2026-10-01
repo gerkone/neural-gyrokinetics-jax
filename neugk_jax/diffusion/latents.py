@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from neugk_jax.training.ddp import barrier
-from neugk_jax.utils import RunningMeanStd, atomic_write, progress
+from neugk_jax.utils import RunningStats, atomic_write, progress
 
 
 def latent_cache_path(
@@ -302,14 +302,8 @@ def verify_latent_cache(dataset, cache: dict, *, latent_shape=None) -> None:
 
 def _compute_latent_stats(dataset) -> None:
     """Running stats over all cached latents — used to scale by 1/std at train time."""
-    stats = None
+    stats = RunningStats(prior_count=0.0)
     for s in dataset.precomputed_latents.values():
         x = s["x"]
-        mean = np.mean(x, keepdims=True)
-        var = np.var(x, keepdims=True)
-        mn = np.min(x, keepdims=True)
-        mx = np.max(x, keepdims=True)
-        if stats is None:
-            stats = RunningMeanStd(shape=mean.shape)
-        stats.update(mean, var, mn, mx, count=1)
+        stats.merge(*(f(x, keepdims=True) for f in (np.mean, np.var, np.min, np.max)))
     dataset.latent_stats = stats

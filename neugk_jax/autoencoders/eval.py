@@ -27,19 +27,19 @@ from neugk_jax.utils import count_trace, recombine_zf
 
 
 @eqx.filter_jit
-def target_integrals(x, fids, denorm, geom):
+def target_integrals(x, fids, norm, geom):
     count_trace("ae_target_integrals")
-    phi, (_, eflux, _) = integrate(geom, fids, denorm("df", x, fids))
+    phi, (_, eflux, _) = integrate(geom, fids, norm.denormalize("df", x, fids))
     return phi, eflux
 
 
 @eqx.filter_jit
-def ae_eval_step(model, batch, acc, denorm, geom, tgt_int):
+def ae_eval_step(model, batch, acc, norm, geom, tgt_int):
     """Reconstruct one batch, add its masked metric sums to ``acc``; returns the denormalized pair."""
     count_trace("ae_eval_step")
     x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
     pred = jax.vmap(lambda xi: model(xi, inference=True)["df"])(x)
-    pred_d, tgt_d = denorm("df", pred, fids), denorm("df", x, fids)
+    pred_d, tgt_d = norm.denormalize("df", pred, fids), norm.denormalize("df", x, fids)
     values = {
         "df_mse": per_sample_mse(pred, x),
         "df_rel_l2": per_sample_rel_l2(recombine_zf(pred_d, axis=1), recombine_zf(tgt_d, axis=1)),
@@ -83,10 +83,10 @@ class AEEvaluator(BaseEvaluator):
             if self.eval_integrals:
                 if plan.number not in self._tgt_int:
                     self._tgt_int[plan.number] = jax.device_get(
-                        target_integrals(batch["df"], batch["file_index"], self.denorm, geom)
+                        target_integrals(batch["df"], batch["file_index"], self.norm, geom)
                     )
                 tgt_int = self.place(self._tgt_int[plan.number])
-            acc, pred_d, tgt_d, phi = ae_eval_step(model, batch, acc, self.denorm, geom, tgt_int)
+            acc, pred_d, tgt_d, phi = ae_eval_step(model, batch, acc, self.norm, geom, tgt_int)
             if self.eval_spectra:
                 self._spectra(spectra, pred_d, tgt_d, plan)
             if plan.number == 0 and self.is_rank0:

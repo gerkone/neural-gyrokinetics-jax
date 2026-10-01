@@ -3,10 +3,8 @@ separate/recombine zonal flow, running stats."""
 
 from __future__ import annotations
 
-import math
 import os
 from collections import Counter
-from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -67,43 +65,63 @@ def recombine_zf(x, axis: int = 0):
     return zf + non_zf
 
 
-@dataclass
-class RunningMeanStd:
-    """Numerically stable running mean/var over batches (numpy buffers)."""
+class RunningStats:
+    """Elementwise running mean/var/min/max in float64, seeded with ``prior_count`` (variance 1).
 
-    mean: np.ndarray | float = 0.0
-    var: np.ndarray | float = 1.0
-    min: np.ndarray | float = math.inf
-    max: np.ndarray | float = -math.inf
-    count: float = 0.0
+    ``push`` adds one sample in place (Welford), ``merge`` a summary of ``count`` samples
+    (Chan et al.); buffers take the shape of the first input. Unpickled ``RunningMeanStd``
+    objects of the stored dataset statistics carry the same attributes.
+    """
 
-    def __init__(self, shape: tuple[int, ...] | None = None):
-        if shape is None:
-            self.mean = 0.0
-            self.var = 1.0
-            self.min = math.inf
-            self.max = -math.inf
-        else:
-            self.mean = np.zeros(shape, dtype=np.float64)
-            self.var = np.ones(shape, dtype=np.float64)
-            self.min = np.full(shape, math.inf, dtype=np.float64)
-            self.max = np.full(shape, -math.inf, dtype=np.float64)
-        self.count = 0.0
+    def __init__(self, prior_count: float):
+        self.count = prior_count
+        self.mean = self.var = self.min = self.max = None
 
-    def update(self, mean, var, mn, mx, count: int = 1) -> None:
-        mean = np.asarray(mean, dtype=np.float64)
-        var = np.asarray(var, dtype=np.float64)
-        mn = np.asarray(mn, dtype=np.float64)
-        mx = np.asarray(mx, dtype=np.float64)
+    def _start(self, shape) -> None:
+        self.mean, self.var = np.zeros(shape), np.ones(shape)
+        self.min, self.max = np.full(shape, np.inf), np.full(shape, -np.inf)
+
+    def push(self, x) -> None:
+        x = np.asarray(x)
+        if self.mean is None:
+            self._start(x.shape)
+        c, n1 = self.count, self.count + 1.0
+        d = np.asarray(x - self.mean)
+        self.mean += d * (1.0 / n1)
+        self.var *= c / n1
+        np.multiply(d, d, out=d)
+        d *= c / (n1 * n1)
+        self.var += d
+        np.minimum(self.min, x, out=self.min)
+        np.maximum(self.max, x, out=self.max)
+        self.count = n1
+
+    def merge(self, mean, var, mn, mx, count: float = 1) -> None:
+        mean, var = np.asarray(mean, np.float64), np.asarray(var, np.float64)
+        if self.mean is None:
+            self._start(mean.shape)
         new_count = self.count + count
-        delta = mean - np.asarray(self.mean)
-        new_mean = np.asarray(self.mean) + delta * (count / new_count)
-        m_a = np.asarray(self.var) * self.count
-        m_b = var * count
-        m2 = m_a + m_b + (delta**2) * (self.count * count / new_count)
-        new_var = m2 / new_count
-        self.mean = new_mean
-        self.var = new_var
-        self.min = np.minimum(self.min, mn)
-        self.max = np.maximum(self.max, mx)
+        delta = mean - self.mean
+        m2 = self.var * self.count + var * count + delta**2 * (self.count * count / new_count)
+        self.mean = self.mean + delta * (count / new_count)
+        self.var = m2 / new_count
+        self.min = np.minimum(self.min, np.asarray(mn, np.float64))
+        self.max = np.maximum(self.max, np.asarray(mx, np.float64))
         self.count = new_count
+
+    def moments(self, dtype=None, axes=None) -> dict:
+        """``mean``/``var``/``std``/``min``/``max``, optionally pooled over ``axes`` (keepdims).
+
+        Pooling over ``axes`` takes the mean of the means, the mean variance plus the
+        variance of the means, and the extreme min/max.
+        """
+        mean, var = np.asarray(self.mean, np.float64), np.asarray(self.var, np.float64)
+        mn, mx = np.asarray(self.min, np.float64), np.asarray(self.max, np.float64)
+        if axes:
+            mean, var = (
+                mean.mean(axis=axes, keepdims=True),
+                var.mean(axis=axes, keepdims=True) + mean.var(axis=axes, keepdims=True),
+            )
+            mn, mx = mn.min(axis=axes, keepdims=True), mx.max(axis=axes, keepdims=True)
+        out = {"mean": mean, "var": var, "std": np.sqrt(var), "min": mn, "max": mx}
+        return out if dtype is None else {k: v.astype(dtype) for k, v in out.items()}

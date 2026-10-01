@@ -31,12 +31,12 @@ def _rel_norm_mse(p, y, eps: float = 1e-4):
 
 
 @eqx.filter_jit
-def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, denorm, geom, fields):
+def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, norm, geom, fields):
     """One rollout step; adds the ``live``-masked metric sums at row ``t`` of ``acc``."""
     count_trace("gyroswin_eval_step")
     preds = jax.vmap(lambda xi, ci: model(xi, ci, inference=True))(x, cond)
-    pred_d = {k: denorm(k, preds[k], fids) for k in fields}
-    tgt_d = {k: denorm(k, tgt[k].reshape(preds[k].shape), fids) for k in fields}
+    pred_d = {k: norm.denormalize(k, preds[k], fids) for k in fields}
+    tgt_d = {k: norm.denormalize(k, tgt[k].reshape(preds[k].shape), fids) for k in fields}
     if "df" in fields:
         pred_d["df"], tgt_d["df"] = (
             recombine_zf(pred_d["df"], axis=1),
@@ -61,8 +61,6 @@ def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, denorm, geom, fi
 
 class GyroSwinEvaluator(BaseEvaluator):
     """``n_eval_steps`` autoregressive rollout over the (tail-cropped) validation set."""
-
-    denorm_fields = TARGETS
 
     def __init__(self, cfg: Any, *, outputs: Optional[Sequence[str]] = None, **kwargs):
         super().__init__(cfg, **kwargs)
@@ -124,7 +122,7 @@ class GyroSwinEvaluator(BaseEvaluator):
                     live,
                     jnp.int32(t),
                     acc,
-                    self.denorm,
+                    self.norm,
                     geom,
                     self.fields,
                 )

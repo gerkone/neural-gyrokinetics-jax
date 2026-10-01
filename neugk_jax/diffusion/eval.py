@@ -51,11 +51,11 @@ def _sample_decode(dit, ae, key, cond, n, steps, latent_scale):
 
 
 @eqx.filter_jit
-def diffusion_eval_step(dit, ae, key, batch, acc, denorm, geom, steps: int, latent_scale: float):
+def diffusion_eval_step(dit, ae, key, batch, acc, norm, geom, steps: int, latent_scale: float):
     count_trace("diffusion_eval_step")
     x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
     pred = _sample_decode(dit, ae, key, batch.get("cond"), x.shape[0], steps, latent_scale)
-    pred_d, tgt_d = denorm("df", pred, fids), denorm("df", x, fids)
+    pred_d, tgt_d = norm.denormalize("df", pred, fids), norm.denormalize("df", x, fids)
     values = {
         "df_mse": per_sample_mse(pred, x),
         "df_rel_l2": per_sample_rel_l2(recombine_zf(pred_d, axis=1), recombine_zf(tgt_d, axis=1)),
@@ -137,7 +137,7 @@ class DiffusionEvaluator(BaseEvaluator):
                     k,
                     batch,
                     acc,
-                    self.denorm,
+                    self.norm,
                     geom,
                     self.steps,
                     self.latent_scale,

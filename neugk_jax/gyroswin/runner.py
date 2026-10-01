@@ -8,7 +8,7 @@ import jax.random as jr
 import numpy as np
 
 from neugk_jax.dataset.factory import build_splits
-from neugk_jax.evaluate.base import Denorm, geometry_table
+from neugk_jax.evaluate.base import geometry_table
 from neugk_jax.losses import integral_losses
 from neugk_jax.training.build import build_gyroswin
 from neugk_jax.training.data import stack_fields
@@ -72,7 +72,7 @@ class GyroSwinRunner(BaseRunner):
     def step_context(self) -> dict:
         if not self.loss_cfg.integrals:
             return {}
-        return {"norm": Denorm.from_dataset(self.train_ds, TARGETS[:3])}
+        return {"norm": self.train_ds.norm}
 
     def geometry(self, fids) -> dict:
         for f in set(int(f) for f in fids) - set(self._geom):
@@ -108,7 +108,7 @@ class GyroSwinRunner(BaseRunner):
         tgts = {k: batch.get(f"y_{k}") for k in TARGETS}
         ints = None
         if loss_cfg.integrals:
-            norm, fids = batch["norm"], batch["file_index"]
+            norm, fids = batch["norm"].denormalize, batch["file_index"]
             ints = integral_losses(
                 batch["geom"],
                 norm("df", preds["df"], fids),
