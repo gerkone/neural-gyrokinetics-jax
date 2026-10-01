@@ -14,10 +14,11 @@ import re
 from typing import Any, Optional
 
 import jax
+import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
-from neugk_jax.diffusion.flow_matching import euler_sample
+from neugk_jax.diffusion.flow_matching import dit_flow_loss, euler_sample
 from neugk_jax.evaluate.base import (
     BaseEvaluator,
     accumulate,
@@ -58,6 +59,49 @@ def diffusion_eval_step(dit, ae, key, batch, acc, norm, geom, steps: int, latent
     if geom is not None:
         _, (_, eflux, _) = integrate(geom, fids, pred_d)
     return accumulate(acc, recon_metrics(pred, x, pred_d, tgt_d), mask), eflux, pred_d, tgt_d
+
+
+@traced_jit("fm_val_step")
+def fm_val_step(model, tables, batch, acc, key, latent_scale: float, use_ot: bool):
+    idx, mask, cond = batch["idx"], batch["mask"], tables["cond"]
+    loss = dit_flow_loss(
+        model,
+        tables["latents"][idx],
+        None if cond is None else cond[idx],
+        key,
+        latent_scale=latent_scale,
+        use_ot=use_ot,
+        train=False,
+        mask=mask,
+    )
+    n = jnp.sum(mask)
+    return {"fm_loss": acc["fm_loss"] + loss * n, "_n": acc["_n"] + n}
+
+
+class FlowLossEvaluator(BaseEvaluator):
+    """Flow-matching loss over the latent validation set with a fixed noise key.
+
+    ``tables`` holds the device ``latents`` and ``cond`` of ``val_ds`` in flat-index order;
+    batches carry only their indices, so nothing is read from disk.
+    """
+
+    def __init__(
+        self, cfg: Any, *, tables: dict, latent_scale: float, use_ot: bool, seed: int, **kw
+    ):
+        super().__init__(cfg, **kw)
+        self.tables = replicate_local(self.dist, tables)
+        self.latent_scale = float(latent_scale)
+        self.use_ot = use_ot
+        self.key = jr.fold_in(jr.PRNGKey(seed), len(self.ds))
+
+    def __call__(self, model: Any, *, epoch: int) -> tuple[dict[str, float], dict[str, Any]]:
+        model = self.local_model(model)
+        acc = self.zeros(("fm_loss", "_n"))
+        for plan in self.plans:
+            batch = self.place({"idx": plan.indices.astype(np.int32), "mask": plan.mask})
+            key = jr.fold_in(self.key, plan.number)
+            acc = fm_val_step(model, self.tables, batch, acc, key, self.latent_scale, self.use_ot)
+        return self.finalize(self.reduce(acc), ("fm_loss",)), {}
 
 
 class DiffusionEvaluator(BaseEvaluator):

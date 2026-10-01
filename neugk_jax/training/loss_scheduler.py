@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import jax.numpy as jnp
 
 from neugk_jax.losses import df_loss, l1, relative_norm_mse
+from neugk_jax.utils import to_dict
 
 
 def linear_burn_in(
@@ -75,10 +76,11 @@ class LossConfig:
     def __init__(
         self, loss_weights: Any, extra_loss_weights: Any = None, loss_scheduler: Any = None
     ):
-        lw = {k: float(v or 0.0) for k, v in dict(loss_weights or {}).items()}
-        elw = {k: float(v or 0.0) for k, v in dict(extra_loss_weights or {}).items()}
+        lw = {k: float(v or 0.0) for k, v in to_dict(loss_weights).items()}
+        elw = {k: float(v or 0.0) for k, v in to_dict(extra_loss_weights).items()}
+        loss_scheduler = to_dict(loss_scheduler)
         known = set(DATA_LOSSES) | set(INTEGRAL_LOSSES) | set(REMOVED_LOSSES)
-        sched_keys = set(dict(loss_scheduler or {}))
+        sched_keys = set(loss_scheduler)
         unknown = sorted((set(lw) | set(elw) | sched_keys) - known)
         if unknown:
             raise ValueError(f"unknown loss keys {unknown}; supported: {sorted(known)}")
@@ -98,11 +100,13 @@ class LossConfig:
         self.flux_key = next((k for k in self.outputs if k in ("flux", "fluxavg")), None)
         self.integrals = tuple(k for k in self.active if k in INTEGRAL_LOSSES)
 
-    def weights_at(self, progress_remaining: float) -> dict[str, float]:
+    def weights_at(self, step: int, total_steps: int) -> dict[str, jnp.ndarray]:
+        """float32 weights of the active terms at training ``step`` of ``total_steps``."""
+        progress_remaining = max(0.0, 1.0 - step / max(total_steps, 1))
         out = {k: self.weights[k] for k in self.active}
         for k, fn in self.schedulers.items():
             out[k] = float(fn(progress_remaining))
-        return out
+        return {k: jnp.asarray(v, jnp.float32) for k, v in out.items()}
 
 
 def compute_multi_task_loss(
@@ -142,32 +146,12 @@ def build_scheduler_dict(loss_scheduler_cfg: Any) -> dict[str, Callable[[float],
     Skips keys whose value is ``None`` / ``{}`` (i.e. constant weight).
     """
     out: dict[str, Callable[[float], float]] = {}
-    if not loss_scheduler_cfg:
-        return out
-    for key in loss_scheduler_cfg:
-        sp = loss_scheduler_cfg[key]
+    for key, sp in to_dict(loss_scheduler_cfg).items():
         if not sp:
             continue
-        kind = sp.get("type", "linear") if hasattr(sp, "get") else getattr(sp, "type", "linear")
-        get = (
-            (lambda obj, k, d=None: obj.get(k, d))
-            if hasattr(sp, "get")
-            else (lambda obj, k, d=None: getattr(obj, k, d))
-        )
-        if kind == "cyclical":
-            out[key] = cyclical_annealing(
-                start=get(sp, "start"),
-                end=get(sp, "end"),
-                start_fraction=get(sp, "start_fraction"),
-                end_fraction=get(sp, "end_fraction"),
-                n_cycles=get(sp, "n_cycles", 4),
-                ratio=get(sp, "ratio", 0.5),
-            )
+        args = [sp.get(k) for k in ("start", "end", "start_fraction", "end_fraction")]
+        if sp.get("type", "linear") == "cyclical":
+            out[key] = cyclical_annealing(*args, sp.get("n_cycles", 4), sp.get("ratio", 0.5))
         else:
-            out[key] = linear_burn_in(
-                start=get(sp, "start"),
-                end=get(sp, "end"),
-                start_fraction=get(sp, "start_fraction"),
-                end_fraction=get(sp, "end_fraction"),
-            )
+            out[key] = linear_burn_in(*args)
     return out

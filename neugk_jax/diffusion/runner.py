@@ -11,14 +11,12 @@ from pathlib import Path
 
 import equinox as eqx
 import jax
-import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 from omegaconf import open_dict
 
-from neugk_jax.autoencoders.runner import AERunner
 from neugk_jax.dataset import precompute_latents
-from neugk_jax.diffusion.flow_matching import fm_forward_loss
+from neugk_jax.diffusion.flow_matching import dit_flow_loss
 from neugk_jax.diffusion.latents import (
     latent_arrays,
     latent_cache_meta,
@@ -26,9 +24,8 @@ from neugk_jax.diffusion.latents import (
     load_precomputed_latents,
 )
 from neugk_jax.training.build import build_dit
-from neugk_jax.training.ddp import local_view, replicate_local
-from neugk_jax.training.runner import conditioning_slots
-from neugk_jax.utils import config_dict, count_trace
+from neugk_jax.training.runner import BaseRunner, conditioning_slots
+from neugk_jax.utils import to_dict
 
 
 def resolve_ae_checkpoint(path) -> Path:
@@ -80,10 +77,10 @@ def check_ae_dataset(ae_dataset: dict, dataset: dict) -> None:
 
 def load_autoencoder(path, *, resolution=None, dataset: dict | None = None):
     """AE of a run directory or checkpoint file; ``dataset`` is checked against the run's."""
-    from neugk_jax.translate import build_ae_from_config, load_config, load_or_translate
+    from neugk_jax.translate import build_ae_from_config, load_or_translate
 
     ae_file = resolve_ae_checkpoint(path)
-    ae_cfg = load_config(str(ae_file.parent / "config.yaml"))
+    ae_cfg = to_dict(str(ae_file.parent / "config.yaml"))
     if dataset is not None:
         check_ae_dataset(ae_cfg.get("dataset") or {}, dataset)
     template = build_ae_from_config(ae_cfg, key=jr.PRNGKey(0), resolution=resolution)
@@ -95,58 +92,18 @@ def encode_batch(ae, df):
     return jax.vmap(ae.encode)(df)
 
 
-def _fm_loss(model, z, cond, key, *, latent_scale, use_ot, train: bool, mask=None):
-    fm_key, drop_key = jr.split(key)
-
-    def fwd(x, t, *rest):
-        c = rest[0] if cond is not None else None
-        k = rest[-1] if train else None
-        return model(x, t, c, key=k, inference=not train)
-
-    return fm_forward_loss(
-        fwd,
-        z,
-        cond,
-        key=fm_key,
-        latent_scale=latent_scale,
-        use_ot=use_ot,
-        dropout_key=drop_key if train else None,
-        mask=mask,
-    )
-
-
-@eqx.filter_jit
-def fm_val_loss(model, latents, cond, idx, mask, key, latent_scale: float, use_ot: bool):
-    count_trace("fm_val_loss")
-    c = None if cond is None else cond[idx]
-    return _fm_loss(
-        model,
-        latents[idx],
-        c,
-        key,
-        latent_scale=latent_scale,
-        use_ot=use_ot,
-        train=False,
-        mask=mask,
-    )
-
-
-class FlowMatchingRunner(AERunner):
+class FlowMatchingRunner(BaseRunner):
     """Trains a DiT on the latent distribution of a frozen AE via flow matching."""
 
     val_metrics = ("avg_flux_rmse", "fm_loss")
     decoupled_wd = True
-    conditioned = True
-
-    def train_dtype(self):
-        return None
 
     def setup_data(self) -> None:
         cfg = self.cfg
         if cfg.get("ae_checkpoint") is None:
             raise ValueError("diffusion workflow requires ae_checkpoint")
-        super().setup_data()
-        dcfg = config_dict(cfg.dataset)
+        self.build_data("ae")
+        dcfg = to_dict(cfg.dataset)
         self.ae = load_autoencoder(
             cfg.ae_checkpoint, resolution=self.train_ds.resolution, dataset=dcfg
         )
@@ -174,8 +131,6 @@ class FlowMatchingRunner(AERunner):
                     meta=meta,
                     latent_shape=self.latent_shape,
                 )
-        # df-mode view of the val split for sample targets
-        self.val_df_ds = self.val_ds.with_mode("ae")
         self.cond_slots = conditioning_slots(
             self.train_ds.conditions, list(cfg.model.get("conditioning") or [])
         )
@@ -210,7 +165,7 @@ class FlowMatchingRunner(AERunner):
 
     def loss_fn(self, model, batch, key):
         idx, cond = batch["idx"], batch["cond"]
-        loss = _fm_loss(
+        loss = dit_flow_loss(
             model,
             batch["latents"][idx],
             None if cond is None else cond[idx],
@@ -222,44 +177,30 @@ class FlowMatchingRunner(AERunner):
         return loss, {"fm_loss": loss}
 
     def make_evaluator(self):
-        self.val_tables = replicate_local(self.dist, self._tables(self.val_ds))
-        if not (self.cfg.get("validation") or {}).get("eval_sampling", False):
-            return None
-        from neugk_jax.diffusion.eval import DiffusionEvaluator
+        from neugk_jax.diffusion.eval import DiffusionEvaluator, FlowLossEvaluator
 
-        vcfg = self.cfg.validation
+        self.loss_evaluator = FlowLossEvaluator(
+            self.cfg,
+            tables=self._tables(self.val_ds),
+            latent_scale=self.latent_scale,
+            use_ot=self.use_ot,
+            seed=self.seed,
+            **self.evaluator_kwargs(),
+        )
+        if not self.vcfg.get("eval_sampling", False):
+            return None
+        # the sampled latents are scored against the df snapshots of the val split
+        kwargs = {**self.evaluator_kwargs(), "val_ds": self.val_ds.with_mode("ae")}
         return DiffusionEvaluator(
             self.cfg,
-            val_ds=self.val_df_ds,
             autoencoder=self.ae,
             latent_scale=self.latent_scale,
             cond_slots=self.cond_slots,
-            dist=self.dist,
-            loader=self.loader,
-            batch_size=vcfg.get("batch_size") or self.tcfg.batch_size,
+            **kwargs,
         )
 
     def evaluate(self, epoch: int) -> tuple[dict, dict]:
-        bs, n = self.tcfg.batch_size, len(self.val_ds)
-        model = local_view(self.dist, self.model)
-        key = jr.fold_in(jr.PRNGKey(self.cfg.get("seed", 0)), n)
-        total = 0.0
-        for i, start in enumerate(range(0, n, bs)):
-            idx = np.arange(start, start + bs) % n
-            mask = (np.arange(start, start + bs) < n).astype(np.float32)
-            loss = fm_val_loss(
-                model,
-                self.val_tables["latents"],
-                self.val_tables["cond"],
-                jnp.asarray(idx, jnp.int32),
-                jnp.asarray(mask),
-                jr.fold_in(key, i),
-                self.latent_scale,
-                self.use_ot,
-            )
-            total += float(loss) * float(mask.sum())
-        out = {"fm_loss": total / n if n else float("nan")}
-        plots = {}
+        out, plots = self.loss_evaluator(self.model, epoch=epoch)
         if self.evaluator is not None:
             metrics, plots = self.evaluator(self.model, epoch=epoch)
             out.update(metrics)

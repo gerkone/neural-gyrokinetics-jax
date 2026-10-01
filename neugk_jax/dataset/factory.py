@@ -6,7 +6,7 @@ from typing import Any, Optional, Sequence
 
 from neugk_jax.dataset.backend import make_backend
 from neugk_jax.dataset.cyclone import DEFAULT_CONDITIONS, CycloneDataset
-from neugk_jax.utils import config_dict
+from neugk_jax.utils import to_dict
 
 
 def build_dataset(
@@ -30,8 +30,8 @@ def build_dataset(
     """
     norm_stats = dcfg.get("normalization_stats")
     if norm_stats is not None and not isinstance(norm_stats, str):
-        norm_stats = config_dict(norm_stats)
-    normalization = config_dict(dcfg.get("normalization")) or None
+        norm_stats = to_dict(norm_stats)
+    normalization = to_dict(dcfg.get("normalization")) or None
     lightweight = bool(dcfg.get("lightweight_metadata", norm_stats is not None))
     if lightweight and normalization is not None and norm_stats is None:
         raise ValueError(
@@ -57,7 +57,7 @@ def build_dataset(
         subsample=int(
             dcfg.get("subsample", 1) if split == "train" else dcfg.get("val_subsample", 1)
         ),
-        cond_filters=config_dict(filters) or None,
+        cond_filters=to_dict(filters) or None,
         backend=make_backend(
             dcfg,
             local_rank=dist.local_rank if dist else 0,

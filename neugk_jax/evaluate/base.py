@@ -23,12 +23,12 @@ from neugk_jax.training.ddp import (
     replicate_local,
     shard_local,
 )
-from neugk_jax.utils import config_dict, recombine_zf
+from neugk_jax.utils import recombine_zf, to_dict
 
 
 def validation_cfg(cfg) -> dict:
     """The ``validation`` section of a run config as a plain dict."""
-    return config_dict(cfg.get("validation")) if hasattr(cfg, "get") else {}
+    return to_dict(cfg.get("validation")) if hasattr(cfg, "get") else {}
 
 
 def geometry_table(ds, fids: Optional[Sequence[int]] = None) -> dict[str, np.ndarray]:

@@ -6,10 +6,11 @@ from __future__ import annotations
 import functools
 import os
 from collections import Counter
-from typing import Callable
+from typing import Callable, Mapping
 
 import equinox as eqx
 import numpy as np
+import yaml
 from omegaconf import OmegaConf
 
 # number of times each named jitted function has been traced
@@ -34,13 +35,16 @@ def traced_jit(name: str, **jit_kwargs):
     return deco
 
 
-def config_dict(cfg) -> dict:
-    """Plain resolved container of an OmegaConf node or mapping (``{}`` for None)."""
-    if cfg is None:
+def to_dict(src) -> dict:
+    """A plain resolved dict from an OmegaConf node, a mapping or a YAML path (``{}`` for None)."""
+    if src is None:
         return {}
-    if OmegaConf.is_config(cfg):
-        return OmegaConf.to_container(cfg, resolve=True)
-    return dict(cfg)
+    if OmegaConf.is_config(src):
+        return OmegaConf.to_container(src, resolve=True)
+    if isinstance(src, Mapping):
+        return dict(src)
+    with open(src) as f:
+        return yaml.safe_load(f)
 
 
 def atomic_write(path, write: Callable, mode: str = "wb") -> None:

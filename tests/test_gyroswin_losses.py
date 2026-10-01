@@ -77,7 +77,8 @@ def test_loss_config_matches_upstream_rules():
     assert cfg.active == ("df", "phi", "fluxavg")
     assert cfg.flux_key == "fluxavg"
     # a schedule replaces the static weight
-    assert cfg.weights_at(0.3) == {"df": 0.0, "phi": 0.1, "fluxavg": 1.0}
+    weights = {k: float(v) for k, v in cfg.weights_at(7, 10).items()}
+    assert weights == pytest.approx({"df": 0.0, "phi": 0.1, "fluxavg": 1.0})
     assert cfg.integrals == ()
 
 

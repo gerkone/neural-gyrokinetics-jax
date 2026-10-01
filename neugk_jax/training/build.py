@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from neugk_jax.utils import config_dict
+from neugk_jax.utils import to_dict
 
 
 def run_config(cfg, ds=None) -> dict:
     """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf."""
-    out = {k: config_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
+    out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
         out["dataset"]["resolution"] = [int(r) for r in ds.resolution]
         out["dataset"]["separate_zf"] = bool(ds.separate_zf)

@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import jax
-import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
-from neugk_jax.dataset.factory import build_splits
 from neugk_jax.evaluate.base import geometry_table
 from neugk_jax.losses import integral_losses
 from neugk_jax.training.build import build_gyroswin
 from neugk_jax.training.data import stack_fields
 from neugk_jax.training.loss_scheduler import DATA_LOSSES, LossConfig, compute_multi_task_loss
 from neugk_jax.training.runner import BaseRunner
-from neugk_jax.utils import config_dict
 
 
 class GyroSwinRunner(BaseRunner):
@@ -26,18 +23,16 @@ class GyroSwinRunner(BaseRunner):
         cfg = self.cfg
         m = cfg.model
         self.loss_cfg = LossConfig(
-            m.get("loss_weights"), m.get("extra_loss_weights"), config_dict(m.get("loss_scheduler"))
+            m.get("loss_weights"), m.get("extra_loss_weights"), m.get("loss_scheduler")
         )
         fields = set(cfg.dataset.get("input_fields", ("df",)))
         fields |= {k for k in self.loss_cfg.outputs if k in ("df", "phi")}
         if self.loss_cfg.integrals:
             fields |= {"df", "phi"}
         # the val split ends n_eval_steps frames early; those frames are rollout targets
-        tail = int((cfg.get("validation") or {}).get("n_eval_steps", 1))
-        self.train_ds, self.val_ds = build_splits(
-            cfg.dataset,
-            dist=self.dist,
-            mode="next",
+        tail = int(self.vcfg.get("n_eval_steps", 1))
+        self.build_data(
+            "next",
             fields=tuple(sorted(fields)),
             conditions=cfg.model.get("conditioning"),
             val_overrides={"tail_offset": tail},
@@ -66,15 +61,8 @@ class GyroSwinRunner(BaseRunner):
             k: np.stack([self._geom[int(f)][k] for f in fids]) for k in self._geom[int(fids[0])]
         }
 
-    def weights_at(self, step: int) -> dict:
-        progress_remaining = max(0.0, 1.0 - step / max(self.total_steps, 1))
-        return {
-            k: jnp.asarray(v, jnp.float32)
-            for k, v in self.loss_cfg.weights_at(progress_remaining).items()
-        }
-
     def step_extras(self, step: int) -> dict:
-        return {"weights": self.weights_at(step)}
+        return {"weights": self.loss_cfg.weights_at(step, self.total_steps)}
 
     def load_batch(self, ds, indices, read) -> dict:
         batch = stack_fields(
@@ -114,12 +102,4 @@ class GyroSwinRunner(BaseRunner):
     def make_evaluator(self):
         from neugk_jax.gyroswin.eval import GyroSwinEvaluator
 
-        vcfg = self.cfg.get("validation") or {}
-        return GyroSwinEvaluator(
-            self.cfg,
-            val_ds=self.val_ds,
-            dist=self.dist,
-            loader=self.loader,
-            batch_size=vcfg.get("batch_size") or self.tcfg.batch_size,
-            outputs=self.loss_cfg.outputs,
-        )
+        return GyroSwinEvaluator(self.cfg, outputs=self.loss_cfg.outputs, **self.evaluator_kwargs())

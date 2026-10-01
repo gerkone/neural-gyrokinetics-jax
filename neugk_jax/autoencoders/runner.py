@@ -5,7 +5,6 @@ from __future__ import annotations
 import jax
 import jax.random as jr
 
-from neugk_jax.dataset.factory import build_splits
 from neugk_jax.losses import df_loss
 from neugk_jax.training.build import build_ae
 from neugk_jax.training.runner import BaseRunner
@@ -23,20 +22,14 @@ class AERunner(BaseRunner):
     """Trains the Swin5DAE on cyclone df snapshots."""
 
     val_metrics = ("df_mse",)
-    conditioned = False
-
-    def train_dtype(self):
-        return train_dtype(self.cfg)
 
     def setup_data(self) -> None:
-        if not self.conditioned and self.cfg.model.get("conditioning") not in (None, [], ()):
+        if self.cfg.model.get("conditioning") not in (None, [], ()):
             raise ValueError(
-                f"`model.conditioning` is set but {type(self).__name__} is "
-                "unconditional; drop it or use workflow=gyroswin"
+                "`model.conditioning` is set but the AE is unconditional; drop it or use "
+                "workflow=gyroswin"
             )
-        self.train_ds, self.val_ds = build_splits(
-            self.cfg.dataset, dist=self.dist, mode="ae", train_dtype=self.train_dtype()
-        )
+        self.build_data("ae", train_dtype=train_dtype(self.cfg))
         self.separate_zf = bool(self.train_ds.separate_zf)
 
     def build_model(self, key):
@@ -52,11 +45,4 @@ class AERunner(BaseRunner):
     def make_evaluator(self):
         from neugk_jax.autoencoders.eval import AEEvaluator
 
-        vcfg = self.cfg.get("validation") or {}
-        return AEEvaluator(
-            self.cfg,
-            val_ds=self.val_ds,
-            dist=self.dist,
-            loader=self.loader,
-            batch_size=vcfg.get("batch_size") or self.tcfg.batch_size,
-        )
+        return AEEvaluator(self.cfg, **self.evaluator_kwargs())

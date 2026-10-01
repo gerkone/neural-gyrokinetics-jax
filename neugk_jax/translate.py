@@ -9,7 +9,6 @@ Centralizes the AE/DiT translation logic so:
 Public API:
 
 - ``load_torch_state(.pth)`` → ``dict[str, np.ndarray]``
-- ``load_config(src)`` → plain dict from a YAML path, OmegaConf config or mapping
 - ``build_ae_from_config(cfg, key)`` → ``Swin5DAE`` (f32-forced)
 - ``build_dit_from_config(cfg, ae, key)`` → ``DiT`` (f32-forced)
 - ``translate_ae(model, state)`` and ``translate_dit(model, state)``
@@ -20,28 +19,16 @@ from __future__ import annotations
 
 import copy
 import re
-from collections.abc import Mapping
 from typing import Optional, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import yaml
+
+from neugk_jax.utils import to_dict
 
 _LAYERS_RE = re.compile(r"\.layers\.(\d+)")
 _NON_PERSISTENT = (".attn_mask", ".rel_pos", ".rpb", ".rpb_idx", ".omega")
-
-
-def load_config(src) -> dict:
-    """A config as a plain dict, from a YAML path, an OmegaConf config or a mapping."""
-    from omegaconf import OmegaConf
-
-    if OmegaConf.is_config(src):
-        return OmegaConf.to_container(src, resolve=True)
-    if isinstance(src, Mapping):
-        return dict(src)
-    with open(src) as f:
-        return yaml.safe_load(f)
 
 
 def force_f32(model):
@@ -272,7 +259,7 @@ def build_ae_from_config(
     """
     from neugk_jax.autoencoders import Swin5DAE
 
-    cfg = load_config(cfg_path)
+    cfg = to_dict(cfg_path)
     mcfg = cfg["model"]
     vit, patch, bn = mcfg.get("vit", {}), mcfg.get("patch", {}), mcfg.get("bottleneck", {})
     dataset = cfg.get("dataset", {})
@@ -321,7 +308,7 @@ def build_dit_from_config(cfg_path, ae, *, key):
     """Construct a ``DiT`` whose dims match an existing AE's bottleneck (config path or mapping)."""
     from neugk_jax.diffusion.dit import DiT
 
-    cfg = load_config(cfg_path)
+    cfg = to_dict(cfg_path)
     mcfg = cfg["model"]
     vit = mcfg["vit"]
     grid = tuple(ae.bottleneck_grid_size)

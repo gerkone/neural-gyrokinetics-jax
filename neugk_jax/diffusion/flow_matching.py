@@ -102,6 +102,30 @@ def fm_forward_loss(
     return masked_mean(per_sample_mse(pred, target_v), mask)
 
 
+def dit_flow_loss(model, z, cond, key, *, latent_scale, use_ot, train: bool, mask=None):
+    """:func:`fm_forward_loss` of a DiT ``model(x, t, cond, key=, inference=)`` on latents ``z``.
+
+    ``train`` turns on dropout/drop-path with per-sample keys split off ``key``.
+    """
+    fm_key, drop_key = jr.split(key)
+
+    def fwd(x, t, *rest):
+        c = rest[0] if cond is not None else None
+        k = rest[-1] if train else None
+        return model(x, t, c, key=k, inference=not train)
+
+    return fm_forward_loss(
+        fwd,
+        z,
+        cond,
+        key=fm_key,
+        latent_scale=latent_scale,
+        use_ot=use_ot,
+        dropout_key=drop_key if train else None,
+        mask=mask,
+    )
+
+
 def euler_sample(
     model_fn: Callable,
     *,

@@ -351,9 +351,10 @@ def build_gyroswin_from_config(
     ``legacy_double_shortcut`` defaults to ``model.legacy_swin_shortcut``, or
     to True when absent. Config keys the port does not implement raise.
     """
-    from neugk_jax.translate import force_f32, load_config
+    from neugk_jax.translate import force_f32
+    from neugk_jax.utils import to_dict
 
-    cfg = load_config(cfg_path)
+    cfg = to_dict(cfg_path)
     mcfg = cfg["model"] if "model" in cfg else cfg
     swin = mcfg["swin"]
     dataset = cfg.get("dataset", {}) or {}
@@ -429,9 +430,9 @@ def release_config(cfg_path, *, resolution: Optional[Sequence[int]] = None) -> d
     """
     import copy
 
-    from neugk_jax.translate import load_config
+    from neugk_jax.utils import to_dict
 
-    cfg = copy.deepcopy(load_config(cfg_path))
+    cfg = copy.deepcopy(to_dict(cfg_path))
     mcfg = cfg["model"]
     for k in _RELEASE_DEAD_SWIN_KEYS:
         mcfg["swin"].pop(k, None)

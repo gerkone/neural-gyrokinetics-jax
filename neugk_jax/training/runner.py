@@ -22,6 +22,7 @@ import numpy as np
 import optax
 from omegaconf import OmegaConf, open_dict
 
+from neugk_jax.dataset.factory import build_splits
 from neugk_jax.models.utils import trainable_mask
 from neugk_jax.training.checkpoint import AsyncCheckpointer, CheckpointState, load_checkpoint
 from neugk_jax.training.data import BatchLoader, stack_fields, train_plans
@@ -35,7 +36,7 @@ from neugk_jax.training.ddp import (
 )
 from neugk_jax.training.logging import Logger
 from neugk_jax.training.schedulers import warmup_cosine
-from neugk_jax.utils import config_dict, count_trace, progress
+from neugk_jax.utils import count_trace, progress, to_dict
 
 
 def weight_decay_mask(params, exclude):
@@ -149,8 +150,8 @@ class BaseRunner:
         self.dist = init_distributed()
         self.logger = Logger(
             is_rank0=self.dist.is_rank0,
-            config=config_dict(cfg),
-            logging=config_dict(cfg.get("logging")),
+            config=to_dict(cfg),
+            logging=to_dict(cfg.get("logging")),
         )
         self.output_path = Path(output_path or cfg.get("output_path") or "outputs/run")
         self.tcfg = cfg.training
@@ -161,13 +162,37 @@ class BaseRunner:
             workers=self.tcfg.get("num_workers", 4), prefetch=self.tcfg.get("prefetch", 2)
         )
         self.setup_data()
-        self.model = self.build_model(jr.PRNGKey(cfg.get("seed", 0)))
+        self.model = self.build_model(jr.PRNGKey(self.seed))
         self.setup_optimizer()
         self.ctx = replicate(self.dist, self.step_context())
         self.spec = StepSpec(type(self).__name__, self.loss_fn, self.optimizer, self.trainable)
         self._maybe_resume()
         self.evaluator = self.make_evaluator()
         self.save_config()
+
+    @property
+    def seed(self) -> int:
+        return int(self.cfg.get("seed", 0))
+
+    @property
+    def vcfg(self) -> dict:
+        return to_dict(self.cfg.get("validation"))
+
+    @property
+    def eval_batch_size(self) -> int:
+        """Per-device validation batch: ``validation.batch_size``, else the training one."""
+        return self.vcfg.get("batch_size") or self.tcfg.batch_size
+
+    def evaluator_kwargs(self) -> dict:
+        return dict(
+            val_ds=self.val_ds, dist=self.dist, loader=self.loader, batch_size=self.eval_batch_size
+        )
+
+    def build_data(self, mode: str, **kwargs) -> None:
+        """Train and val datasets of ``mode`` from the ``dataset`` config."""
+        self.train_ds, self.val_ds = build_splits(
+            self.cfg.dataset, dist=self.dist, mode=mode, **kwargs
+        )
 
     def save_config(self) -> None:
         if self.dist.is_rank0:
@@ -292,8 +317,8 @@ class BaseRunner:
         raise KeyError(f"none of {self.val_metrics} in validation metrics {sorted(val_logs)}")
 
     def __call__(self) -> None:
-        base_key = jr.PRNGKey(self.cfg.get("seed", 0))
-        val_every = (self.cfg.get("validation") or {}).get("validate_every_n_epochs", 1)
+        base_key = jr.PRNGKey(self.seed)
+        val_every = self.vcfg.get("validate_every_n_epochs", 1)
         save_every = self.tcfg.get("save_every_n_epochs", 1)
         n_epochs = self.tcfg.n_epochs
         last_val = math.nan
