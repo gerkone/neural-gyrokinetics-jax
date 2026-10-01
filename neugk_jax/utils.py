@@ -78,11 +78,14 @@ def separate_zf(x, axis: int = 0):
 
 
 def recombine_zf(x, axis: int = 0):
-    """Inverse of ``separate_zf``: ``[zf, non_zf]`` → ``zf + non_zf``."""
-    if x.shape[axis] <= 2 or x.shape[axis] % 2 != 0:
-        return x
-    zf, non_zf = x.__array_namespace__().split(x, 2, axis=axis)
-    return zf + non_zf
+    """Sum the (real, imag) channel pairs along ``axis`` back to 2 channels.
+
+    Inverts ``separate_zf`` (``[zf, rest]``) and the ky-band split of the preprocessing;
+    a 2-channel ``x`` is returned as is.
+    """
+    xp = x.__array_namespace__()
+    x = xp.moveaxis(x, axis, 0)
+    return xp.moveaxis(x.reshape(-1, 2, *x.shape[1:]).sum(0), 0, axis)
 
 
 class RunningStats:

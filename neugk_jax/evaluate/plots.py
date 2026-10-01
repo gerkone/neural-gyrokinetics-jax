@@ -16,7 +16,7 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 
-from neugk_jax.utils import recombine_zf as _recombine_zf
+from neugk_jax.utils import recombine_zf
 
 GK_LABELS = {
     5: [r"v_{\parallel}", r"\mu", r"s", r"k_x", r"k_y"],
@@ -127,10 +127,7 @@ def generate_val_plots(
             continue
         x, y = rollout[key], gt[key]
         if cfg["recombine"]:
-            if y.shape[0] != 2:
-                y = _recombine_zf(y, axis=0)
-            if x.shape[0] != 2:
-                x = _recombine_zf(x, axis=0)
+            x, y = recombine_zf(x, axis=0), recombine_zf(y, axis=0)
         x, y = x.squeeze(), y.squeeze()
         plots[cfg["name"]] = _plt_to_wandb_image(plot_nd(x, y, cmap=cfg["cmap"]))
     return plots

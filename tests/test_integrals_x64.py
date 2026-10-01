@@ -13,10 +13,10 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_gyaradax_import_keeps_x64_off():
-    from neugk_jax.evaluate.integrals import _import_gyaradax, _x64
+    from neugk_jax.evaluate.integrals import _float64, _import_gyaradax
 
     assert not jax.config.jax_enable_x64
     _import_gyaradax()
     assert not jax.config.jax_enable_x64
-    seen = _x64(lambda: jax.config.jax_enable_x64)()
+    seen = _float64(lambda: jax.config.jax_enable_x64)()
     assert seen and not jax.config.jax_enable_x64

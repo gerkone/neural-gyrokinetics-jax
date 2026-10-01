@@ -58,7 +58,8 @@ from neugk_jax.dataset.backend import (
     meta_path,
     save_meta,
 )
-from neugk_jax.utils import RunningStats, atomic_write, progress
+from neugk_jax.evaluate.fourier import df_to_spec, phi_to_spec, spec_to_df, spec_to_phi
+from neugk_jax.utils import RunningStats, atomic_write, progress, recombine_zf
 
 RAW_ROOT = os.environ.get("NEUGK_RAW_ROOT")
 TARGET_DIR = os.environ.get("NEUGK_TARGET_DIR")
@@ -321,21 +322,11 @@ def load_k_dump(path: str, resolution: tuple) -> np.ndarray:
     return np.reshape(ff, (2, *resolution), order="F").astype("float32").copy()
 
 
-def do_ifft(knth: np.ndarray) -> np.ndarray:
-    knth = np.fft.ifftn(knth, axes=(3, 4), norm="forward")
-    return np.stack([knth.real, knth.imag]).squeeze().astype("float32")
-
-
 def check_ifft(
     transformed: np.ndarray, orig: np.ndarray, zf_separated: bool = False, atol: float = 1e-5
 ) -> bool:
     """True when the real-space df transforms back onto the raw spectral dump within ``atol``."""
-    if zf_separated:
-        cplx = np.sum(transformed[::2], axis=0) + 1j * np.sum(transformed[1::2], axis=0)
-    else:
-        cplx = transformed[0] + 1j * transformed[1]
-    spec = np.fft.fftn(cplx.astype(np.complex64), axes=(3, 4), norm="forward")
-    spec = np.fft.ifftshift(spec, axes=(3,))
+    spec = df_to_spec(recombine_zf(transformed, axis=0) if zf_separated else transformed)
     err_re = np.max(np.abs(spec.real.astype(np.float32) - orig[0]))
     err_im = np.max(np.abs(spec.imag.astype(np.float32) - orig[1]))
     return bool(max(err_re, err_im) <= atol)
@@ -343,73 +334,6 @@ def check_ifft(
 
 def _check_spc(abs_phi_fft: np.ndarray, spc: np.ndarray) -> bool:
     return np.allclose(abs_phi_fft, spc, rtol=0.0, atol=1e-3)
-
-
-def phi_to_spc(phi, gt_spc=None, out_shape=None, norm: str = "forward") -> np.ndarray:
-    """Real GKW potential ``(nx, s, ny)`` to its kx-centred one-sided spectrum ``(nkx, s, nky)``.
-
-    Asserts ``|spectrum|`` against the ``Spc3d`` dump when ``gt_spc`` is given.
-    """
-    phi_fft = np.fft.fftn(phi, axes=(0, 2), norm=norm)
-    phi_fft = np.fft.fftshift(phi_fft, axes=(0, 2))
-    phi_fft = phi_fft[..., phi_fft.shape[-1] // 2 :]
-    nkx, _, nky = out_shape
-    xpad = (phi_fft.shape[0] - nkx) // 2
-    xpad = xpad + 1 if (phi_fft.shape[0] % 2 == 0) else xpad
-    phi_fft = phi_fft[xpad : nkx + xpad, :, :nky]
-    if gt_spc is not None:
-        assert _check_spc(np.abs(phi_fft), gt_spc), "Spectral space of Phi incorrect"
-    return phi_fft
-
-
-def phi_fft_to_real(fft: np.ndarray, out_shape, norm: str = "forward") -> np.ndarray:
-    """Kx-centred one-sided spectrum (zero-padded to ``out_shape``) to a real potential."""
-    if fft.shape != tuple(out_shape):
-        nkx, _, nky = out_shape
-        nx, _, ny = fft.shape
-        xpad = (nkx - nx) // 2 + 1
-        padded = np.zeros(out_shape).astype(fft.dtype)
-        padded[xpad : xpad + nx, :, :ny] = fft
-    else:
-        nkx, _, nky = fft.shape
-        padded = fft
-    # ifftshift (not fftshift) inverts the centring for odd nkx
-    phi = np.fft.ifftshift(padded, axes=(0,))
-    return np.fft.irfftn(phi, axes=(0, 2), norm=norm, s=[nkx, nky])
-
-
-def solver_df_to_realspace(df_spec: np.ndarray) -> np.ndarray:
-    # inverse of the solver-side fftshift + spatial fft
-    un = np.fft.fftshift(df_spec, axes=(3,))
-    phys = np.fft.ifftn(un, axes=(3, 4), norm="forward")
-    return np.stack([phys.real, phys.imag]).astype("float32")
-
-
-def realspace_to_solver_df(df: np.ndarray) -> np.ndarray:
-    spec = np.fft.fftn(df[0] + 1j * df[1], axes=(3, 4), norm="forward")
-    return np.fft.ifftshift(spec, axes=(3,)).astype(np.complex64)
-
-
-def _eflux_ky(g: dict, spec, phi, apar, bpar):
-    import jax.numpy as jnp
-
-    chi = (
-        g["bessel"] * phi
-        - 2.0 * g["vthrat"] * g["vpgr"] * g["bessel"] * apar
-        + 2.0 * g["mugr"] * g["tmp"] / g["signz"] * g["bessel_bpar"] * bpar
-    )
-    dum1 = jnp.imag(g["parseval"] * g["ints"] * g["efun"] * g["krho"] * spec * jnp.conj(chi))
-    d3v = g["ints"] * g["d2X"] * g["intmu"] * g["bn"] * g["intvp"]
-    ef = d3v * (g["vpgr"] ** 2 * dum1 + 2.0 * g["mugr"] * g["bn"] * dum1) * g["de"] * g["tmp"]
-    return jnp.sum(ef, axis=(0, 1, 2, 3))
-
-
-def _flux_spectrum(g: dict, df):
-    from neugk_jax.evaluate.integrals import _df_fft, _solve_fields
-
-    spec = _df_fft(df)
-    phi, apar, bpar = _solve_fields(g, spec)
-    return _eflux_ky(g, spec, phi, apar, bpar)
 
 
 class FieldSolver:
@@ -425,13 +349,13 @@ class FieldSolver:
         import jax
         import jax.numpy as jnp
 
-        from neugk_jax.evaluate.integrals import flux_integral, precompute_geometry
+        from neugk_jax.evaluate.integrals import flux_integral, flux_spectrum, precompute_geometry
 
         self.x64 = x64
         self.dtype = np.float64 if x64 else np.float32
         if not FieldSolver._jits:
             FieldSolver._jits["solve"] = jax.jit(flux_integral)
-            FieldSolver._jits["spectrum"] = jax.jit(_flux_spectrum)
+            FieldSolver._jits["spectrum"] = jax.jit(flux_spectrum)
         gt = precompute_geometry(geometry, dtype=self.dtype)
         with jax.enable_x64(x64):
             self.geom = {k: jnp.asarray(v) for k, v in gt.items()}
@@ -582,11 +506,10 @@ def preprocess(
         knth = load_k_dump(f"{dir_in}/{k}", resolution)
         orig_knth = knth.copy()
         knth = np.moveaxis(knth, 0, -1).copy().view(dtype=np.complex64)
-        knth = np.fft.fftshift(knth, axes=(3,))
         if separate_zf:
             knth = np.concatenate(_split_modes(knth, split_into_bands), axis=0)
         else:
-            knth = do_ifft(knth)
+            knth = spec_to_df(knth)
         assert check_ifft(
             knth, orig_knth, zf_separated=separate_zf
         ), "error transforming back to original space"
@@ -595,11 +518,11 @@ def preprocess(
         phi_gkw = np.reshape(a, (nx, ns, ny), order="F").astype("float32").copy()
         b = np.loadtxt(f"{dir_in}/{pot.replace('Poten', 'Spc3d')}")
         gt_spc = np.reshape(b, (nkx, ns, nky), order="F")
-        phi_fft = phi_to_spc(phi_gkw, gt_spc, out_shape=(nkx, ns, nky))
-        phi_gkw = phi_fft_to_real(phi_fft, out_shape=phi_fft.shape).astype(np.float32)
+        phi_fft = phi_to_spec(phi_gkw, (nkx, ns, nky))
+        assert _check_spc(np.abs(phi_fft), gt_spc), "Spectral space of Phi incorrect"
+        phi_gkw = spec_to_phi(phi_fft).astype(np.float32)
 
-        df2 = knth.reshape(-1, 2, *knth.shape[1:]).sum(0) if knth.shape[0] != 2 else knth
-        phi_int, eflux = solver(df2)
+        phi_int, eflux = solver(recombine_zf(knth, axis=0))
         if not np.isclose(eflux, orig_fluxes[idx], rtol=0.0, atol=1e-2):
             warnings.warn(
                 f"Flux integral does not match original flux! "
@@ -628,20 +551,25 @@ def preprocess(
 
 def _split_modes(knth: np.ndarray, split_into_bands: Optional[int]) -> list[np.ndarray]:
     """Zonal (ky=0) and turbulent (optionally ky-banded) real-space parts of a spectral df."""
+
+    def to_df(shifted):
+        return spec_to_df(np.fft.ifftshift(shifted, axes=(3,)))
+
+    knth = np.fft.fftshift(knth, axes=(3,))
     nky = knth.shape[4]
     zf, no_zf = knth.copy(), knth.copy()
     zf[..., 1:, :] = 0.0
     no_zf[..., 0, :] = 0.0
-    out = [do_ifft(zf)]
+    out = [to_df(zf)]
     if not split_into_bands:
-        return out + [do_ifft(no_zf)]
+        return out + [to_df(no_zf)]
     per = nky // split_into_bands
     for band in range(split_into_bands):
         cur = np.zeros_like(no_zf)
         lo = 1 + band * per
         hi = None if band == split_into_bands - 1 else lo + per
         cur[..., lo:hi, :] = no_zf[..., lo:hi, :]
-        out.append(do_ifft(cur))
+        out.append(to_df(cur))
     return out
 
 
@@ -754,7 +682,7 @@ def preprocess_gyaradax(
         enumerate(steps), show_tqdm, total=len(steps), desc=name, leave=False
     ):
         d = np.load(step_path)
-        df_real = solver_df_to_realspace(d["df"])
+        df_real = spec_to_df(d["df"])
         phi, eflux_total = solver(df_real)
         reported = float(d["fluxes"][1])
         if not np.isclose(eflux_total, reported, rtol=0.0, atol=1.0):

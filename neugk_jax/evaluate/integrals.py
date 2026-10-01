@@ -10,11 +10,15 @@ global x64 switch on import.
 from __future__ import annotations
 
 import functools
+import importlib.util
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from neugk_jax.evaluate.fourier import df_to_spec, phi_to_spec, spec_to_phi
+from neugk_jax.utils import recombine_zf
 
 REQUIRED_GEOMETRY = (
     "krho",
@@ -32,14 +36,6 @@ REQUIRED_GEOMETRY = (
 )
 
 
-def require_integrals(geometry: Optional[dict]) -> None:
-    import importlib.util
-
-    if importlib.util.find_spec("gyaradax") is None:
-        raise ImportError("eval_integrals needs gyaradax (pip install -e '.[gyro]')")
-    require_geometry(geometry)
-
-
 def require_geometry(geometry: Optional[dict]) -> None:
     """Raise unless ``geometry`` carries every field :func:`precompute_geometry` needs."""
     if geometry is None:
@@ -50,27 +46,18 @@ def require_geometry(geometry: Optional[dict]) -> None:
 
 
 def _import_gyaradax():
-    import importlib.util
-
     if importlib.util.find_spec("gyaradax") is None:
-        raise ImportError("flux integrals need gyaradax (pip install -e '.[gyro]')")
+        raise ImportError("the spectral metrics need gyaradax (pip install -e '.[gyro]')")
     prev = jax.config.jax_enable_x64
     import gyaradax.integrals  # noqa: F401
 
+    # gyaradax switches x64 on globally at import
     jax.config.update("jax_enable_x64", prev)
 
 
-def _x64(fn):
-    @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        _import_gyaradax()
-        with jax.enable_x64(True):
-            return fn(*args, **kwargs)
+def _float64(fn):
+    """Run ``fn`` inside a local ``jax.enable_x64`` context."""
 
-    return wrapped
-
-
-def _f64(fn):
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         with jax.enable_x64(True):
@@ -79,39 +66,41 @@ def _f64(fn):
     return wrapped
 
 
-@_x64
 def gyaradax_spectral_fields(df_batch, geometry: dict, *, per_sample: bool = False):
     """Spectral potential + per-mode heat-flux field of a spatial df batch via gyaradax.
 
-    ``df_batch`` is ``(B, 4, vp, mu, s, x, y)`` (separate-zf layout) or ``(B, 2, ...)``;
-    ``geometry`` is one trajectory's geometry, or with ``per_sample`` a geometry whose
-    leaves carry a leading batch axis. Returns ``(phi_spec, eflux_field)`` as host numpy
-    arrays of shapes ``(B, s, kx, ky)`` (complex) and ``(B, kx, ky)``; ``parseval`` is
-    replaced by the Hermitian factor ``where(|krho| < 1e-12, 1, 2)``.
+    ``df_batch`` is ``(B, C, vp, mu, s, x, y)`` with the zonal-flow parts of a separate-zf
+    layout summed back; ``geometry`` is one trajectory's geometry, or with ``per_sample`` a
+    geometry whose leaves carry a leading batch axis. Returns ``(phi_spec, eflux_field)`` as
+    host numpy arrays of shapes ``(B, s, kx, ky)`` (complex) and ``(B, kx, ky)``;
+    ``parseval`` is replaced by the Hermitian factor ``where(|krho| < 1e-12, 1, 2)``.
     """
-    require_integrals(geometry)
-    df_batch = jnp.asarray(df_batch)
-    df_rec = df_batch[:, :2] + df_batch[:, 2:] if df_batch.shape[1] == 4 else df_batch
-    df_cplx = (df_rec[:, 0] + 1j * df_rec[:, 1]).astype(jnp.complex128)
-    geom = {k: jnp.asarray(v) for k, v in geometry.items()}
-    geom["parseval"] = jnp.where(jnp.abs(geom["krho"]) < 1e-12, 1.0, 2.0).astype(jnp.float64)
-    fn = _gyaradax_spectral_per_sample if per_sample else _gyaradax_spectral_batched
-    phi, eflux = fn(df_cplx, geom)
-    return np.asarray(phi), np.asarray(eflux)
+    _import_gyaradax()
+    require_geometry(geometry)
+    with jax.enable_x64(True):
+        df = recombine_zf(jnp.asarray(df_batch), axis=1).astype(jnp.float64)
+        geom = {k: jnp.asarray(v) for k, v in geometry.items()}
+        geom["parseval"] = jnp.where(jnp.abs(geom["krho"]) < 1e-12, 1.0, 2.0).astype(jnp.float64)
+        fn = _gyaradax_spectral_per_sample if per_sample else _gyaradax_spectral_batched
+        phi, eflux = fn(df, geom)
+        return np.asarray(phi), np.asarray(eflux)
 
 
 @jax.jit
 def _gyaradax_spectral_one(df_one, geom):
-    """Per-sample (spatial complex df, geom) → (phi_spec, per-(kx, ky) eflux field)."""
+    """Per-sample (spatial df, geom) → (phi_spec, per-(kx, ky) eflux field)."""
     from gyaradax.integrals import _phi_adiabatic, calculate_fluxes, geom_tensors
 
-    spec = jnp.fft.fftn(df_one, axes=(-2, -1), norm="forward")
-    spec = jnp.fft.ifftshift(spec, axes=-2)
+    spec = df_to_spec(df_one)
     gt = geom_tensors(geom)
     phi = _phi_adiabatic(gt, spec)  # (s, kx, ky) complex
     phi = _zonal_correction(gt, geom, spec, phi)
     _pflux, eflux, _vflux = calculate_fluxes(gt, spec, phi, reduce=False)
     return phi, eflux
+
+
+def _zonal_weights(signz, de, tmp, gamma, ints):
+    return -ints / (signz * de * (signz * (gamma - 1.0) / tmp - 1.0 / tmp))
 
 
 def _zonal_correction(gt, geom, spec, phi):
@@ -129,17 +118,15 @@ def _zonal_correction(gt, geom, spec, phi):
     ints_s = jnp.asarray(geom["ints"], dtype=jnp.float64)
     gamma00 = gamma[0, 0, 0, :, 0, 0]  # (s,) — gamma is v/mu-independent
     sz, d, t = signz.ravel()[0], de.ravel()[0], tmp.ravel()[0]
-    diagz = sz * (gamma00 - 1.0) / t
-    matz = -ints_s / (sz * d * (diagz - 1.0 / t))
-    phi_new = phi_raw + jnp.sum(matz * phi_raw)
-    return phi.at[:, 0, 0].set(phi_new)
+    matz = _zonal_weights(sz, d, t, gamma00, ints_s)
+    return phi.at[:, 0, 0].set(phi_raw + jnp.sum(matz * phi_raw))
 
 
 _gyaradax_spectral_batched = jax.jit(jax.vmap(_gyaradax_spectral_one, in_axes=(0, None)))
 _gyaradax_spectral_per_sample = jax.jit(jax.vmap(_gyaradax_spectral_one, in_axes=(0, 0)))
 
 
-@_f64
+@_float64
 def precompute_geometry(geometry: dict, dtype=np.float32) -> dict[str, np.ndarray]:
     """Broadcast-ready geometry tensors for :func:`flux_integral` (one trajectory).
 
@@ -187,31 +174,6 @@ def precompute_geometry(geometry: dict, dtype=np.float32) -> dict[str, np.ndarra
     return {k: np.ascontiguousarray(v, dtype=dtype) for k, v in out.items()}
 
 
-def _df_fft(df: jnp.ndarray) -> jnp.ndarray:
-    spec = jnp.fft.fftn(df[0] + 1j * df[1], axes=(-2, -1), norm="forward")
-    return jnp.fft.ifftshift(spec, axes=-2)
-
-
-def _phi_to_spc(phi: jnp.ndarray, out_shape: tuple, real_potens: bool) -> jnp.ndarray:
-    if not real_potens:
-        phi = phi[0] + 1j * phi[1]
-    phi = jnp.fft.fftshift(jnp.fft.fftn(phi, axes=(0, 2), norm="forward"), axes=0)
-    if phi.shape != out_shape:
-        nx, _, ny = out_shape
-        phi = phi[..., phi.shape[-1] // 2 :]
-        xpad = (phi.shape[0] - nx) // 2 + (1 if phi.shape[0] % 2 == 0 else 0)
-        phi = phi[xpad : nx + xpad, :, :ny]
-    return jnp.transpose(phi, (1, 0, 2))
-
-
-def _spc_to_phi(spc: jnp.ndarray, real_potens: bool) -> jnp.ndarray:
-    spc = jnp.fft.ifftshift(jnp.transpose(spc, (1, 0, 2)), axes=0)
-    if real_potens:
-        return jnp.fft.irfftn(spc, s=(spc.shape[0], spc.shape[2]), axes=(0, 2), norm="forward")
-    phi = jnp.fft.ifftn(spc, axes=(0, 2), norm="forward")
-    return jnp.stack([phi.real, phi.imag])
-
-
 def _solve_fields(g: dict, spec: jnp.ndarray):
     signz, de, tmp, bn = g["signz"], g["de"], g["tmp"], g["bn"]
     ints, intvp, intmu, gamma = g["ints"], g["intvp"], g["intmu"], g["gamma"]
@@ -223,9 +185,7 @@ def _solve_fields(g: dict, spec: jnp.ndarray):
     diag = -1.0 / jnp.where(diag == 0.0, 1.0, diag)
 
     # zonal-flow correction on the ky=0 column, kx index 0 excluded
-    diagz = signz * (gamma - 1.0) / tmp
-    matz = -ints / (signz * de * (diagz - 1.0 / tmp))
-    matz = matz.at[..., 1:].set(0.0)
+    matz = _zonal_weights(signz, de, tmp, gamma, ints).at[..., 1:].set(0.0)
     maty = tmp / de + jnp.sum(-matz, axis=-3, keepdims=True)
     maty = maty.at[..., 0, :].set(1.0)
     maty = 1.0 / jnp.where(maty == 0.0, 1.0, maty)
@@ -242,7 +202,8 @@ def _solve_fields(g: dict, spec: jnp.ndarray):
     return phi, apar[0, 0], bpar[0, 0]
 
 
-def _pev_fluxes(g: dict, spec, phi, apar, bpar):
+def _pev_fluxes(g: dict, spec, phi, apar, bpar, axis=None):
+    """Particle, heat and momentum flux, summed over ``axis`` (default: all)."""
     vpgr, mugr, bn, ints, intmu, intvp = (
         g["vpgr"],
         g["mugr"],
@@ -258,8 +219,8 @@ def _pev_fluxes(g: dict, spec, phi, apar, bpar):
     )
     dum1 = jnp.imag(g["parseval"] * ints * g["efun"] * g["krho"] * spec * jnp.conj(chi))
     d3v = ints * g["d2X"] * intmu * bn * intvp
-    pflux = jnp.sum(d3v * dum1 * g["de"])
-    eflux = jnp.sum(d3v * (vpgr**2 * dum1 + 2.0 * mugr * bn * dum1) * g["de"] * g["tmp"])
+    pflux = jnp.sum(d3v * dum1 * g["de"], axis=axis)
+    eflux = jnp.sum(d3v * (vpgr**2 * dum1 + 2.0 * mugr * bn * dum1) * g["de"] * g["tmp"], axis=axis)
     vflux = jnp.sum(
         d3v
         * dum1
@@ -269,26 +230,32 @@ def _pev_fluxes(g: dict, spec, phi, apar, bpar):
         * g["signB"]
         * g["de"]
         * g["mas"]
-        * g["vthrat"] ** 2
+        * g["vthrat"] ** 2,
+        axis=axis,
     )
     return pflux, eflux, vflux
 
 
-def flux_integral(
-    geom_t: dict, df: jnp.ndarray, phi: Optional[jnp.ndarray] = None, *, real_potens: bool = True
-):
+def flux_integral(geom_t: dict, df: jnp.ndarray, phi: Optional[jnp.ndarray] = None):
     """Jittable single-sample fields and fluxes from a spatial df (real-space phi out).
 
     ``geom_t`` comes from :func:`precompute_geometry`; ``df`` is ``(2, vp, mu, s, x, y)``
-    (real/imag, spatial x/y). Fields are solved from ``df``; an external ``phi``
-    (``(x, s, y)`` real, or ``(2, x, s, y)``) replaces the solved one in the fluxes.
-    Returns ``(phi_int, (pflux, eflux, vflux))`` with ``phi_int`` in the dataset
-    layout ``(x, s, y)`` (``(2, x, s, y)`` without ``real_potens``). Runs in the
-    input precision.
+    (real/imag, spatial x/y). Fields are solved from ``df``; an external real ``phi``
+    ``(x, s, y)`` replaces the solved one in the fluxes. Returns ``(phi_int, (pflux, eflux,
+    vflux))`` with ``phi_int`` in the dataset layout ``(x, s, y)``. Runs in the input
+    precision.
     """
     ns, nx, ny = df.shape[-3:]
-    spec = _df_fft(df)
+    spec = df_to_spec(df)
     phi_s, apar_s, bpar_s = _solve_fields(geom_t, spec)
-    phi_f = phi_s if phi is None else _phi_to_spc(phi, (nx, ns, ny), real_potens)
-    fluxes = _pev_fluxes(geom_t, spec, phi_f, apar_s, bpar_s)
-    return _spc_to_phi(phi_s, real_potens), fluxes
+    if phi is not None:
+        shape = None if phi.shape == (nx, ns, ny) else (nx, ns, ny)
+        phi_s_ext = jnp.transpose(phi_to_spec(phi, shape), (1, 0, 2))
+    fluxes = _pev_fluxes(geom_t, spec, phi_s if phi is None else phi_s_ext, apar_s, bpar_s)
+    return spec_to_phi(jnp.transpose(phi_s, (1, 0, 2))), fluxes
+
+
+def flux_spectrum(geom_t: dict, df: jnp.ndarray) -> jnp.ndarray:
+    """Per-ky heat flux of a spatial df (the field-solved potential's)."""
+    spec = df_to_spec(df)
+    return _pev_fluxes(geom_t, spec, *_solve_fields(geom_t, spec), axis=(0, 1, 2, 3))[1]
