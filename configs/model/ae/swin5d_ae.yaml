@@ -18,10 +18,9 @@ vit:
   gated_attention: true
   qk_norm: true
   qkv_bias: false
+  drop_path: 0.1
 bottleneck:
   dim: 256
   depth: 2
   num_heads: 4
   normalized_latent: false
-middle_depth: 2
-middle_num_heads: 4

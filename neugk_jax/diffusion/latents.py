@@ -9,10 +9,12 @@ running the encoder on each step.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import pickle
+import warnings
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 import jax.numpy as jnp
 import numpy as np
@@ -23,110 +25,204 @@ from neugk_jax.utils import RunningMeanStd
 def _tqdm(*args, **kwargs):
     try:
         from tqdm import tqdm
+
         return tqdm(*args, **kwargs)
     except ImportError:
         return args[0] if args else iter(())
 
 
-def _cache_path(dataset, split: str, ae_tag: str) -> Path:
+def latent_cache_path(
+    dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False, timestep_std_filter=None
+) -> Path:
+    """Cache file for a split's latents.
+
+    ``<path>/diff_<split>_latents_offset<o>[_mu][_std<f>]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
+    where ``<run>`` is the last ``_`` field of the AE run directory (a checkpoint file resolves
+    to its directory).
+    """
     basenames = sorted(os.path.basename(f) for f in dataset.files)
-    h = hashlib.sha256("".join(basenames).encode()).hexdigest()[:12]
-    name = f"diff_{split}_latents_offset{dataset.offset}_{h}_{ae_tag}.pkl"
-    return Path(dataset.path) / name
+    file_hash = hashlib.sha256("".join(basenames).encode()).hexdigest()[:12]
+    run_dir = os.path.abspath(str(ae_checkpoint))
+    if os.path.isfile(run_dir):
+        run_dir = os.path.dirname(run_dir)
+    segments = [
+        "diff",
+        f"{split}_latents",
+        f"offset{dataset.offset}",
+        "mu" if decouple_mu else "",
+        f"std{timestep_std_filter}" if timestep_std_filter else "",
+        file_hash,
+        "latents",
+        "ae" + run_dir.split("_")[-1],
+    ]
+    return Path(dataset.path) / ("_".join(filter(None, segments)) + ".pkl")
+
+
+def cache_meta_path(cache_file: str | Path) -> Path:
+    cache_file = Path(cache_file)
+    return cache_file.with_name(cache_file.name + ".meta.json")
+
+
+def latent_cache_meta(
+    dataset, ae_checkpoint: str | os.PathLike, *, normalization_stats=None
+) -> dict:
+    """Provenance of a latent cache: AE checkpoint file identity and the dataset preprocessing."""
+    ae = Path(ae_checkpoint).resolve()
+    st = ae.stat()
+    stats = normalization_stats if isinstance(normalization_stats, (str, os.PathLike)) else None
+    return {
+        "ae_checkpoint": str(ae),
+        "ae_size": int(st.st_size),
+        "ae_mtime": float(st.st_mtime),
+        "normalization_stats": None if stats is None else str(Path(stats).resolve()),
+        "separate_zf": bool(dataset.separate_zf),
+        "offset": int(dataset.offset),
+    }
+
+
+def write_cache_meta(cache_file: str | Path, meta: dict) -> None:
+    path = cache_meta_path(cache_file)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(meta, indent=2, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def check_cache_meta(cache_file: str | Path, meta: Optional[dict]) -> None:
+    """Raise if the sidecar of ``cache_file`` disagrees with ``meta``; warn if it has none."""
+    if meta is None:
+        return
+    path = cache_meta_path(cache_file)
+    if not path.exists():
+        warnings.warn(
+            f"{cache_file} has no {path.name}; its AE and preprocessing cannot be "
+            "checked, only its index and latent shape"
+        )
+        return
+    saved = json.loads(path.read_text())
+    diff = {k: (saved.get(k), v) for k, v in meta.items() if saved.get(k) != v}
+    if diff:
+        lines = "\n".join(f"  {k}: cache={a!r} run={b!r}" for k, (a, b) in sorted(diff.items()))
+        raise ValueError(
+            f"latent cache {cache_file} was built for a different AE or "
+            f"preprocessing:\n{lines}\ndelete it to re-encode, or point "
+            "dataset.latents_cache_* at a matching cache"
+        )
+
+
+def _barrier(name: str) -> None:
+    import jax
+
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+
+        multihost_utils.sync_global_devices(name)
 
 
 def precompute_latents(
     dataset,
     *,
     encode_fn: Callable,
-    ae_tag: str,
+    cache_file: str | Path,
     batch_size: int = 4,
-    device=None,
     overwrite: bool = False,
+    meta: Optional[dict] = None,
+    latent_shape=None,
 ) -> None:
-    """Encode the entire dataset through ``encode_fn`` and cache the result.
+    """Encode the dataset through ``encode_fn`` into ``cache_file`` (or load it if present).
 
-    ``encode_fn`` is called as ``encode_fn(df_batch, cond_batch) -> latent_batch``
-    where ``df_batch`` has shape ``(B, C, *resolution)`` and ``latent_batch``
-    has shape ``(B, *latent_grid, latent_channels)``. The dataset is mutated
-    in place: ``dataset.precomputed_latents`` is populated and the mode is
-    flipped to ``"diff"`` so subsequent ``__getitem__`` calls return cached
-    latents instead of raw df reads.
+    ``encode_fn(df_batch, cond_batch) -> latent_batch`` maps ``(B, C, *resolution)`` to
+    ``(B, *latent_grid, latent_channels)``. Entries:
+    ``{(fid, t_idx): {"x", "phi", "flux", "timestep", <one raw scalar per condition>}}``.
+    Process 0 encodes and writes atomically, with ``meta`` (see :func:`latent_cache_meta`)
+    as a ``<cache>.meta.json`` sidecar; the others wait. Every process then loads the cache
+    through :func:`load_precomputed_latents`, which checks it against ``meta`` and this
+    dataset, and the dataset is switched to ``mode="diff"``.
     """
-    cache_file = _cache_path(dataset, dataset.split, ae_tag)
-    if cache_file.exists() and not overwrite:
-        with open(cache_file, "rb") as f:
-            dataset.precomputed_latents = pickle.load(f)
-        dataset.mode = "diff"
-        _compute_latent_stats(dataset)
-        return
+    import jax
 
+    cache_file = Path(cache_file)
+    if (overwrite or not cache_file.exists()) and jax.process_index() == 0:
+        latents_dict = _encode_all(dataset, encode_fn, batch_size)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_file.with_name(cache_file.name + f".tmp{os.getpid()}")
+        with open(tmp, "wb") as f:
+            pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        if meta is not None:
+            write_cache_meta(cache_file, meta)
+        os.replace(tmp, cache_file)
+    _barrier(f"latents:{cache_file.name}")
+    load_precomputed_latents(dataset, cache_file, latent_shape=latent_shape, meta=meta)
+
+
+def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
     latents_dict: dict[tuple[int, int], dict] = {}
     n = len(dataset)
-    indices = list(range(n))
-    pbar = _tqdm(range(0, n, batch_size), desc=f"precompute {dataset.split} latents")
-    for start in pbar:
-        sl = indices[start : start + batch_size]
-        # gather a batch from the (currently mode='ae') dataset
-        samples = [dataset[i] for i in sl]
-        df_batch = jnp.stack([jnp.asarray(s.df) for s in samples])
+    for start in _tqdm(range(0, n, batch_size), desc=f"precompute {dataset.split} latents"):
+        samples = [dataset[i] for i in range(start, min(start + batch_size, n))]
+        # pad the tail so the encoder sees one batch shape
+        padded = samples + [samples[-1]] * (batch_size - len(samples))
+        df_batch = jnp.stack([jnp.asarray(s.df) for s in padded])
         cond_batch = None
         if samples[0].conditioning is not None:
-            cond_batch = jnp.stack([jnp.asarray(s.conditioning) for s in samples])
-        z = encode_fn(df_batch, cond_batch)
-        z_np = np.asarray(z)
-        for i, s in zip(sl, samples):
-            fid = int(s.file_index)
-            t_idx = int(s.timestep_index)
-            latents_dict[(fid, t_idx)] = {
-                "x": z_np[sl.index(i)],
-                "flux": np.asarray(s.flux),
-                "timestep": np.asarray(s.timestep),
+            cond_batch = jnp.stack([jnp.asarray(s.conditioning) for s in padded])
+        z_np = np.asarray(encode_fn(df_batch, cond_batch))
+        for b, s in enumerate(samples):
+            entry = {
+                "x": z_np[b],
                 "phi": np.asarray(s.phi) if s.phi is not None else None,
-                "conditioning": np.asarray(s.conditioning) if s.conditioning is not None else None,
+                "flux": np.asarray(s.flux, dtype=np.float32),
+                "timestep": np.asarray(s.timestep, dtype=np.float32),
             }
+            if s.conditioning is not None:
+                cond = np.asarray(s.conditioning, dtype=np.float32)
+                for k, name in enumerate(dataset.conditions):
+                    entry[name] = cond[k]
+            latents_dict[(int(s.file_index), int(s.timestep_index))] = entry
+    return latents_dict
 
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_file, "wb") as f:
-        pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
-    dataset.precomputed_latents = latents_dict
-    dataset.mode = "diff"
-    _compute_latent_stats(dataset)
+
+def latent_arrays(dataset) -> tuple[np.ndarray, np.ndarray | None]:
+    """Latents ``(N, *latent_shape)`` and conditioning ``(N, n_cond)`` in flat-index order."""
+    n = len(dataset)
+    keys = [dataset.flat_index_to_file_and_tstep[i] for i in range(n)]
+    z = np.stack([np.asarray(dataset.precomputed_latents[k]["x"], np.float32) for k in keys])
+    if not dataset.conditions:
+        return z, None
+    return z, np.stack([np.asarray(dataset[i].conditioning, np.float32) for i in range(n)])
 
 
 def load_precomputed_latents(
-    dataset, pickle_path: str | Path, *, verify: bool = True, remap: bool = True,
+    dataset,
+    pickle_path: str | Path,
+    *,
+    remap: bool = True,
     latent_shape=None,
+    meta: Optional[dict] = None,
 ) -> None:
-    """Populate ``dataset.precomputed_latents`` from a pre-existing pickle.
+    """Populate ``dataset.precomputed_latents`` from a cache pickle and switch to ``mode="diff"``.
 
-    Bypasses the ``encode_fn`` path in :func:`precompute_latents` when the
-    cache has been computed externally. The pickle is expected to be
-    ``dict[(file_idx, t_idx), dict]`` with the same per-entry schema
-    written by :func:`precompute_latents` — at minimum ``x``, ``flux``,
-    ``timestep``; optionally ``phi`` and the scalar conditioning fields.
-
-    ``verify`` cross-checks the cache against this dataset: every indexed
-    ``(fid, t_idx)`` must be present, and where the cache carries the scalar
-    conditions they must agree with the trajectory metadata — a foreign cache
-    whose file ordering differs would otherwise pair latents with the wrong
-    trajectory silently. ``latent_shape``, when given, is checked too. ``remap``
-    then re-keys such a cache onto this dataset's fids (see
-    :func:`remap_latent_cache`) instead of failing.
+    The pickle is ``dict[(file_idx, t_idx), dict]`` with the per-entry schema written by
+    :func:`precompute_latents` (at minimum ``x``, ``flux``, ``timestep``; optionally ``phi``
+    and the scalar conditions). With ``meta`` the ``<cache>.meta.json`` sidecar must match
+    (see :func:`check_cache_meta`). The cache is verified against this dataset: every
+    indexed ``(fid, t_idx)`` must be present, the scalar conditions it carries must agree
+    with the trajectory metadata and the latents must have ``latent_shape`` when given.
+    With ``remap`` a cache keyed by a different file ordering is re-keyed onto this
+    dataset's fids (see :func:`remap_latent_cache`) instead of failing.
     """
     p = Path(pickle_path)
     if not p.exists():
         raise FileNotFoundError(p)
+    check_cache_meta(p, meta)
     with open(p, "rb") as f:
         cache = pickle.load(f)
-    if verify:
-        try:
-            verify_latent_cache(dataset, cache, latent_shape=latent_shape)
-        except ValueError:
-            if not remap:
-                raise
-            cache = remap_latent_cache(dataset, cache)
-            verify_latent_cache(dataset, cache, latent_shape=latent_shape)
+    try:
+        verify_latent_cache(dataset, cache)
+    except ValueError:
+        if not remap:
+            raise
+        cache = remap_latent_cache(dataset, cache)
+    verify_latent_cache(dataset, cache, latent_shape=latent_shape)
     dataset.precomputed_latents = cache
     dataset.mode = "diff"
     _compute_latent_stats(dataset)
@@ -142,6 +238,7 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     unique on both sides; the per-entry ``timestep`` is then checked against the
     trajectory metadata so a wrong pairing cannot slip through.
     """
+
     def _tuple_of(get):
         return np.array([float(np.squeeze(get(k))) for k in ("itg", "dg", "s_hat", "q")])
 
@@ -149,8 +246,10 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     for fid, meta in dataset.metadata.items():
         key = tuple(np.round(_tuple_of(lambda k: meta[_COND_ALIASES[k]]), 6))
         if key in ours:
-            raise ValueError(f"trajectories {ours[key]} and {fid} share conditions {key}; "
-                             "cannot remap the cache by conditions")
+            raise ValueError(
+                f"trajectories {ours[key]} and {fid} share conditions {key}; "
+                "cannot remap the cache by conditions"
+            )
         ours[key] = fid
     keys = np.array(list(ours))
     fids = list(ours.values())
@@ -165,8 +264,10 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
         d = np.abs(keys - _tuple_of(lambda k: entry[k])).max(axis=1)
         j = int(np.argmin(d))
         if d[j] > tol:
-            raise ValueError(f"cache trajectory {cfid} matches no dataset trajectory "
-                             f"(closest distance {d[j]:.3g})")
+            raise ValueError(
+                f"cache trajectory {cfid} matches no dataset trajectory "
+                f"(closest distance {d[j]:.3g})"
+            )
         mapping[cfid] = fids[j]
     if len(set(mapping.values())) != len(mapping):
         raise ValueError("cache -> dataset trajectory matching is not bijective")
@@ -199,7 +300,9 @@ def verify_latent_cache(dataset, cache: dict, *, latent_shape=None) -> None:
     any_key = next(iter(wanted))
     x = cache[any_key]["x"]
     if latent_shape is not None and tuple(x.shape) != tuple(latent_shape):
-        raise ValueError(f"latent cache shape {tuple(x.shape)} != model latent {tuple(latent_shape)}")
+        raise ValueError(
+            f"latent cache shape {tuple(x.shape)} != model latent {tuple(latent_shape)}"
+        )
     # the scalar conditions pin the fid -> trajectory mapping
     aliases = _COND_ALIASES
     bad = []

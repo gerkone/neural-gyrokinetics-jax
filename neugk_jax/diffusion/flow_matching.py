@@ -48,12 +48,13 @@ def minibatch_ot(x0: jnp.ndarray, x1: jnp.ndarray) -> jnp.ndarray:
     x0_flat = x0.reshape(bs, -1)
     x1_flat = x1.reshape(bs, -1)
     # ||a-b||^2 = |a|^2 + |b|^2 - 2a.b: one gemm, no (B, B, D) intermediate
-    sq0 = jnp.sum(x0_flat ** 2, axis=-1)
-    sq1 = jnp.sum(x1_flat ** 2, axis=-1)
+    sq0 = jnp.sum(x0_flat**2, axis=-1)
+    sq1 = jnp.sum(x1_flat**2, axis=-1)
     cost = jnp.sqrt(jnp.maximum(sq0[:, None] + sq1[None, :] - 2.0 * (x0_flat @ x1_flat.T), 0.0))
 
     def _assign(cost_np):
         import scipy.optimize
+
         _, col = scipy.optimize.linear_sum_assignment(np.asarray(cost_np))
         return np.argsort(col).astype(np.int32)
 
@@ -69,51 +70,35 @@ def fm_forward_loss(
     key,
     latent_scale: float = 1.0,
     use_ot: bool = True,
-    pair_fn: Optional[Callable] = None,
-    loss_mask: Optional[jnp.ndarray] = None,
-    aux_loss_fn: Optional[Callable] = None,
-    time_fn: Optional[Callable] = None,
+    dropout_key=None,
+    mask: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """One flow-matching training step (returns the scalar loss).
 
     ``model_fn(xt, t_scalar, cond_per_sample)`` is the *per-sample* DiT
-    forward — caller vmaps the model over the batch.
-
-    Optional hooks (all default off — the latent path is unchanged):
-
-    * ``pair_fn(key, x0, x1) -> x0`` — per-sample set coupling (e.g. within-set
-      atom matching for splat banks); replaces ``minibatch_ot`` when set.
-    * ``loss_mask`` — broadcastable to ``x1``; masks dead channels (weighted mean).
-    * ``aux_loss_fn(x1_hat, x1, t) -> scalar`` — auxiliary loss on the predicted
-      clean sample ``x1_hat = xt + (1 - t)·v̂`` (e.g. a differentiable render loss).
-    * ``time_fn(key, batch) -> t`` — replaces the sigmoid-normal time sampler
-      (e.g. a heavy tail near t=1 for targets whose fine structure only exists
-      in a thin neighborhood of the data).
+    forward — caller vmaps the model over the batch. With ``dropout_key`` it is called as
+    ``model_fn(xt, t, cond, key)`` with one key per sample. ``mask`` (``(B,)``) averages
+    the loss over the rows it marks.
     """
     bs = latents.shape[0]
-    k_prior, k_t, k_pair = jr.split(key, 3)
+    k_prior, k_t = jr.split(key, 2)
     x1 = latents * latent_scale
     x0 = sample_prior(k_prior, x1.shape, dtype=x1.dtype)
-    if pair_fn is not None:
-        x0 = pair_fn(k_pair, x0, x1)
-    elif use_ot:
+    if use_ot:
         x0 = minibatch_ot(x0, x1)
-    t = time_fn(k_t, bs) if time_fn is not None else sample_time(k_t, bs, dtype=x1.dtype)
+    t = sample_time(k_t, bs, dtype=x1.dtype)
     t_b = t.reshape(-1, *[1] * (x1.ndim - 1))
     xt = t_b * x1 + (1.0 - t_b) * x0
     target_v = x1 - x0
     # vmap over the batch — model_fn is per-sample
-    pred = jax.vmap(model_fn)(xt, t, cond) if cond is not None else jax.vmap(model_fn)(xt, t)
-    err = (pred - target_v) ** 2
-    if loss_mask is None:
-        loss = jnp.mean(err)
-    else:
-        w = jnp.broadcast_to(loss_mask, err.shape)
-        loss = jnp.sum(err * w) / jnp.maximum(jnp.sum(w), 1.0)
-    if aux_loss_fn is not None:
-        x1_hat = xt + (1.0 - t_b) * pred
-        loss = loss + aux_loss_fn(x1_hat, x1, t)
-    return loss
+    args = (xt, t) if cond is None else (xt, t, cond)
+    if dropout_key is not None:
+        args = (*args, jr.split(dropout_key, bs))
+    pred = jax.vmap(model_fn)(*args)
+    if mask is None:
+        return jnp.mean((pred - target_v) ** 2)
+    per_sample = jnp.mean(((pred - target_v) ** 2).reshape(bs, -1), axis=-1)
+    return jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
 
 def _euler_step(velocity, x, ti, dti):
@@ -158,8 +143,6 @@ def euler_sample(
     steps: int = 10,
     latent_scale: float = 1.0,
     dtype=jnp.float32,
-    prior_fn: Optional[Callable] = None,
-    time_warp: float = 1.0,
     method: str = "euler",
 ) -> jnp.ndarray:
     """Integrate the velocity field over ``[0, 1]``.
@@ -173,18 +156,17 @@ def euler_sample(
     ``latent_scale`` at the end to undo the encoder's whitening).
     """
     bs = shape[0]
-    # prior_fn overrides the gaussian source (e.g. structured/tied noise)
-    x0 = prior_fn(key, shape) if prior_fn is not None else sample_prior(key, shape, dtype=dtype)
-    # time_warp > 1 concentrates integration steps near t=1 (t = 1 - (1-u)^p)
-    u = jnp.linspace(0.0, 1.0, steps + 1, dtype=dtype)
-    t_grid = 1.0 - (1.0 - u) ** time_warp if time_warp != 1.0 else u
+    x0 = sample_prior(key, shape, dtype=dtype)
+    t_grid = jnp.linspace(0.0, 1.0, steps + 1, dtype=dtype)
     dts = t_grid[1:] - t_grid[:-1]
     ts = t_grid[:-1]
 
     if cond is not None:
+
         def velocity(x, ti):
             return jax.vmap(model_fn)(x, jnp.full((bs,), ti, dtype=dtype), cond)
     else:
+
         def velocity(x, ti):
             return jax.vmap(model_fn)(x, jnp.full((bs,), ti, dtype=dtype))
 
@@ -196,4 +178,3 @@ def euler_sample(
 
     x, _ = jax.lax.scan(step, x0, (ts, dts))
     return x / latent_scale
-

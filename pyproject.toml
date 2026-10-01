@@ -30,7 +30,8 @@ dependencies = [
 cuda = ["jax[cuda12]"]
 gyro = ["gyaradax @ git+https://github.com/gerkone/gyaradax.git@master"]
 io = ["cupy-cuda12x", "kvikio-cu12"]
-dev = ["pytest>=7", "pytest-xdist", "ruff>=0.5"]
+h5 = ["h5py>=3"]   # H5Backend (single-file .h5 trajectories)
+dev = ["pytest>=7", "pytest-xdist", "ruff>=0.5", "h5py>=3", "huggingface_hub>=0.20"]
 
 [tool.setuptools.packages.find]
 include = ["neugk_jax*"]
@@ -38,7 +39,7 @@ include = ["neugk_jax*"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-extend-exclude = ["notebooks"]
+extend-exclude = ["scripts/local", "tests/local"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

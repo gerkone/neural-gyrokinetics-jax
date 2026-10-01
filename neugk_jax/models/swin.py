@@ -12,7 +12,7 @@ import numpy as np
 
 from neugk_jax.models.attention import MultiHeadSelfAttention
 from neugk_jax.models.patching import pad_to_blocks, unpad
-from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, Linear, RMSNorm, gelu
+from neugk_jax.models.utils import MLP, DiTModulation, Linear, gelu, make_norm
 
 
 def _prod(xs):
@@ -102,7 +102,7 @@ def _build_shift_mask(
         for i, (lo, hi) in enumerate(slices):
             idx = [slice(None)] * len(padded)
             idx[axis] = slice(lo, hi)
-            region[tuple(idx)] += i * (10 ** axis)
+            region[tuple(idx)] += i * (10**axis)
     region = jnp.asarray(region)[..., None]  # (*padded, 1)
     win = window_partition(region, window_size)  # (n_win, W, 1)
     win = win[..., 0]
@@ -118,7 +118,7 @@ class _DropPath(eqx.Module):
     def __init__(self, rate: float = 0.0):
         self.rate = rate
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
         if inference or self.rate == 0.0 or key is None:
             return x
         keep = 1.0 - self.rate
@@ -138,6 +138,7 @@ class SwinBlock(eqx.Module):
     window_size: tuple[int, ...] = eqx.field(static=True)
     shift_size: tuple[int, ...] = eqx.field(static=True)
     attn_mask: Optional[jax.Array]
+    buffer_fields = ("attn_mask",)
     legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
@@ -173,13 +174,17 @@ class SwinBlock(eqx.Module):
         self.window_size = eff_w
         self.shift_size = shift_size
 
-        self.norm1 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
-        self.norm2 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
+        self.norm1 = make_norm(dim, rms=rms_norm, affine=norm_affine)
+        self.norm2 = make_norm(dim, rms=rms_norm, affine=norm_affine)
         katt, kmlp = jr.split(key, 2)
         self.attn = MultiHeadSelfAttention(
-            dim, num_heads, key=katt,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention,
+            dim,
+            num_heads,
+            key=katt,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            use_rpb=use_rpb,
+            gated_attention=gated_attention,
             window_size=eff_w,
         )
         hidden = max(int(dim * mlp_ratio), dim)
@@ -188,7 +193,7 @@ class SwinBlock(eqx.Module):
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
         """SwinV2 post-norm forward (single residual).
 
         ``forward_part1`` runs attention on the un-normed input and applies
@@ -205,17 +210,19 @@ class SwinBlock(eqx.Module):
         h, pads = pad_to_blocks(x, self.window_size)
         padded_spatial = h.shape[:-1]
         if any(s > 0 for s in self.shift_size):
-            h = jnp.roll(h, shift=[-s for s in self.shift_size],
-                         axis=list(range(len(padded_spatial))))
+            h = jnp.roll(
+                h, shift=[-s for s in self.shift_size], axis=list(range(len(padded_spatial)))
+            )
         windows = window_partition(h, self.window_size)  # (n_win, W, dim) per block
         if self.attn_mask is not None:
-            windows = jax.vmap(lambda w, m: self.attn(w, attn_bias=m[None]))(windows, self.attn_mask)
+            windows = jax.vmap(lambda w, m: self.attn(w, attn_bias=m[None]))(
+                windows, self.attn_mask
+            )
         else:
             windows = jax.vmap(lambda w: self.attn(w))(windows)
         h = window_reverse(windows, self.window_size, padded_spatial)
         if any(s > 0 for s in self.shift_size):
-            h = jnp.roll(h, shift=list(self.shift_size),
-                         axis=list(range(len(padded_spatial))))
+            h = jnp.roll(h, shift=list(self.shift_size), axis=list(range(len(padded_spatial))))
         h = unpad(h, pads, spatial)
         h = self.norm1(h)  # post-norm per SwinV2 convention
 
@@ -242,6 +249,7 @@ class DiTSwinBlock(eqx.Module):
     window_size: tuple[int, ...] = eqx.field(static=True)
     shift_size: tuple[int, ...] = eqx.field(static=True)
     attn_mask: Optional[jax.Array]
+    buffer_fields = ("attn_mask",)
     legacy_double_shortcut: bool = eqx.field(static=True)
 
     def __init__(
@@ -274,14 +282,19 @@ class DiTSwinBlock(eqx.Module):
         self.window_size = eff_w
         self.shift_size = shift_size
 
-        # DiT modulation provides scale/shift, so the norm is non-affine; norm type follows the model (rmsnorm for cold/warm)
-        _Norm = RMSNorm if rms_norm else LayerNorm
-        self.norm1 = _Norm(dim, elementwise_affine=False)
-        self.norm2 = _Norm(dim, elementwise_affine=False)
+        # dit modulation provides scale/shift, so the norm is non-affine
+        self.norm1 = make_norm(dim, rms=rms_norm, affine=False)
+        self.norm2 = make_norm(dim, rms=rms_norm, affine=False)
         katt, kmlp, kmod = jr.split(key, 3)
         self.attn = MultiHeadSelfAttention(
-            dim, num_heads, key=katt, qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention, window_size=eff_w,
+            dim,
+            num_heads,
+            key=katt,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            use_rpb=use_rpb,
+            gated_attention=gated_attention,
+            window_size=eff_w,
         )
         hidden = max(int(dim * mlp_ratio), dim)
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
@@ -290,10 +303,13 @@ class DiTSwinBlock(eqx.Module):
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=False) -> jnp.ndarray:
+    def __call__(
+        self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=True
+    ) -> jnp.ndarray:
         spatial = x.shape[:-1]
         # order: (scale1, shift1, gate1, scale2, shift2, gate2) from DiTModulation
         scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = self.mod(cond)
+
         def _bc(t):
             for _ in range(len(spatial)):
                 t = t[None, ...]
@@ -309,17 +325,19 @@ class DiTSwinBlock(eqx.Module):
         padded_spatial = h.shape[:-1]
 
         if any(s > 0 for s in self.shift_size):
-            h = jnp.roll(h, shift=[-s for s in self.shift_size],
-                         axis=list(range(len(padded_spatial))))
+            h = jnp.roll(
+                h, shift=[-s for s in self.shift_size], axis=list(range(len(padded_spatial)))
+            )
         windows = window_partition(h, self.window_size)
         if self.attn_mask is not None:
-            windows = jax.vmap(lambda w, m: self.attn(w, attn_bias=m[None]))(windows, self.attn_mask)
+            windows = jax.vmap(lambda w, m: self.attn(w, attn_bias=m[None]))(
+                windows, self.attn_mask
+            )
         else:
             windows = jax.vmap(lambda w: self.attn(w))(windows)
         h = window_reverse(windows, self.window_size, padded_spatial)
         if any(s > 0 for s in self.shift_size):
-            h = jnp.roll(h, shift=list(self.shift_size),
-                         axis=list(range(len(padded_spatial))))
+            h = jnp.roll(h, shift=list(self.shift_size), axis=list(range(len(padded_spatial))))
         h = unpad(h, pads, spatial)
 
         key1, key2 = (None, None) if key is None else jr.split(key, 2)
@@ -340,7 +358,6 @@ class SwinLayer(eqx.Module):
     mlp_ratio: float = eqx.field(static=True)
     drop_path: float = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
-    norm_layer: type = eqx.field(static=True)
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -356,7 +373,6 @@ class SwinLayer(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
-        norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = False,
@@ -365,7 +381,6 @@ class SwinLayer(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         keys = jr.split(key, depth)
         self.blocks = [
@@ -395,10 +410,9 @@ class SwinLayer(eqx.Module):
         self.mlp_ratio = mlp_ratio
         self.drop_path = drop_path
         self.use_checkpoint = use_checkpoint
-        self.norm_layer = norm_layer
         self.act_fn = act_fn
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = False, **_) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
             call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
@@ -416,7 +430,6 @@ class DiTSwinLayer(eqx.Module):
     mlp_ratio: float = eqx.field(static=True)
     drop_path: float = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
-    norm_layer: type = eqx.field(static=True)
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -433,7 +446,6 @@ class DiTSwinLayer(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
-        norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = False,
@@ -441,7 +453,6 @@ class DiTSwinLayer(eqx.Module):
         gated_attention: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         keys = jr.split(key, depth)
         self.blocks = [
@@ -471,10 +482,9 @@ class DiTSwinLayer(eqx.Module):
         self.mlp_ratio = mlp_ratio
         self.drop_path = drop_path
         self.use_checkpoint = use_checkpoint
-        self.norm_layer = norm_layer
         self.act_fn = act_fn
 
-    def __call__(self, x, condition, *, key=None, inference=False, **_):
+    def __call__(self, x, condition, *, key=None, inference=True):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, k in zip(self.blocks, keys):
             call = blk if not self.use_checkpoint else eqx.filter_checkpoint(blk)
@@ -539,17 +549,26 @@ class FilmSwinLayer(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         bkeys = jr.split(key, depth)
         fkeys = jr.split(jr.fold_in(key, 1), depth)
         self.blocks = [
             SwinBlock(
-                dim, num_heads, grid_size, window_size, key=bkeys[i],
-                shift=bool(i % 2), mlp_ratio=mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                dim,
+                num_heads,
+                grid_size,
+                window_size,
+                key=bkeys[i],
+                shift=bool(i % 2),
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
@@ -558,7 +577,7 @@ class FilmSwinLayer(eqx.Module):
         self.dim = dim
         self.use_checkpoint = use_checkpoint
 
-    def __call__(self, x, condition, *, key=None, inference=False, **_):
+    def __call__(self, x, condition, *, key=None, inference=True):
         keys = jr.split(key, len(self.blocks)) if key is not None else [None] * len(self.blocks)
         for blk, film, k in zip(self.blocks, self.conditioning, keys):
             x = film(x, condition)

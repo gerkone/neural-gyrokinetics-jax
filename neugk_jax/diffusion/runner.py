@@ -1,244 +1,267 @@
-"""Latent flow-matching training pipeline.
+"""Latent flow-matching runner.
 
-Loads a translated/trained AE (frozen), precomputes latents over the
-training set, then trains a DiT on Gaussian → latent flow matching.
+Reuses the AE dataset setup, loads a trained AE (frozen), caches its latents over both
+splits, keeps the latent tables on device and trains a DiT on Gaussian -> latent flow
+matching with the batch latents gathered inside the step.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
+from omegaconf import open_dict
 
-from neugk_jax.dataset import CycloneDataset, KvikIOBackend, NumpyBackend, precompute_latents
-from neugk_jax.diffusion.dit import DiT
-from neugk_jax.diffusion.flow_matching import (
-    euler_sample,
-    fm_forward_loss,
+from neugk_jax.autoencoders.runner import AERunner
+from neugk_jax.dataset import precompute_latents
+from neugk_jax.diffusion.flow_matching import fm_forward_loss
+from neugk_jax.diffusion.latents import (
+    latent_arrays,
+    latent_cache_meta,
+    latent_cache_path,
+    load_precomputed_latents,
 )
-from neugk_jax.diffusion.latents import load_precomputed_latents
-from neugk_jax.training.runner import BaseRunner, build_optimizer
-from neugk_jax.training.schedulers import warmup_cosine
-from neugk_jax.translate import force_f32
+from neugk_jax.training.build import build_dit
+from neugk_jax.training.ddp import local_view, replicate_local
+from neugk_jax.training.runner import conditioning_slots
+from neugk_jax.utils import config_dict, count_trace
 
 
-class FlowMatchingRunner(BaseRunner):
-    """Trains a DiT to model the latent distribution via flow matching."""
+def resolve_ae_checkpoint(path) -> Path:
+    """AE checkpoint file for a run directory (``best.eqx``, else ``best.pth``) or a file path."""
+    p = Path(path)
+    if p.is_dir():
+        for name in ("best.eqx", "best.pth"):
+            if (p / name).exists():
+                return p / name
+        raise FileNotFoundError(f"no best.eqx / best.pth in {p}")
+    return p
 
-    dataset_cls = CycloneDataset
 
-    def _dataset_kwargs(self) -> dict:
-        return {}
+def _same_path(a, b) -> bool:
+    return Path(a).resolve() == Path(b).resolve()
+
+
+def check_ae_dataset(ae_dataset: dict, dataset: dict) -> None:
+    """Raise unless ``dataset`` preprocesses df as the AE run's saved ``ae_dataset`` section.
+
+    Compares ``separate_zf``, ``offset``, the ``normalization`` of every field normalized in
+    ``dataset`` and the resolved ``normalization_stats`` paths; warns when only one side
+    sets ``normalization_stats``.
+    """
+    import warnings
+
+    bad = []
+    for k, default in (("separate_zf", False), ("offset", 0)):
+        a, b = ae_dataset.get(k, default), dataset.get(k, default)
+        if a != b:
+            bad.append((k, a, b))
+    ae_norm = ae_dataset.get("normalization") or {}
+    for field, spec in (dataset.get("normalization") or {}).items():
+        if ae_norm.get(field) != spec:
+            bad.append((f"normalization.{field}", ae_norm.get(field), spec))
+    a, b = ae_dataset.get("normalization_stats"), dataset.get("normalization_stats")
+    if isinstance(a, str) and isinstance(b, str):
+        if not _same_path(a, b):
+            bad.append(("normalization_stats", a, b))
+    elif (a is None) != (b is None):
+        warnings.warn(
+            f"ae normalization_stats={a!r}, diffusion normalization_stats={b!r}: "
+            "cannot check that both normalize df with the same statistics"
+        )
+    if bad:
+        lines = "\n".join(f"  dataset.{k}: ae={a!r} diffusion={b!r}" for k, a, b in bad)
+        raise ValueError(f"diffusion dataset does not match the AE run's dataset:\n{lines}")
+
+
+def load_autoencoder(path, *, resolution=None, dataset: dict | None = None):
+    """AE of a run directory or checkpoint file; ``dataset`` is checked against the run's."""
+    from neugk_jax.translate import build_ae_from_config, load_config, load_or_translate
+
+    ae_file = resolve_ae_checkpoint(path)
+    ae_cfg = load_config(str(ae_file.parent / "config.yaml"))
+    if dataset is not None:
+        check_ae_dataset(ae_cfg.get("dataset") or {}, dataset)
+    template = build_ae_from_config(ae_cfg, key=jr.PRNGKey(0), resolution=resolution)
+    return load_or_translate(template, str(ae_file))
+
+
+@eqx.filter_jit
+def encode_batch(ae, df):
+    return jax.vmap(lambda x: ae.encode(x)[0])(df)
+
+
+def _fm_loss(model, z, cond, key, *, latent_scale, use_ot, train: bool, mask=None):
+    fm_key, drop_key = jr.split(key)
+
+    def fwd(x, t, *rest):
+        c = rest[0] if cond is not None else None
+        k = rest[-1] if train else None
+        return model(x, t, c, key=k, inference=not train)
+
+    return fm_forward_loss(
+        fwd,
+        z,
+        cond,
+        key=fm_key,
+        latent_scale=latent_scale,
+        use_ot=use_ot,
+        dropout_key=drop_key if train else None,
+        mask=mask,
+    )
+
+
+@eqx.filter_jit
+def fm_val_loss(model, latents, cond, idx, mask, key, latent_scale: float, use_ot: bool):
+    count_trace("fm_val_loss")
+    c = None if cond is None else cond[idx]
+    return _fm_loss(
+        model,
+        latents[idx],
+        c,
+        key,
+        latent_scale=latent_scale,
+        use_ot=use_ot,
+        train=False,
+        mask=mask,
+    )
+
+
+class FlowMatchingRunner(AERunner):
+    """Trains a DiT on the latent distribution of a frozen AE via flow matching."""
+
+    val_metrics = ("avg_flux_rmse", "fm_loss")
+    decoupled_wd = True
+    conditioned = True
+
+    def train_dtype(self):
+        return None
 
     def setup_data(self) -> None:
         cfg = self.cfg
-        # conditioning is gyroswin-specific; latent diffusion stays unconditional
-        if cfg.model.get("conditioning") not in (None, [], ()):
-            raise ValueError(
-                "`model.conditioning` is set but the diffusion workflow does not accept "
-                "scalar conditioning at the model level. Drop it from the config or "
-                "switch to workflow=gyroswin."
-            )
-        ae_path = cfg.ae_checkpoint
-        if ae_path is None:
+        if cfg.get("ae_checkpoint") is None:
             raise ValueError("diffusion workflow requires ae_checkpoint")
-        # build the ae template + load translated weights
-        from neugk_jax.translate import build_ae_from_config, load_or_translate
-        ae_cfg = Path(ae_path).parent / "config.yaml"
-        ae_template = build_ae_from_config(str(ae_cfg), key=jr.PRNGKey(0))
-        # .eqx loads directly; a torch .pth is translated on the fly
-        self.ae = load_or_translate(ae_template, ae_path)
-
-        backend = (
-            KvikIOBackend(rank=self.dist.process_id)
-            if cfg.dataset.get("backend", "numpy") == "kvikio"
-            else NumpyBackend()
+        super().setup_data()
+        dcfg = config_dict(cfg.dataset)
+        self.ae = load_autoencoder(
+            cfg.ae_checkpoint, resolution=self.train_ds.resolution, dataset=dcfg
         )
-        common = dict(
-            path=cfg.dataset.path,
-            fields_to_load=tuple(cfg.dataset.get("input_fields", ("df",))),
-            conditions=tuple(cfg.dataset.get("conditions", ("itg", "dg", "s_hat", "q"))),
-            mode="ae",
-            backend=backend,
-            separate_zf=cfg.dataset.get("separate_zf", False),
-            normalization=cfg.dataset.get("normalization"),
-            normalization_scope=cfg.dataset.get("normalization_scope", "dataset"),
-            normalization_stats=cfg.dataset.get("normalization_stats"),
-            offset=cfg.dataset.get("offset", 0),
-            lightweight_metadata=cfg.dataset.get("lightweight_metadata", False),
-        )
-        extra = self._dataset_kwargs()
-        # the cond filters fix the file list, hence the fid ordering a latent cache uses
-        self.train_ds = self.dataset_cls(
-            split="train",
-            trajectories=cfg.dataset.training_trajectories,
-            cond_filters=self._omegaconf_to_dict(cfg.dataset.get("training_cond_filters")),
-            **common,
-            **extra,
-        )
-        self.val_ds = self.dataset_cls(
-            split="val",
-            trajectories=cfg.dataset.validation_trajectories,
-            cond_filters=self._omegaconf_to_dict(cfg.dataset.get("eval_cond_filters")),
-            **common,
-            **extra,
-        )
-
-        # encode every sample once so training is just mse on cached latents
-        def encode_fn(df_batch, cond_batch):
-            return jax.vmap(lambda x: self.ae.encode(x)[0])(df_batch)
-
-        ae_tag = Path(ae_path).stem
-        latent_shape = (*self.ae.bottleneck_grid_size, int(self.ae.bottleneck_dim))
+        self.latent_shape = (*self.ae.bottleneck_grid_size, int(self.ae.bottleneck_dim))
+        ae_file = resolve_ae_checkpoint(cfg.ae_checkpoint)
         for ds, key in ((self.train_ds, "latents_cache_train"), (self.val_ds, "latents_cache_val")):
-            path = cfg.dataset.get(key)
+            meta = latent_cache_meta(
+                ds, ae_file, normalization_stats=dcfg.get("normalization_stats")
+            )
+            path = dcfg.get(key)
             if path:
-                load_precomputed_latents(ds, path, latent_shape=latent_shape)
-                if self.dist.is_rank0:
-                    print(f"loaded {len(ds.precomputed_latents)} {ds.split} latents from {path}")
+                load_precomputed_latents(ds, path, latent_shape=self.latent_shape, meta=meta)
             else:
-                precompute_latents(ds, encode_fn=encode_fn, ae_tag=ae_tag,
-                                   batch_size=cfg.training.get("precompute_batch", 2))
-
-        # 1 / sqrt(mean variance)
-        var = self.train_ds.latent_stats.var
-        self.latent_scale = float(1.0 / np.sqrt(max(float(np.mean(var)), 1e-12)))
+                cache = latent_cache_path(
+                    ds,
+                    ds.split,
+                    cfg.ae_checkpoint,
+                    decouple_mu=dcfg.get("norm_decouple_mu", False),
+                    timestep_std_filter=dcfg.get("timestep_std_filter"),
+                )
+                precompute_latents(
+                    ds,
+                    encode_fn=lambda df, _c: encode_batch(self.ae, df),
+                    cache_file=cache,
+                    batch_size=self.tcfg.get("precompute_batch", 2),
+                    meta=meta,
+                    latent_shape=self.latent_shape,
+                )
+        # df-mode view of the val split for sample targets
+        self.val_df_ds = self.val_ds.with_mode("ae")
+        self.cond_slots = conditioning_slots(
+            self.train_ds.conditions, list(cfg.model.get("conditioning") or [])
+        )
+        if cfg.get("latent_scale") is not None:
+            self.latent_scale = float(cfg.latent_scale)
+        else:
+            var = float(np.mean(self.train_ds.latent_stats.var))
+            self.latent_scale = float(1.0 / np.sqrt(max(var, 1e-12)))
+            with open_dict(cfg):
+                cfg.latent_scale = self.latent_scale
+        self.use_ot = bool(cfg.model.get("minibatch_ot", True))
         if self.dist.is_rank0:
             print(f"latent_scale = {self.latent_scale:.4f}")
 
-    def setup_components(self) -> None:
-        cfg = self.cfg
-        mcfg = cfg.model
-        key = jr.PRNGKey(getattr(cfg, "seed", 0))
-        grid = tuple(self.ae.bottleneck_grid_size)
-        z_dim = int(self.ae.bottleneck_dim)
-        self.latent_shape = (*grid, z_dim)
-        self.model = DiT(
-            space=len(grid),
-            z_dim=z_dim,
-            dim=mcfg.get("latent_dim", 512),
-            grid_size=grid,
-            depth=mcfg.vit.get("depth", 4),
-            num_heads=mcfg.vit.get("num_heads", 8),
-            n_cond=len(cfg.dataset.get("conditions", [])),
-            key=key,
-            mlp_ratio=mcfg.vit.get("mlp_ratio", 4.0),
-            drop_path=mcfg.vit.get("drop_path", 0.0),
+    def checkpoint_meta(self) -> dict:
+        return {"latent_scale": self.latent_scale}
+
+    def build_model(self, key):
+        return build_dit(self.cfg, self.ae, key=key)
+
+    def _tables(self, ds) -> dict:
+        z, cond = latent_arrays(ds)
+        if self.cond_slots is None:
+            return {"latents": z, "cond": None}
+        return {"latents": z, "cond": cond[:, self.cond_slots]}
+
+    def step_context(self) -> dict:
+        return self._tables(self.train_ds)
+
+    def load_batch(self, ds, indices, read) -> dict:
+        return {"idx": np.asarray(indices, np.int32)}
+
+    def loss_fn(self, model, batch, key):
+        idx, cond = batch["idx"], batch["cond"]
+        loss = _fm_loss(
+            model,
+            batch["latents"][idx],
+            None if cond is None else cond[idx],
+            key,
+            latent_scale=self.latent_scale,
+            use_ot=self.use_ot,
+            train=True,
         )
-        self.model = force_f32(self.model)
-        steps_per_epoch = max(1, len(self.train_ds) // cfg.training.batch_size)
-        total = cfg.training.n_epochs * steps_per_epoch
-        self.schedule = warmup_cosine(
-            peak_lr=cfg.training.learning_rate,
-            total_steps=total,
-            steps_per_epoch=steps_per_epoch,
-            n_epochs=cfg.training.n_epochs,
-            min_lr=cfg.training.get("final_learning_rate", 1e-6),
+        return loss, {"fm_loss": loss}
+
+    def make_evaluator(self):
+        self.val_tables = replicate_local(self.dist, self._tables(self.val_ds))
+        if not (self.cfg.get("validation") or {}).get("eval_sampling", False):
+            return None
+        from neugk_jax.diffusion.eval import DiffusionEvaluator
+
+        vcfg = self.cfg.validation
+        return DiffusionEvaluator(
+            self.cfg,
+            val_ds=self.val_df_ds,
+            autoencoder=self.ae,
+            latent_scale=self.latent_scale,
+            cond_slots=self.cond_slots,
+            dist=self.dist,
+            loader=self.loader,
+            batch_size=vcfg.get("batch_size") or self.tcfg.batch_size,
         )
-        self.optimizer = build_optimizer(self.schedule, cfg.training, self.model, decoupled=True)
-        params, _ = eqx.partition(self.model, eqx.is_array)
-        self.opt_state = self.optimizer.init(params)
-        self.use_ot = bool(cfg.model.get("minibatch_ot", True))
 
-    @eqx.filter_jit
-    def _train_step(self, model, opt_state, latents, cond, key):
-        def loss_fn(m):
-            def fwd(x, t, c):
-                return m(x, t, c)
-            return fm_forward_loss(fwd, latents, cond, key=key,
-                                   latent_scale=self.latent_scale,
-                                   use_ot=self.use_ot)
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        params, static = eqx.partition(model, eqx.is_array)
-        g_params, _ = eqx.partition(grads, eqx.is_array)
-        updates, opt_state = self.optimizer.update(g_params, opt_state, params)
-        params = eqx.apply_updates(params, updates)
-        model = eqx.combine(params, static)
-        return model, opt_state, loss
-
-    def train_epoch(self, epoch: int, key) -> dict:
-        cfg = self.cfg
-        bs = cfg.training.batch_size
-        n = len(self.train_ds)
-        idx_key, key = jr.split(key)
-        idx = jr.permutation(idx_key, n)
-        losses = []
-        for start in range(0, n - bs + 1, bs):
-            samples = [self.train_ds[int(idx[i])] for i in range(start, start + bs)]
-            z = jnp.stack([jnp.asarray(s.df) for s in samples])
-            cond = (
-                jnp.stack([jnp.asarray(s.conditioning) for s in samples])
-                if samples[0].conditioning is not None
-                else None
+    def evaluate(self, epoch: int) -> tuple[dict, dict]:
+        bs, n = self.tcfg.batch_size, len(self.val_ds)
+        model = local_view(self.dist, self.model)
+        key = jr.fold_in(jr.PRNGKey(self.cfg.get("seed", 0)), n)
+        total = 0.0
+        for i, start in enumerate(range(0, n, bs)):
+            idx = np.arange(start, start + bs) % n
+            mask = (np.arange(start, start + bs) < n).astype(np.float32)
+            loss = fm_val_loss(
+                model,
+                self.val_tables["latents"],
+                self.val_tables["cond"],
+                jnp.asarray(idx, jnp.int32),
+                jnp.asarray(mask),
+                jr.fold_in(key, i),
+                self.latent_scale,
+                self.use_ot,
             )
-            step_key, key = jr.split(key)
-            self.model, self.opt_state, loss = self._train_step(
-                self.model, self.opt_state, z, cond, step_key,
-            )
-            losses.append(float(loss))
-        return {"loss": sum(losses) / max(len(losses), 1)}
-
-    def evaluate(self, epoch: int) -> dict:
-        from neugk_jax.evaluate import DiffusionEvaluator
-
-        def _sample(*, key, batch, cond=None, steps=50):
-            return self.sample(key=key, batch=batch, cond=cond, steps=steps)
-
-        # for cheap eval we also report the fm training-loss on the val set
-        cfg = self.cfg
-        bs = cfg.training.batch_size
-        n = min(len(self.val_ds), bs * 4)
-        losses = []
-        key = jr.PRNGKey(epoch)
-        for start in range(0, n - bs + 1, bs):
-            samples = [self.val_ds[i] for i in range(start, start + bs)]
-            z = jnp.stack([jnp.asarray(s.df) for s in samples])
-            cond = (
-                jnp.stack([jnp.asarray(s.conditioning) for s in samples])
-                if samples[0].conditioning is not None
-                else None
-            )
-            step_key, key = jr.split(key)
-            losses.append(float(fm_forward_loss(
-                lambda x, t, c: self.model(x, t, c),
-                z, cond, key=step_key,
-                latent_scale=self.latent_scale, use_ot=self.use_ot,
-            )))
-        out = {"fm_loss": sum(losses) / max(len(losses), 1)}
-
-        # sample-based eval — only when explicitly enabled (slow on cpu)
-        if cfg.validation.get("eval_sampling", False):
-            ev = DiffusionEvaluator(
-                cfg, val_ds=self.val_ds,
-                autoencoder=self.ae,
-                sample_fn=_sample,
-                is_rank0=self.dist.is_rank0,
-            )
-            metrics, val_plots = ev(
-                self.model, epoch=epoch,
-                batch_size=bs,
-                n_steps=cfg.validation.get("eval_sample_steps", 50),
-                n_samples_per_traj=cfg.validation.get("eval_n_samples", 1),
-                eval_integrals=cfg.validation.get("eval_integrals", True),
-                eval_spectra=cfg.validation.get("eval_spectra", False),
-                max_batches=cfg.validation.get("eval_max_batches", None),
-            )
+            total += float(loss) * float(mask.sum())
+        out = {"fm_loss": total / n if n else float("nan")}
+        plots = {}
+        if self.evaluator is not None:
+            metrics, plots = self.evaluator(self.model, epoch=epoch)
             out.update(metrics)
-            # hand plots to the wandb logger
-            if val_plots and self.dist.is_rank0:
-                self.logger.log({f"val_plots/{k}": v for k, v in val_plots.items()},
-                                step=epoch)
-        return out
-
-    def sample(self, *, key, batch: int, cond: Optional[jnp.ndarray] = None, steps: int = 50):
-        latents = euler_sample(
-            lambda x, t, c: self.model(x, t, c),
-            key=key, shape=(batch, *self.latent_shape),
-            cond=cond, steps=steps, latent_scale=self.latent_scale,
-        )
-        return jax.vmap(self.ae.decode)(latents)
+        return out, plots

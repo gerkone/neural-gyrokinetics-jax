@@ -1,199 +1,140 @@
-"""GyroSwin training runner — multi-task MSE on df + phi (+ optional flux)."""
+"""GyroSwin training runner: next-step multi-task training on df, phi and flux targets."""
 
 from __future__ import annotations
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 
-from neugk_jax.dataset import CycloneDataset, KvikIOBackend, NumpyBackend
-from neugk_jax.gyroswin.models import build_gyroswin_from_config
-from neugk_jax.training.loss_scheduler import (
-    build_scheduler_dict,
-    compute_multi_task_loss,
-)
-from neugk_jax.training.runner import BaseRunner, build_optimizer
-from neugk_jax.training.schedulers import warmup_cosine
+from neugk_jax.dataset.factory import build_splits
+from neugk_jax.evaluate.base import Denorm, geometry_table
+from neugk_jax.losses import integral_losses
+from neugk_jax.training.build import build_gyroswin
+from neugk_jax.training.data import stack_fields
+from neugk_jax.training.loss_scheduler import LossConfig, compute_multi_task_loss
+from neugk_jax.training.runner import BaseRunner
+from neugk_jax.utils import config_dict
+
+TARGETS = ("df", "phi", "flux", "fluxavg")
 
 
-def _mse(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
-    return jnp.mean((a - b) ** 2)
+def gyroswin_loss(preds, tgts, weights, loss_cfg, *, integrals=None, separate_zf_loss=False):
+    return compute_multi_task_loss(
+        preds, tgts, weights, loss_cfg.active, extra=integrals, separate_zf_loss=separate_zf_loss
+    )
+
+
+def model_conditions(cfg) -> tuple:
+    conds = cfg.model.get("conditioning")
+    if conds is None:
+        conds = cfg.dataset.get("conditions", ("itg", "dg", "s_hat", "q"))
+    return tuple(conds or ())
 
 
 class GyroSwinRunner(BaseRunner):
-    """Trains GyroSwinMultitask on df+phi multi-task MSE."""
+    """Trains GyroSwinMultitask to predict the state at ``t + 1`` from ``t``."""
+
+    adam_b2 = 0.95
 
     def setup_data(self) -> None:
         cfg = self.cfg
-        backend = (
-            KvikIOBackend(rank=self.dist.process_id)
-            if getattr(cfg.dataset, "backend", "kvikio") == "kvikio"
-            else NumpyBackend()
+        m = cfg.model
+        self.loss_cfg = LossConfig(
+            m.get("loss_weights"), m.get("extra_loss_weights"), config_dict(m.get("loss_scheduler"))
         )
-        common = dict(
-            path=cfg.dataset.path,
-            fields_to_load=tuple(cfg.dataset.get("input_fields", ("df", "phi"))),
-            conditions=tuple(cfg.dataset.get("conditions", ("itg", "dg", "s_hat", "q"))),
-            mode="ae",
-            backend=backend,
-            separate_zf=cfg.dataset.get("separate_zf", True),
-            normalization=cfg.dataset.get("normalization"),
-            normalization_scope=cfg.dataset.get("normalization_scope", "dataset"),
-            normalization_stats=getattr(cfg.dataset, "normalization_stats", None),
-            offset=cfg.dataset.get("offset", 0),
+        fields = set(cfg.dataset.get("input_fields", ("df",)))
+        fields |= {k for k in self.loss_cfg.outputs if k in ("df", "phi")}
+        if self.loss_cfg.integrals:
+            fields |= {"df", "phi"}
+        # the val split ends n_eval_steps frames early; those frames are rollout targets
+        tail = int((cfg.get("validation") or {}).get("n_eval_steps", 1))
+        self.train_ds, self.val_ds = build_splits(
+            cfg.dataset,
+            dist=self.dist,
+            mode="next",
+            fields=tuple(sorted(fields)),
+            conditions=model_conditions(cfg),
+            val_overrides={"tail_offset": tail},
         )
-        self.train_ds = CycloneDataset(
-            split="train", trajectories=cfg.dataset.training_trajectories,
-            cond_filters=cfg.dataset.get("training_cond_filters"), **common,
-        )
-        self.val_ds = CycloneDataset(
-            split="val", trajectories=cfg.dataset.validation_trajectories,
-            cond_filters=cfg.dataset.get("eval_cond_filters"), **common,
-        )
+        self.separate_zf_loss = bool(m.get("extra_zf_loss", False) and self.train_ds.separate_zf)
+        self.real_potens = bool(cfg.dataset.get("real_potens", True))
+        self._geom: dict[int, dict] = {}
 
-    def setup_components(self) -> None:
-        cfg = self.cfg
-        # route via build_gyroswin_from_config after dumping the hydra cfg to a yaml-shaped dict
-        from omegaconf import OmegaConf
-        cfg_d = OmegaConf.to_container(cfg, resolve=True)
-        # build expects a {"model": ..., "dataset": ...} layout
-        cfg_d.setdefault("dataset", cfg_d.get("dataset", {}))
-        cfg_d["dataset"].setdefault("resolution", list(self.train_ds.resolution))
-        import tempfile
+    def build_model(self, key):
+        model = build_gyroswin(self.cfg, self.train_ds, key=key)
+        if model.flux_key != self.loss_cfg.flux_key:
+            raise ValueError(
+                f"model flux head {model.flux_key!r} != loss flux key "
+                f"{self.loss_cfg.flux_key!r}"
+            )
+        return model
 
-        import yaml
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-            yaml.safe_dump({"model": cfg_d["model"], "dataset": cfg_d["dataset"]}, f)
-            tmp_cfg = f.name
-        # defaults to the non-legacy residual unless the config overrides it
-        self.model = build_gyroswin_from_config(
-            tmp_cfg, key=jr.PRNGKey(getattr(cfg, "seed", 0)),
-            legacy_double_shortcut=cfg.model.get("legacy_swin_shortcut", False),
-        )
+    def step_context(self) -> dict:
+        if not self.loss_cfg.integrals:
+            return {}
+        return {"norm": Denorm.from_dataset(self.train_ds, TARGETS[:3])}
 
-        steps_per_epoch = max(1, len(self.train_ds) // cfg.training.batch_size)
-        total = cfg.training.n_epochs * steps_per_epoch
-        self.schedule = warmup_cosine(
-            peak_lr=cfg.training.learning_rate, total_steps=total,
-            steps_per_epoch=steps_per_epoch, n_epochs=cfg.training.n_epochs,
-            min_lr=cfg.training.get("final_learning_rate", 1e-6),
-        )
-        opt = build_optimizer(self.schedule, cfg.training, self.model, decoupled=False, b2=0.95)
-        params, _ = eqx.partition(self.model, eqx.is_array)
-        self.optimizer = opt
-        self.opt_state = opt.init(params)
-        self.steps_per_epoch = steps_per_epoch
-        # static weights (sum loss_weights + extra_loss_weights) and progress-based schedulers
-        lw = dict(cfg.model.get("loss_weights") or {})
-        elw = dict(cfg.model.get("extra_loss_weights") or {})
-        self.loss_weights = {k: float(v) for k, v in {**lw, **elw}.items()}
-        self.loss_schedulers = build_scheduler_dict(cfg.model.get("loss_scheduler"))
-        self.total_steps = total
+    def geometry(self, fids) -> dict:
+        for f in set(int(f) for f in fids) - set(self._geom):
+            self._geom[f] = {k: v[0] for k, v in geometry_table(self.train_ds, [f]).items()}
+        return {
+            k: np.stack([self._geom[int(f)][k] for f in fids]) for k in self._geom[int(fids[0])]
+        }
 
-    def _weights_at(self, step: int) -> dict[str, float]:
+    def weights_at(self, step: int) -> dict:
         progress_remaining = max(0.0, 1.0 - step / max(self.total_steps, 1))
-        out = dict(self.loss_weights)
-        for k, fn in self.loss_schedulers.items():
-            out[k] = float(fn(progress_remaining))
-        return out
+        return {
+            k: jnp.asarray(v, jnp.float32)
+            for k, v in self.loss_cfg.weights_at(progress_remaining).items()
+        }
 
-    @eqx.filter_jit
-    def _train_step(self, model, opt_state, batch_df, batch_phi, batch_cond,
-                    batch_geom, batch_flux, w_dict):
-        """Per-step training update.
+    def step_extras(self, step: int) -> dict:
+        return {"weights": self.weights_at(step)}
 
-        ``w_dict`` is a dict of float scalars; values may be 0.0 to disable
-        a term. Integrals are computed only when ``w_dict[phi_int|flux_int]>0``.
-        """
-        from neugk_jax.evaluate.integrals import gyaradax_flux_integrals
+    def load_batch(self, ds, indices, read) -> dict:
+        batch = stack_fields(
+            read(ds, indices), ("df", "conditioning", "file_index", *(f"y_{k}" for k in TARGETS))
+        )
+        if self.loss_cfg.integrals:
+            batch["geom"] = self.geometry(np.asarray(batch["file_index"]))
+        return batch
 
-        def loss_fn(m):
-            preds = jax.vmap(lambda x, c: m(x, c))(batch_df, batch_cond)
-            tgts = {"df": batch_df, "phi": batch_phi, "flux": batch_flux, "avgflux": batch_flux}
-            loss = compute_multi_task_loss(preds, tgts, w_dict)
-            # physics integrals — only run gyaradax when any integral weight is on
-            need = (w_dict.get("phi_int", 0.0) > 0 or w_dict.get("flux_int", 0.0) > 0
-                    or w_dict.get("phi_cross", 0.0) > 0 or w_dict.get("flux_cross", 0.0) > 0)
-            if need and batch_geom is not None:
-                phi_p, eflux_p = gyaradax_flux_integrals(preds["df"], batch_geom)
-                # phi_int — compare integrated phi (spectral) magnitude to the gt phi
-                if w_dict.get("phi_int", 0.0) > 0:
-                    loss = loss + w_dict["phi_int"] * jnp.mean(jnp.abs(phi_p) ** 2 - jnp.abs(batch_phi) ** 2)
-                # flux_int — compare integrated eflux to gt flux scalar
-                if w_dict.get("flux_int", 0.0) > 0 and batch_flux is not None:
-                    eflux_int = eflux_p.reshape(eflux_p.shape[0], -1).sum(axis=-1)
-                    loss = loss + w_dict["flux_int"] * jnp.mean((eflux_int.real - batch_flux) ** 2)
-                # cross terms only meaningful when the model itself outputs phi/flux directly
-                if w_dict.get("phi_cross", 0.0) > 0 and "phi" in preds:
-                    loss = loss + w_dict["phi_cross"] * _mse(preds["phi"], jnp.abs(phi_p))
-            return loss
+    def loss_fn(self, model, batch, key):
+        loss_cfg = self.loss_cfg
+        x, cond = batch["df"], batch.get("conditioning")
+        keys = jr.split(key, x.shape[0])
+        preds = jax.vmap(lambda xi, ci, k: model(xi, ci, key=k, inference=False))(x, cond, keys)
+        tgts = {k: batch.get(f"y_{k}") for k in TARGETS}
+        ints = None
+        if loss_cfg.integrals:
+            norm, fids = batch["norm"], batch["file_index"]
+            ints = integral_losses(
+                batch["geom"],
+                norm("df", preds["df"], fids),
+                norm("phi", preds["phi"], fids) if "phi" in preds else None,
+                norm("phi", tgts["phi"], fids),
+                norm("flux", tgts["flux"], fids),
+                real_potens=self.real_potens,
+            )
+        return gyroswin_loss(
+            preds,
+            tgts,
+            batch["weights"],
+            loss_cfg,
+            integrals=ints,
+            separate_zf_loss=self.separate_zf_loss,
+        )
 
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-        params, static = eqx.partition(model, eqx.is_array)
-        g_params, _ = eqx.partition(grads, eqx.is_array)
-        updates, opt_state = self.optimizer.update(g_params, opt_state, params)
-        params = eqx.apply_updates(params, updates)
-        return eqx.combine(params, static), opt_state, loss
-
-    def train_epoch(self, epoch: int, key) -> tuple[dict, dict]:
-        cfg = self.cfg
-        bs = cfg.training.batch_size
-        n = len(self.train_ds)
-        idx = jr.permutation(key, n)
-        starts = list(range(0, n - bs + 1, bs))
-        import time as _time
-        from concurrent.futures import ThreadPoolExecutor
-
-        # only fetch geometry when the integral losses are actually active
-        need_geom = any(self.loss_weights.get(k, 0.0) > 0 or k in self.loss_schedulers
-                        for k in ("phi_int", "flux_int", "phi_cross", "flux_cross"))
-
-        def _load(start):
-            samples = [self.train_ds[int(idx[i])] for i in range(start, start + bs)]
-            df = jnp.stack([jnp.asarray(s.df) for s in samples])
-            phi = jnp.stack([jnp.asarray(s.phi) for s in samples]) if getattr(samples[0], "phi", None) is not None else None
-            cond = jnp.stack([jnp.asarray(s.conditioning) for s in samples]) if getattr(samples[0], "conditioning", None) is not None else None
-            flux = jnp.stack([jnp.asarray(s.flux) for s in samples]) if getattr(samples[0], "flux", None) is not None else None
-            geom = None
-            if need_geom and hasattr(self.train_ds, "get_batch_geometry"):
-                import numpy as _np
-                fid = _np.asarray([int(s.file_index) for s in samples])
-                g = self.train_ds.get_batch_geometry(fid)
-                geom = {k: jnp.asarray(v) for k, v in g.items()}
-            return df, phi, cond, geom, flux
-
-        ex = ThreadPoolExecutor(max_workers=1)
-        losses, t_data, t_step = [], [], []
-        future = ex.submit(_load, starts[0]) if starts else None
-        try:
-            for i, start in enumerate(starts):
-                _t = _time.perf_counter_ns()
-                df, phi, cond, geom, flux = future.result()
-                t_data.append((_time.perf_counter_ns() - _t) / 1e6)
-                if i + 1 < len(starts):
-                    future = ex.submit(_load, starts[i + 1])
-                _t = _time.perf_counter_ns()
-                # per-step scheduled weights (linear/cyclical from cfg.model.loss_scheduler)
-                global_step = (epoch - 1) * self.steps_per_epoch + i
-                w_dict = self._weights_at(global_step)
-                self.model, self.opt_state, loss = self._train_step(
-                    self.model, self.opt_state, df, phi, cond, geom, flux, w_dict,
-                )
-                lf = float(loss)
-                t_step.append((_time.perf_counter_ns() - _t) / 1e6)
-                losses.append(lf)
-        finally:
-            ex.shutdown(wait=False)
-        m_data = sorted(t_data[1:] or t_data)[len(t_data[1:] or t_data) // 2] if t_data else 0.0
-        m_step = sorted(t_step[1:] or t_step)[len(t_step[1:] or t_step) // 2] if t_step else 0.0
-        loss_logs = {"total": sum(losses) / max(len(losses), 1)}
-        info = {"data_ms": m_data, "step_ms": m_step,
-                "first_step_ms": t_step[0] if t_step else 0.0}
-        return loss_logs, info
-
-    def evaluate(self, epoch: int):
+    def make_evaluator(self):
         from neugk_jax.gyroswin.eval import GyroSwinEvaluator
-        ev = GyroSwinEvaluator(self.cfg, val_ds=self.val_ds, is_rank0=self.dist.is_rank0)
-        metrics, plots = ev(self.model, epoch=epoch, batch_size=self.cfg.training.batch_size)
-        return metrics, plots
+
+        vcfg = self.cfg.get("validation") or {}
+        return GyroSwinEvaluator(
+            self.cfg,
+            val_ds=self.val_ds,
+            dist=self.dist,
+            loader=self.loader,
+            batch_size=vcfg.get("batch_size") or self.tcfg.batch_size,
+            outputs=self.loss_cfg.outputs,
+        )

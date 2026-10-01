@@ -11,7 +11,7 @@ import jax.random as jr
 
 from neugk_jax.models.attention import MultiHeadSelfAttention
 from neugk_jax.models.swin import Film, _DropPath
-from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, RMSNorm, gelu
+from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, gelu, make_norm
 
 
 class LayerModes(enum.Enum):
@@ -47,19 +47,23 @@ class ViTBlock(eqx.Module):
         legacy_double_shortcut: bool = False,
     ):
         katt, kmlp = jr.split(key, 2)
-        self.norm1 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
-        self.norm2 = RMSNorm(dim, elementwise_affine=norm_affine) if rms_norm else LayerNorm(dim, elementwise_affine=norm_affine)
+        self.norm1 = make_norm(dim, rms=rms_norm, affine=norm_affine)
+        self.norm2 = make_norm(dim, rms=rms_norm, affine=norm_affine)
         self.attn = MultiHeadSelfAttention(
-            dim, num_heads, key=katt,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            gated_attention=gated_attention, use_rpb=False,  # vit has no windowing, so no rpb
+            dim,
+            num_heads,
+            key=katt,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            gated_attention=gated_attention,
+            use_rpb=False,  # vit has no windowing, so no rpb
         )
         hidden = max(int(dim * mlp_ratio), dim)
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x, *, key=None, inference=False):
+    def __call__(self, x, *, key=None, inference=True):
         # x: (n_tokens, dim); standard pre-norm transformer block
         key1, key2 = (None, None) if key is None else jr.split(key, 2)
         x = x + self.drop_path(self.attn(self.norm1(x)), key=key1, inference=inference)
@@ -103,7 +107,7 @@ class DiTViTBlock(eqx.Module):
         self.mod = DiTModulation(cond_dim, dim, key=kmod)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x, cond, *, key=None, inference=False):
+    def __call__(self, x, cond, *, key=None, inference=True):
         # order: (scale1, shift1, gate1, scale2, shift2, gate2)
         scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = self.mod(cond)
         shift_msa = shift_msa[None, :]
@@ -129,7 +133,6 @@ class ViTLayer(eqx.Module):
     drop_path: float = eqx.field(static=True)
     mlp_ratio: float = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
-    norm_layer: type = eqx.field(static=True)
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -144,7 +147,6 @@ class ViTLayer(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
-        norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = False,
@@ -152,16 +154,21 @@ class ViTLayer(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         keys = jr.split(key, depth)
         self.blocks = [
             ViTBlock(
-                dim, num_heads, key=keys[i],
-                mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                dim,
+                num_heads,
+                key=keys[i],
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
                 gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
@@ -171,10 +178,9 @@ class ViTLayer(eqx.Module):
         self.drop_path = drop_path
         self.mlp_ratio = mlp_ratio
         self.use_checkpoint = use_checkpoint
-        self.norm_layer = norm_layer
         self.act_fn = act_fn
 
-    def __call__(self, x: jnp.ndarray, *, key=None, inference=False, **_):
+    def __call__(self, x: jnp.ndarray, *, key=None, inference=True):
         # x: (*grid, dim) → flatten → blocks → reshape
         spatial = x.shape[:-1]
         dim = x.shape[-1]
@@ -194,7 +200,6 @@ class DiTLayer(eqx.Module):
     drop_path: float = eqx.field(static=True)
     mlp_ratio: float = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
-    norm_layer: type = eqx.field(static=True)
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -210,19 +215,23 @@ class DiTLayer(eqx.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         act_fn: Callable = gelu,
-        norm_layer: type = LayerNorm,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         norm_affine: bool = True,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         keys = jr.split(key, depth)
         self.blocks = [
             DiTViTBlock(
-                dim, num_heads, cond_dim, key=keys[i],
-                mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
-                qkv_bias=qkv_bias, norm_affine=norm_affine,
+                dim,
+                num_heads,
+                cond_dim,
+                key=keys[i],
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                norm_affine=norm_affine,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
@@ -232,10 +241,9 @@ class DiTLayer(eqx.Module):
         self.drop_path = drop_path
         self.mlp_ratio = mlp_ratio
         self.use_checkpoint = use_checkpoint
-        self.norm_layer = norm_layer
         self.act_fn = act_fn
 
-    def __call__(self, x, condition, *, key=None, inference=False, **_):
+    def __call__(self, x, condition, *, key=None, inference=True):
         spatial = x.shape[:-1]
         dim = x.shape[-1]
         x = x.reshape(-1, dim)
@@ -277,16 +285,22 @@ class FilmViTLayer(eqx.Module):
         norm_affine: bool = False,
         rms_norm: bool = False,
         legacy_double_shortcut: bool = False,
-        **_unused,
     ):
         bkeys = jr.split(key, depth)
         fkeys = jr.split(jr.fold_in(key, 1), depth)
         self.blocks = [
             ViTBlock(
-                dim, num_heads, key=bkeys[i],
-                mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
-                qkv_bias=qkv_bias, qk_norm=qk_norm, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                dim,
+                num_heads,
+                key=bkeys[i],
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
@@ -295,7 +309,7 @@ class FilmViTLayer(eqx.Module):
         self.grid_size = tuple(grid_size)
         self.dim = dim
 
-    def __call__(self, x: jnp.ndarray, condition, *, key=None, inference=False, **_):
+    def __call__(self, x: jnp.ndarray, condition, *, key=None, inference=True):
         spatial = x.shape[:-1]
         dim = x.shape[-1]
         x = x.reshape(-1, dim)

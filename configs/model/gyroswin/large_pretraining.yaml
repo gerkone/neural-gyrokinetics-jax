@@ -3,10 +3,20 @@ bundle_seq_length: 1
 latent_dim: 1024
 num_layers: 1
 decouple_mu: true
-conditioning: ["itg", "dg", "s_hat", "q"]
+# stochastic depth in the swin stages; swin.drop_path is ignored
+drop_path: 0.1
+conditioning: ["timestep", "itg", "dg", "s_hat", "q"]
+# plain mse on the zonal-flow channels + relative-norm mse on the rest (needs separate_zf)
+extra_zf_loss: false
+# a key is an output / loss term when its weight is > 0 or it has a schedule; a schedule replaces the weight
 loss_weights:
   df: 1.0
   phi: 0.1
+  flux: 0.0
+  fluxavg: 0.0
+extra_loss_weights:
+  phi_int: 0.0
+  flux_int: 0.0
 loss_scheduler:
   df: null
   phi:
@@ -15,6 +25,10 @@ loss_scheduler:
     end: 1
     start_fraction: 0.5
     end_fraction: 0.7
+  flux: null
+  fluxavg: null
+  phi_int: null
+  flux_int: null
 
 swin:
   patch_size: [4, 2, 4, 5, 4]
@@ -30,7 +44,6 @@ swin:
   act_fn: GELU
   patch_skip: true
   modulation: dit
-  drop_path: 0.1
   swin_bottleneck: true
   latent_cross_attn: true
   use_rpb: true
@@ -40,4 +53,6 @@ swin:
   flux_num_heads: 8
   flux_depth: 1
   flux_conditioning: false
+  attn_drop: 0.1  # attention dropout of the mixing blocks and velocity reductions
+  flux_drop: 0.1  # flux head projection and mlp dropout
   norm_fn: RMSNorm

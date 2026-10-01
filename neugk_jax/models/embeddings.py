@@ -19,7 +19,9 @@ def _sincos_1d(length: int, dim: int, base: float = 10000.0) -> jnp.ndarray:
     assert dim % 2 == 0, "sincos dim must be even"
     pos = jnp.arange(length, dtype=jnp.float32)
     # force f32 — x64 mode promotes math.log(base) to f64, which would contaminate downstream dtypes
-    freqs = jnp.exp(-math.log(base) * jnp.arange(0, dim, 2, dtype=jnp.float32) / dim).astype(jnp.float32)
+    freqs = jnp.exp(-math.log(base) * jnp.arange(0, dim, 2, dtype=jnp.float32) / dim).astype(
+        jnp.float32
+    )
     angles = pos[:, None] * freqs[None, :]
     return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1).astype(jnp.float32)
 
@@ -43,7 +45,9 @@ def _sincos_nd(grid_size: Sequence[int], dim: int) -> jnp.ndarray:
         shape = [1] * n + [d]
         shape[i] = size
         pe_parts.append(pe_i.reshape(shape))
-    pe = jnp.concatenate([jnp.broadcast_to(p, (*grid_size, p.shape[-1])) for p in pe_parts], axis=-1)
+    pe = jnp.concatenate(
+        [jnp.broadcast_to(p, (*grid_size, p.shape[-1])) for p in pe_parts], axis=-1
+    )
     # trim any rounding overshoot to exactly dim
     return pe[..., :dim]
 
@@ -51,11 +55,15 @@ def _sincos_nd(grid_size: Sequence[int], dim: int) -> jnp.ndarray:
 class APE(eqx.Module):
     """Absolute positional embedding broadcast-added to the last axis.
 
-    ``learnable=False`` keeps it frozen via stop_gradient.
+    ``learnable=False`` makes ``pos_embed`` a buffer (see ``trainable_mask``).
     """
 
     pos_embed: jax.Array
     learnable: bool = eqx.field(static=True)
+
+    @property
+    def buffer_fields(self):
+        return () if self.learnable else ("pos_embed",)
 
     def __init__(
         self,
@@ -97,6 +105,7 @@ class ContinuousConditionEmbed(eqx.Module):
 
     mlp: list  # [Linear]
     omega: jax.Array
+    buffer_fields = ("omega",)
     dim: int = eqx.field(static=True)
     n_cond: int = eqx.field(static=True)
     cond_dim: int = eqx.field(static=True)
@@ -126,10 +135,10 @@ class ContinuousConditionEmbed(eqx.Module):
         self.cond_per_wave = cond_per_wave
 
         # force f32 — x64 mode would otherwise promote omega to f64 and contaminate the dit output
-        omega = 1.0 / (max_wavelength ** (
-            jnp.arange(0, cond_per_wave, 2, dtype=jnp.float32) / cond_per_wave
-        ))
-        self.omega = jax.lax.stop_gradient(omega.astype(jnp.float32))
+        omega = 1.0 / (
+            max_wavelength ** (jnp.arange(0, cond_per_wave, 2, dtype=jnp.float32) / cond_per_wave)
+        )
+        self.omega = omega.astype(jnp.float32)
 
         self.cond_dim = 4 * dim
         self.mlp = [Linear(dim, self.cond_dim, key=key)]
@@ -151,8 +160,6 @@ class ContinuousConditionEmbed(eqx.Module):
             emb = jnp.concatenate([emb, pad], axis=-1)
         emb = self.mlp[0](emb)
         return jax.nn.silu(emb)
-
-
 
 
 def _build_rpb_table(window_size: Sequence[int]) -> jnp.ndarray:
@@ -177,9 +184,7 @@ def _build_rpb_table(window_size: Sequence[int]) -> jnp.ndarray:
 def _build_rpb_idx(window_size: Sequence[int]) -> jnp.ndarray:
     """Integer index ``(sl, sl)`` gathering per-pair biases from the flat table."""
     space = len(window_size)
-    grids = _np.stack(
-        _np.meshgrid(*[_np.arange(w) for w in window_size], indexing="ij")
-    )
+    grids = _np.stack(_np.meshgrid(*[_np.arange(w) for w in window_size], indexing="ij"))
     flat = grids.reshape(space, -1)
     dists = flat[:, :, None] - flat[:, None, :]
     out = _np.zeros_like(dists[0])
@@ -204,6 +209,7 @@ class RPB(eqx.Module):
     cpb_mlp: MLP
     rpb: jax.Array
     rpb_idx: jax.Array
+    buffer_fields = ("rpb", "rpb_idx")
     num_heads: int = eqx.field(static=True)
     seq_len: int = eqx.field(static=True)
     space: int = eqx.field(static=True)
@@ -225,8 +231,8 @@ class RPB(eqx.Module):
             self.cpb_mlp,
             Linear(last.weight.shape[1], last.weight.shape[0], key=kw2, use_bias=False),
         )
-        self.rpb = jax.lax.stop_gradient(_build_rpb_table(window_size))
-        self.rpb_idx = jax.lax.stop_gradient(_build_rpb_idx(window_size))
+        self.rpb = _build_rpb_table(window_size)
+        self.rpb_idx = _build_rpb_idx(window_size)
         seq_len = 1
         for w in window_size:
             seq_len *= w

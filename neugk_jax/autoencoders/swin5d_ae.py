@@ -15,7 +15,7 @@ import jax.random as jr
 
 from neugk_jax.models.gk_unet import Swin5DUnet
 from neugk_jax.models.patching import PatchExpand
-from neugk_jax.models.utils import LayerNorm, Linear, gelu
+from neugk_jax.models.utils import LayerNorm, Linear, gelu, split_key
 from neugk_jax.models.vit import ViTLayer
 
 
@@ -50,8 +50,6 @@ class Swin5DAE(eqx.Module):
         depth,
         num_heads,
         num_layers: int = 4,
-        middle_depth: int = 2,
-        middle_num_heads: int = 8,
         bottleneck_dim: Optional[int] = None,
         bottleneck_depth: int = 2,
         bottleneck_num_heads: int = 2,
@@ -86,8 +84,6 @@ class Swin5DAE(eqx.Module):
             depth=depth,
             num_heads=num_heads,
             num_layers=num_layers,
-            middle_depth=middle_depth,
-            middle_num_heads=middle_num_heads,
             c_multiplier=c_multiplier,
             drop_path=drop_path,
             hidden_mlp_ratio=hidden_mlp_ratio,
@@ -97,13 +93,16 @@ class Swin5DAE(eqx.Module):
             unmerging_depth=unmerging_depth,
             use_abs_pe=use_abs_pe,
             act_fn=act_fn,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            use_rpb=use_rpb,
+            gated_attention=gated_attention,
             norm_affine=norm_affine,
             legacy_double_shortcut=legacy_double_shortcut,
             rms_norm=True,
-            # ae has no encoder→decoder skips
+            # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
+            build_middle=False,
             key=kb,
         )
 
@@ -118,30 +117,47 @@ class Swin5DAE(eqx.Module):
 
         # bottleneck vit blocks use RMSNorm(elementwise_affine=True) regardless of encoder setting
         vit_kwargs = dict(
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
             gated_attention=gated_attention,
             norm_affine=True,
             rms_norm=True,
         )
         self.middle_pre = ViTLayer(
-            space=self.backbone.space, dim=mid_dim, depth=bottleneck_depth,
-            num_heads=bottleneck_num_heads, grid_size=mid_grid,
-            key=k1, mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
-            act_fn=act_fn, **vit_kwargs,
+            space=self.backbone.space,
+            dim=mid_dim,
+            depth=bottleneck_depth,
+            num_heads=bottleneck_num_heads,
+            grid_size=mid_grid,
+            key=k1,
+            mlp_ratio=hidden_mlp_ratio,
+            drop_path=drop_path,
+            act_fn=act_fn,
+            **vit_kwargs,
         )
         self.middle_post = ViTLayer(
-            space=self.backbone.space, dim=mid_dim, depth=bottleneck_depth,
-            num_heads=bottleneck_num_heads, grid_size=mid_grid,
-            key=k2, mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
-            act_fn=act_fn, **vit_kwargs,
+            space=self.backbone.space,
+            dim=mid_dim,
+            depth=bottleneck_depth,
+            num_heads=bottleneck_num_heads,
+            grid_size=mid_grid,
+            key=k2,
+            mlp_ratio=hidden_mlp_ratio,
+            drop_path=drop_path,
+            act_fn=act_fn,
+            **vit_kwargs,
         )
         self.middle_downproj = Linear(mid_dim, bd, key=k3)
         self.middle_upproj = Linear(bd, mid_dim, key=k4)
         # ae middle_upscale uses LayerNorm (with weight + bias)
         self.middle_upscale = PatchExpand(
-            mid_dim, mid_grid, key=k5,
+            mid_dim,
+            mid_grid,
+            key=k5,
             target_grid_size=self.backbone.grid_sizes[-2],
-            c_multiplier=c_multiplier, mlp_depth=1, rms_norm=False,
+            c_multiplier=c_multiplier,
+            mlp_depth=1,
+            rms_norm=False,
         )
 
         if normalized_latent:
@@ -152,19 +168,19 @@ class Swin5DAE(eqx.Module):
             self.post_z_norm = None
         self.normalized_latent = normalized_latent
 
-
-    def encode(self, df: jnp.ndarray):
+    def encode(self, df: jnp.ndarray, *, key=None, inference: bool = True):
+        keys = split_key(key, len(self.backbone.down_blocks) + 1)
         z, pad_axes = self.backbone.patch_encode(df)
-        for blk in self.backbone.down_blocks:
-            z = blk(z, return_skip=False)
-        z = self.middle_pre(z)
+        for blk, k in zip(self.backbone.down_blocks, keys):
+            z = blk(z, return_skip=False, key=k, inference=inference)
+        z = self.middle_pre(z, key=keys[-1], inference=inference)
         z = self.middle_downproj(z)
         if self.normalized_latent:
             z = self.pre_z_norm(z)
         return z, pad_axes
 
-
-    def decode(self, z: jnp.ndarray, pad_axes=None):
+    def decode(self, z: jnp.ndarray, pad_axes=None, *, key=None, inference: bool = True):
+        keys = split_key(key, len(self.backbone.up_blocks) + 1)
         if pad_axes is None:
             # reconstruct pad_axes from the base resolution
             dummy = jnp.zeros((self.backbone.original_in_channels, *self.backbone.full_resolution))
@@ -172,18 +188,20 @@ class Swin5DAE(eqx.Module):
         if self.normalized_latent:
             z = self.post_z_norm(z)
         z = self.middle_upproj(z)
-        z = self.middle_post(z)
+        z = self.middle_post(z, key=keys[0], inference=inference)
         z = self.middle_upscale(z)
         # no skip connections in ae decoder
-        for blk in self.backbone.up_blocks:
-            z = blk(z, s=None)
+        for blk, k in zip(self.backbone.up_blocks, keys[1:]):
+            z = blk(z, s=None, key=k, inference=inference)
         df = self.backbone.patch_decode(z, pad_axes)
         return {"df": df}
 
-
-    def __call__(self, df: jnp.ndarray, return_latent: bool = False):
-        z, pad_axes = self.encode(df)
-        out = self.decode(z, pad_axes)
+    def __call__(
+        self, df: jnp.ndarray, return_latent: bool = False, *, key=None, inference: bool = True
+    ):
+        k_enc, k_dec = split_key(key, 2)
+        z, pad_axes = self.encode(df, key=k_enc, inference=inference)
+        out = self.decode(z, pad_axes, key=k_dec, inference=inference)
         if return_latent:
             out["latent"] = z
         return out

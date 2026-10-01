@@ -1,4 +1,10 @@
-"""AE evaluator: reconstruction MSE + optional integrals via gyaradax, plus cross-section plots."""
+"""AE evaluator: reconstruction MSE and relative L2, optional flux integrals and spectra, cross-section plots.
+
+Metrics: ``df_mse`` (normalized), ``df_rel_l2`` (denormalized, zf recombined); with
+``validation.eval_integrals`` also ``phi_int_mse``/``phi_int_rel_l2`` and
+``flux_int_mse``/``flux_int_rel_err`` of the integrals of the denormalized reconstruction
+against those of the target (cached after the first epoch).
+"""
 
 from __future__ import annotations
 
@@ -8,130 +14,106 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
-from neugk_jax.evaluate.base import BaseEvaluator, validation_metrics
+from neugk_jax.evaluate.base import (
+    BaseEvaluator,
+    accumulate,
+    integrate,
+    per_sample_mse,
+    per_sample_rel_l2,
+)
+from neugk_jax.training.data import stack_fields
+from neugk_jax.utils import count_trace, recombine_zf
+
+
+@eqx.filter_jit
+def target_integrals(x, fids, denorm, geom):
+    count_trace("ae_target_integrals")
+    phi, (_, eflux, _) = integrate(geom, fids, denorm("df", x, fids))
+    return phi, eflux
+
+
+@eqx.filter_jit
+def ae_eval_step(model, batch, acc, denorm, geom, tgt_int):
+    """Reconstruct one batch, add its masked metric sums to ``acc``; returns the denormalized pair."""
+    count_trace("ae_eval_step")
+    x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
+    pred = jax.vmap(lambda xi: model(xi, inference=True)["df"])(x)
+    pred_d, tgt_d = denorm("df", pred, fids), denorm("df", x, fids)
+    values = {
+        "df_mse": per_sample_mse(pred, x),
+        "df_rel_l2": per_sample_rel_l2(recombine_zf(pred_d, axis=1), recombine_zf(tgt_d, axis=1)),
+    }
+    phi = None
+    if tgt_int is not None:
+        phi_t, eflux_t = tgt_int
+        phi, (_, eflux, _) = integrate(geom, fids, pred_d)
+        values["phi_int_mse"] = per_sample_mse(phi, phi_t)
+        values["phi_int_rel_l2"] = per_sample_rel_l2(phi, phi_t)
+        values["flux_int_mse"] = (eflux - eflux_t) ** 2
+        values["flux_int_rel_err"] = jnp.abs(eflux - eflux_t) / (jnp.abs(eflux_t) + 1e-12)
+    return accumulate(acc, values, mask), pred_d, tgt_d, phi
 
 
 class AEEvaluator(BaseEvaluator):
-    """Run ``model`` over the val set, return mean recon metrics + plot dict."""
+    """Reconstruction metrics over the validation set."""
 
-    def __call__(
-        self,
-        model: Any,
-        *,
-        epoch: int,
-        batch_size: int = 1,
-        eval_integrals: bool = False,
-        eval_spectra: bool = False,
-        **kwargs,
-    ) -> tuple[dict[str, float], dict[str, Any]]:
-        ds = self.val_ds
-        n = len(ds)
+    def __init__(self, cfg: Any, **kwargs):
+        super().__init__(cfg, **kwargs)
+        self.eval_integrals = bool(self.vcfg.get("eval_integrals", False))
+        self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
+        keys = ["df_mse", "df_rel_l2"]
+        if self.eval_integrals:
+            keys += ["phi_int_mse", "phi_int_rel_l2", "flux_int_mse", "flux_int_rel_err"]
+        self.metric_keys = tuple(keys)
+        self._tgt_int: dict[int, tuple] = {}
 
-        @eqx.filter_jit
-        def fwd(m, x):
-            return jax.vmap(lambda xi: m(xi)["df"])(x)
+    @staticmethod
+    def load(ds, indices, read):
+        return stack_fields(read(ds, indices), ("df", "file_index", "timestep"))
 
-        running: dict[str, float] = {}
-        n_acc = 0.0
-        # match training-time placement: model replicated across devices → shard the val batch too
-        local_dev = jax.local_device_count()
-        data_shard = None
-        if local_dev > 1:
-            mesh = jax.sharding.Mesh(jax.devices(), ("dp",))
-            data_shard = NamedSharding(mesh, P("dp"))
-
-        # plot collection — one cross-section panel per epoch (first batch)
-        val_plots: dict[str, Any] = {}
-        plot_drawn = False
-        # per-trajectory spectral diagnostics (zonal flow + ky/Q spectra)
-        spectra_store: dict[int, tuple] = {}
-
-        for start in range(0, n - batch_size + 1, batch_size):
-            samples = [ds[i] for i in range(start, start + batch_size)]
-            df = jnp.stack([jnp.asarray(s.df) for s in samples])
-            if data_shard is not None:
-                df = jax.device_put(df, data_shard)
-            pred = fwd(model, df)
-            fid = np.asarray([int(s.file_index) for s in samples])
-
-            geometry = None
-            if eval_integrals and hasattr(ds, "get_batch_geometry"):
-                geom = ds.get_batch_geometry(fid)
-                geometry = {k: jnp.asarray(v) for k, v in geom.items()}
-
-            metrics, integrated = validation_metrics(
-                preds={"df": pred},
-                tgts={"df": df},
-                eval_integrals=eval_integrals,
-                geometry=geometry,
-            )
-            running, n_acc = self._accumulate(running, metrics, n_acc, n_new=batch_size)
-
-            if eval_spectra and hasattr(ds, "get_batch_geometry"):
-                try:
-                    from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-                    # spectra are physical quantities — denormalize pred/tgt first
-                    if getattr(ds, "normalization", None) is not None:
-                        pred_d = np.stack([
-                            np.asarray(ds.denormalize(int(fid[b]), df=np.asarray(pred[b])))
-                            for b in range(batch_size)
-                        ])
-                        tgt_d = np.stack([
-                            np.asarray(ds.denormalize(int(fid[b]), df=np.asarray(df[b])))
-                            for b in range(batch_size)
-                        ])
-                    else:
-                        pred_d, tgt_d = np.asarray(pred), np.asarray(df)
-                    if not accumulate_spectral_diagnostics(spectra_store, pred_d, tgt_d, fid, ds):
-                        if self.is_rank0:
-                            print("[evaluate] eval_spectra requested but metadata has no 'ds' — skipping spectral metrics")
-                        eval_spectra = False
-                except Exception as e:
-                    if self.is_rank0:
-                        print(f"[evaluate] spectral diagnostics failed: {e}")
-                    eval_spectra = False
-
-            # one cross-section panel per epoch (first eval batch only): df + integrated phi
-            if not plot_drawn and self.is_rank0:
-                try:
-                    from neugk_jax.evaluate.plots import generate_val_plots
-                    b_idx = 0
-                    fid_i = int(samples[b_idx].file_index)
-                    pred_d = np.asarray(ds.denormalize(fid_i, df=np.asarray(pred[b_idx])))
-                    tgt_d = np.asarray(ds.denormalize(fid_i, df=np.asarray(df[b_idx])))
-                    rollout = {"df": pred_d}
-                    gt = {"df": tgt_d}
-                    if integrated is not None and integrated.get("phi") is not None:
-                        # phi is complex-valued; plot the magnitude so matplotlib can render it
-                        rollout["phi"] = np.abs(np.asarray(integrated["phi"])[b_idx])
-                        gt["phi"] = np.abs(np.asarray(integrated["phi_tgt"])[b_idx])
-                    panels = generate_val_plots(
-                        rollout=rollout, gt=gt, phase="random draw",
-                        ts=np.asarray(samples[b_idx].timestep).reshape(-1),
+    def __call__(self, model: Any, *, epoch: int) -> tuple[dict[str, float], dict[str, Any]]:
+        model = self.local_model(model)
+        geom = self.geometry if self.eval_integrals else None
+        acc = self.zeros((*self.metric_keys, "_n"))
+        plots: dict[str, Any] = {}
+        spectra: dict[int, dict] = {}
+        for plan, batch, _ in self.loader.iterate(self.ds, self.plans, self.load, self.place):
+            tgt_int = None
+            if self.eval_integrals:
+                if plan.number not in self._tgt_int:
+                    self._tgt_int[plan.number] = jax.device_get(
+                        target_integrals(batch["df"], batch["file_index"], self.denorm, geom)
                     )
-                    val_plots.update(panels)
-                except Exception as e:
-                    print(f"[evaluate] cross-section plot skipped: {e}")
-                finally:
-                    plot_drawn = True
+                tgt_int = self.place(self._tgt_int[plan.number])
+            acc, pred_d, tgt_d, phi = ae_eval_step(model, batch, acc, self.denorm, geom, tgt_int)
+            if self.eval_spectra:
+                self._spectra(spectra, pred_d, tgt_d, plan)
+            if plan.number == 0 and self.is_rank0:
+                plots = self._plots(pred_d, tgt_d, phi, tgt_int, batch)
+        sums = self.reduce(acc)
+        metrics = {k: sums[k] / max(sums["_n"], 1.0) for k in self.metric_keys}
+        if self.eval_spectra:
+            metrics.update(self.spectral_metrics(spectra))
+        return metrics, plots
 
-        running, n_acc = self._sync(running, n_acc)
-        # rename to torch's canonical keys
-        finalized = self._finalize(running, n_acc)
-        # rename to canonical metric keys
-        renamed = {
-            "df_mse" if k == "df" else
-            "phi_int_mse" if k == "phi_int" else
-            "flux_int_mse" if k == "flux_int" else
-            "flux_target_mse" if k == "flux" else k: v
-            for k, v in finalized.items()
-        }
-        # time-averaged spectral metrics, mean over trajectories
-        if spectra_store:
-            from neugk_jax.evaluate.metrics import merged_spectral_metrics
-            renamed.update(merged_spectral_metrics(spectra_store))
-        return renamed, val_plots
+    def _spectra(self, store, pred_d, tgt_d, plan) -> None:
+        from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
 
+        accumulate_spectral_diagnostics(
+            store, pred_d, tgt_d, plan_fids(self.ds, plan), self.ds, valid=plan.mask > 0
+        )
+
+    @staticmethod
+    def _plots(pred_d, tgt_d, phi, tgt_int, batch) -> dict[str, Any]:
+        from neugk_jax.evaluate.plots import generate_val_plots
+
+        rollout, gt = {"df": pred_d[0]}, {"df": tgt_d[0]}
+        if phi is not None:
+            rollout["phi"], gt["phi"] = phi[0], tgt_int[0][0]
+        ts = np.asarray(jax.device_get(batch["timestep"][:1])).reshape(-1)
+        return generate_val_plots(rollout=rollout, gt=gt, phase="random draw", ts=ts)
+
+
+def plan_fids(ds, plan) -> np.ndarray:
+    return np.asarray([ds.flat_index_to_file_and_tstep[int(i)][0] for i in plan.indices])

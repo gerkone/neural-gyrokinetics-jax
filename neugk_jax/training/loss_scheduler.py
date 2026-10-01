@@ -1,19 +1,23 @@
 """Progress-based loss-weight schedules + multi-task loss builder.
 
-Port of ``neugk/utils.py``'s scheduler helpers + a minimal
-``compute_multi_task_loss`` that handles the four physical outputs the
-gyroswin training uses: ``df``, ``phi``, ``flux``, ``avgflux``.
+Training-mode loss terms used by GyroSwin: ``df``, ``phi``,
+``flux``/``fluxavg`` and the physics-integral losses ``phi_int``/``flux_int``.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import jax.numpy as jnp
 
+from neugk_jax.losses import df_loss, l1, relative_norm_mse
 
-def linear_burn_in(start: float, end: float, start_fraction: float, end_fraction: float) -> Callable[[float], float]:
+
+def linear_burn_in(
+    start: float, end: float, start_fraction: float, end_fraction: float
+) -> Callable[[float], float]:
     """Linear ramp from ``start`` to ``end`` over [start_fraction, end_fraction]."""
+
     def fn(progress_remaining: float) -> float:
         progress = 1.0 - progress_remaining
         if progress > end_fraction:
@@ -21,14 +25,20 @@ def linear_burn_in(start: float, end: float, start_fraction: float, end_fraction
         if progress < start_fraction:
             return start
         return start + (progress - start_fraction) * (end - start) / (end_fraction - start_fraction)
+
     return fn
 
 
 def cyclical_annealing(
-    start: float, end: float, start_fraction: float, end_fraction: float,
-    n_cycles: int = 4, ratio: float = 0.5,
+    start: float,
+    end: float,
+    start_fraction: float,
+    end_fraction: float,
+    n_cycles: int = 4,
+    ratio: float = 0.5,
 ) -> Callable[[float], float]:
     """Cyclical annealing — ``n_cycles`` ramps within [start_fraction, end_fraction]."""
+
     def fn(progress_remaining: float) -> float:
         progress = 1.0 - progress_remaining
         if progress < start_fraction:
@@ -40,34 +50,94 @@ def cyclical_annealing(
         if cycle < ratio:
             return start + (end - start) * (cycle / ratio)
         return end
+
     return fn
 
 
-_SUPPORTED_LOSSES = ("df", "phi", "flux", "avgflux")
+DATA_LOSSES = ("df", "phi", "flux", "fluxavg")
+INTEGRAL_LOSSES = ("phi_int", "flux_int")
+REMOVED_LOSSES = ("phi_cross", "flux_cross")
+
+
+def _truthy(sched_cfg: Any, key: str) -> bool:
+    return bool(sched_cfg) and key in sched_cfg and bool(sched_cfg[key])
+
+
+class LossConfig:
+    """Resolved multi-task loss setup.
+
+    ``weights`` merges ``loss_weights`` and ``extra_loss_weights``; ``active`` are
+    the keys whose weight is positive or that carry a schedule (the static term
+    set); ``outputs`` are the model outputs (``loss_weights`` keys only). A
+    scheduled weight is replaced by ``sched(progress_remaining)`` each step.
+    """
+
+    def __init__(
+        self, loss_weights: Any, extra_loss_weights: Any = None, loss_scheduler: Any = None
+    ):
+        lw = {k: float(v or 0.0) for k, v in dict(loss_weights or {}).items()}
+        elw = {k: float(v or 0.0) for k, v in dict(extra_loss_weights or {}).items()}
+        known = set(DATA_LOSSES) | set(INTEGRAL_LOSSES) | set(REMOVED_LOSSES)
+        sched_keys = set(dict(loss_scheduler or {}))
+        unknown = sorted((set(lw) | set(elw) | sched_keys) - known)
+        if unknown:
+            raise ValueError(f"unknown loss keys {unknown}; supported: {sorted(known)}")
+        self.weights = {**lw, **elw}
+        self.schedulers = {
+            k: fn for k, fn in build_scheduler_dict(loss_scheduler).items() if k in self.weights
+        }
+        self.active = tuple(
+            k for k in self.weights if self.weights[k] > 0.0 or k in self.schedulers
+        )
+        removed = [k for k in self.active if k in REMOVED_LOSSES]
+        if removed:
+            raise ValueError(f"cross losses {removed} are not supported; set their weight to 0")
+        self.outputs = tuple(k for k in lw if lw[k] > 0.0 or _truthy(loss_scheduler, k))
+        if len([k for k in self.outputs if k.startswith("flux")]) > 1:
+            raise ValueError("cannot predict both flux and fluxavg")
+        self.flux_key = next((k for k in self.outputs if k in ("flux", "fluxavg")), None)
+        self.integrals = tuple(k for k in self.active if k in INTEGRAL_LOSSES)
+
+    def weights_at(self, progress_remaining: float) -> dict[str, float]:
+        out = {k: self.weights[k] for k in self.active}
+        for k, fn in self.schedulers.items():
+            out[k] = float(fn(progress_remaining))
+        return out
 
 
 def compute_multi_task_loss(
     preds: Mapping[str, jnp.ndarray],
     tgts: Mapping[str, jnp.ndarray],
-    weights: Mapping[str, float],
-) -> jnp.ndarray:
-    """Weighted MSE across the supported gyroswin outputs.
+    weights: Mapping[str, jnp.ndarray],
+    active: Sequence[str],
+    *,
+    extra: Optional[Mapping[str, jnp.ndarray]] = None,
+    separate_zf_loss: bool = False,
+) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+    """Weighted sum over the static ``active`` terms.
 
-    Recognised keys: ``df`` (5D), ``phi`` (3D), ``flux`` (scalar per sample),
-    ``avgflux`` (scalar per sample). Any other key in ``weights`` is ignored.
-    Terms with zero weight or with a missing pred/tgt are skipped.
+    ``df``/``phi`` use relative-norm MSE (``df`` optionally with the zonal-flow
+    MSE split), ``flux``/``fluxavg`` L1; ``extra`` carries precomputed terms such
+    as the integral losses. ``weights`` may hold traced scalars.
     """
-    loss = jnp.float32(0.0)
-    for k in _SUPPORTED_LOSSES:
-        w = float(weights.get(k, 0.0) or 0.0)
-        if w == 0.0 or k not in preds or k not in tgts or preds[k] is None or tgts[k] is None:
-            continue
-        loss = loss + w * jnp.mean((preds[k] - tgts[k]) ** 2)
-    return loss
+    losses = {}
+    for k in active:
+        if extra is not None and k in extra:
+            losses[k] = extra[k]
+        elif k == "df":
+            losses[k] = df_loss(preds[k], tgts[k], separate_zf=separate_zf_loss)
+        elif k == "phi":
+            losses[k] = relative_norm_mse(preds[k], tgts[k].reshape(preds[k].shape))
+        elif k in ("flux", "fluxavg"):
+            losses[k] = l1(preds[k], tgts[k])
+        else:
+            raise KeyError(f"no loss available for active term {k!r}")
+    total = sum((weights[k] * losses[k] for k in active), jnp.float32(0.0))
+    return total, losses
 
 
 def build_scheduler_dict(loss_scheduler_cfg: Any) -> dict[str, Callable[[float], float]]:
-    """Translate the upstream ``loss_scheduler`` config into a name → fn dict.
+    """Translate the ``loss_scheduler`` config into a name → fn dict.
 
     Skips keys whose value is ``None`` / ``{}`` (i.e. constant weight).
     """
@@ -79,10 +149,15 @@ def build_scheduler_dict(loss_scheduler_cfg: Any) -> dict[str, Callable[[float],
         if not sp:
             continue
         kind = sp.get("type", "linear") if hasattr(sp, "get") else getattr(sp, "type", "linear")
-        get = (lambda obj, k, d=None: obj.get(k, d)) if hasattr(sp, "get") else (lambda obj, k, d=None: getattr(obj, k, d))
+        get = (
+            (lambda obj, k, d=None: obj.get(k, d))
+            if hasattr(sp, "get")
+            else (lambda obj, k, d=None: getattr(obj, k, d))
+        )
         if kind == "cyclical":
             out[key] = cyclical_annealing(
-                start=get(sp, "start"), end=get(sp, "end"),
+                start=get(sp, "start"),
+                end=get(sp, "end"),
                 start_fraction=get(sp, "start_fraction"),
                 end_fraction=get(sp, "end_fraction"),
                 n_cycles=get(sp, "n_cycles", 4),
@@ -90,7 +165,8 @@ def build_scheduler_dict(loss_scheduler_cfg: Any) -> dict[str, Callable[[float],
             )
         else:
             out[key] = linear_burn_in(
-                start=get(sp, "start"), end=get(sp, "end"),
+                start=get(sp, "start"),
+                end=get(sp, "end"),
                 start_fraction=get(sp, "start_fraction"),
                 end_fraction=get(sp, "end_fraction"),
             )

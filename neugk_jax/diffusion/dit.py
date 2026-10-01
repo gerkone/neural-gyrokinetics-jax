@@ -64,12 +64,16 @@ class DiT(eqx.Module):
         keys = jr.split(key, 6)
 
         self.time_embed = ContinuousConditionEmbed(
-            time_embed_dim, 1, key=keys[0],
+            time_embed_dim,
+            1,
+            key=keys[0],
         )
         cdim = self.time_embed.cond_dim
         if n_cond > 0:
             self.cond_embed = ContinuousConditionEmbed(
-                cond_embed_dim, n_cond, key=keys[1],
+                cond_embed_dim,
+                n_cond,
+                key=keys[1],
             )
             cdim += self.cond_embed.cond_dim
         else:

@@ -38,17 +38,16 @@ def _plt_to_wandb_image(fig):
     """Convert a figure to ``wandb.Image`` (or return it unchanged if wandb is
     missing). Closes the figure to free the matplotlib resources."""
     try:
-        from PIL import Image as PILImage
-
         import wandb
-        buf = io.BytesIO()
-        fig.savefig(buf, bbox_inches="tight", format="png", dpi=120, pad_inches=0.01)
-        buf.seek(0)
-        img = PILImage.open(buf)
-        plt.close(fig)
-        return wandb.Image(img)
-    except Exception:
+        from PIL import Image as PILImage
+    except ImportError:
         return fig
+    buf = io.BytesIO()
+    fig.savefig(buf, bbox_inches="tight", format="png", dpi=120, pad_inches=0.01)
+    buf.seek(0)
+    img = PILImage.open(buf)
+    plt.close(fig)
+    return wandb.Image(img)
 
 
 def plot_nd(
@@ -64,14 +63,12 @@ def plot_nd(
 ):
     """Upper-triangular grid of 2D projections, one per axis pair.
 
-    ``x`` (and optional ``y``) are arrays with shape ``(C?, *spatial)``.
-    Each subplot in the upper triangle aggregates the non-displayed
-    spatial axes (default: mean) and shows the resulting 2D slice. When
-    ``y`` is provided each subplot becomes a side-by-side (pred | gt).
+    ``x`` (and optional ``y``) are arrays with shape ``(C?, *spatial)``, numpy or
+    device arrays. Each subplot in the upper triangle aggregates the non-displayed
+    spatial axes (default: mean) and shows the resulting 2D slice; only those
+    slices are brought to host. When ``y`` is provided each subplot becomes a
+    side-by-side (pred | gt).
     """
-    x = np.asarray(x)
-    if y is not None:
-        y = np.asarray(y)
 
     # detect spatial dims + optional leading channel
     if labels is not None:
@@ -88,9 +85,9 @@ def plot_nd(
     if ndim < 2:
         # 1D: just plot a line
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(x.ravel(), label="x")
+        ax.plot(np.asarray(x).ravel(), label="x")
         if y is not None:
-            ax.plot(y.ravel(), label="y", linestyle="--")
+            ax.plot(np.asarray(y).ravel(), label="y", linestyle="--")
             ax.legend()
         return _plt_to_wandb_image(fig) if to_wandb else fig
 
@@ -99,7 +96,8 @@ def plot_nd(
 
     comb = [list(c) for c in combinations(range(ndim), 2)]
     fig, axes = plt.subplots(
-        ndim, ndim,
+        ndim,
+        ndim,
         figsize=(ndim * (3.5 if y is not None else 2), ndim * 1.8),
         squeeze=False,
     )
@@ -119,8 +117,9 @@ def plot_nd(
             res = d[tuple(slices)]
         else:
             res = d.mean(axis=other_dims)
+        res = np.asarray(res)
         if mark_bad:
-            s = d.std(axis=other_dims)
+            s = np.asarray(d.std(axis=other_dims))
             res = np.where(s == 0, np.nan, res)
         return res
 
@@ -145,7 +144,8 @@ def plot_nd(
                 ax.set_ylabel(rf"${labels[i]}$", fontsize=22, labelpad=2)
             if i == j - 1:
                 ax.set_xlabel(rf"${labels[j]}$", fontsize=22, labelpad=2)
-            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_xticks([])
+            ax.set_yticks([])
             _force_aspect(ax, aspect=aspect * (2.1 if y is not None else 1.0))
 
     plt.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99, wspace=0, hspace=0)
@@ -169,14 +169,13 @@ def generate_val_plots(
     plots: dict[str, object] = {}
     time_str = f"T={float(ts[0]):.2f}, " if ts is not None and np.asarray(ts).size > 0 else ""
     field_configs = {
-        "df":  {"name": f"df ({time_str}{phase})",  "recombine": True,  "cmap": "RdBu_r"},
+        "df": {"name": f"df ({time_str}{phase})", "recombine": True, "cmap": "RdBu_r"},
         "phi": {"name": f"phi ({time_str}{phase})", "recombine": False, "cmap": "plasma"},
     }
     for key, cfg in field_configs.items():
         if key not in rollout or key not in gt:
             continue
-        x = np.asarray(rollout[key])
-        y = np.asarray(gt[key])
+        x, y = rollout[key], gt[key]
         if cfg["recombine"]:
             if y.shape[0] != 2:
                 y = _recombine_zf(y, axis=0)
@@ -185,7 +184,7 @@ def generate_val_plots(
                 x = _recombine_zf(x, axis=axis)
         if x.ndim == 7:
             x = x[0]
-        x = np.squeeze(x); y = np.squeeze(y)
+        x, y = x.squeeze(), y.squeeze()
         fig = plot_nd(x, y, cmap=cfg["cmap"])
         plots[cfg["name"]] = _plt_to_wandb_image(fig) if to_wandb else fig
     return plots
@@ -202,12 +201,18 @@ def avg_flux_confidence(
     fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
     x_pos = np.arange(len(traj_ids))
     ax.errorbar(
-        x_pos, pred_means, yerr=pred_stds, fmt="o", capsize=6,
-        label="Predicted (Mean ± Std)", color="#1f77b4",
-        mfc="white", mew=2, alpha=0.8,
+        x_pos,
+        pred_means,
+        yerr=pred_stds,
+        fmt="o",
+        capsize=6,
+        label="Predicted (Mean ± Std)",
+        color="#1f77b4",
+        mfc="white",
+        mew=2,
+        alpha=0.8,
     )
-    ax.scatter(x_pos, tgt_vals, marker="x", s=80, color="#d62728",
-               label="Ground Truth", zorder=3)
+    ax.scatter(x_pos, tgt_vals, marker="x", s=80, color="#d62728", label="Ground Truth", zorder=3)
     ax.set_xticks(x_pos)
     ax.set_xticklabels(traj_ids, rotation=45, ha="right")
     ax.set_xlabel("Trajectory ID", fontsize=12)

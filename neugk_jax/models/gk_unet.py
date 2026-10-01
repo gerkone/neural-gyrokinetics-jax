@@ -8,7 +8,6 @@ from __future__ import annotations
 from typing import Callable, Optional, Sequence
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 from einops import rearrange
@@ -71,39 +70,74 @@ class SwinBlockDown(eqx.Module):
         self.use_cond = cond_dim is not None and cond_dim > 0
         if self.use_cond and cond_mode == "film":
             self.swin = FilmSwinLayer(
-                space, dim, depth=depth, num_heads=num_heads,
-                grid_size=grid_size, window_size=window_size, cond_dim=cond_dim,
-                key=k1, mlp_ratio=mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                space,
+                dim,
+                depth=depth,
+                num_heads=num_heads,
+                grid_size=grid_size,
+                window_size=window_size,
+                cond_dim=cond_dim,
+                key=k1,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
         elif self.use_cond:
             self.swin = DiTSwinLayer(
-                space, dim, depth=depth, num_heads=num_heads,
-                grid_size=grid_size, window_size=window_size,
+                space,
+                dim,
+                depth=depth,
+                num_heads=num_heads,
+                grid_size=grid_size,
+                window_size=window_size,
                 cond_dim=cond_dim,
-                key=k1, mlp_ratio=mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=rms_norm,
+                key=k1,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=False,  # only affects plain swin blocks
             )
         else:
             self.swin = SwinLayer(
-                space, dim, depth=depth, num_heads=num_heads,
-                grid_size=grid_size, window_size=window_size,
-                key=k1, mlp_ratio=mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                space,
+                dim,
+                depth=depth,
+                num_heads=num_heads,
+                grid_size=grid_size,
+                window_size=window_size,
+                key=k1,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
         self.downsample = PatchMerge(
-            dim, grid_size, key=k2, c_multiplier=c_multiplier, rms_norm=rms_norm,
+            dim,
+            grid_size,
+            key=k2,
+            c_multiplier=c_multiplier,
+            rms_norm=rms_norm,
         )
         self.resampled_grid_size = self.downsample.target_grid_size
         self.out_dim = self.downsample.out_dim
@@ -129,6 +163,7 @@ class SwinBlockUp(eqx.Module):
     resampled_grid_size: tuple[int, ...] = eqx.field(static=True)
     mode: LayerModes = eqx.field(static=True)
     use_cond: bool = eqx.field(static=True)
+    act_fn: Callable = eqx.field(static=True)
 
     def __init__(
         self,
@@ -160,6 +195,7 @@ class SwinBlockUp(eqx.Module):
         legacy_double_shortcut: bool = False,
     ):
         k1, k2, k3 = jr.split(key, 3)
+        self.act_fn = act_fn
         if use_skip:
             self.proj_concat = Linear(2 * dim, dim, key=k1)
         else:
@@ -170,40 +206,73 @@ class SwinBlockUp(eqx.Module):
         up_rms_norm = False
         if self.use_cond and cond_mode == "film":
             self.swin = FilmSwinLayer(
-                space, dim, depth=depth, num_heads=num_heads,
-                grid_size=grid_size, window_size=window_size, cond_dim=cond_dim,
-                key=k2, mlp_ratio=mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=up_rms_norm,
+                space,
+                dim,
+                depth=depth,
+                num_heads=num_heads,
+                grid_size=grid_size,
+                window_size=window_size,
+                cond_dim=cond_dim,
+                key=k2,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=up_rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
         elif self.use_cond:
             self.swin = DiTSwinLayer(
-                space, dim, depth=depth, num_heads=num_heads,
-                grid_size=grid_size, window_size=window_size,
+                space,
+                dim,
+                depth=depth,
+                num_heads=num_heads,
+                grid_size=grid_size,
+                window_size=window_size,
                 cond_dim=cond_dim,
-                key=k2, mlp_ratio=mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention, rms_norm=up_rms_norm,
+                key=k2,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                rms_norm=up_rms_norm,
                 legacy_double_shortcut=False,  # only affects plain swin blocks
             )
         else:
             self.swin = SwinLayer(
-                space, dim, depth=depth, num_heads=num_heads,
-                grid_size=grid_size, window_size=window_size,
-                key=k2, mlp_ratio=mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=up_rms_norm,
+                space,
+                dim,
+                depth=depth,
+                num_heads=num_heads,
+                grid_size=grid_size,
+                window_size=window_size,
+                key=k2,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=up_rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
         if mode == LayerModes.UPSAMPLE:
             self.upsample = PatchExpand(
-                dim, grid_size, key=k3,
+                dim,
+                grid_size,
+                key=k3,
                 c_multiplier=c_multiplier,
                 expand_by=2,
                 target_grid_size=target_grid_size,
@@ -218,8 +287,7 @@ class SwinBlockUp(eqx.Module):
 
     def __call__(self, x, s=None, condition=None, *, key=None, inference=True):
         if self.proj_concat is not None and s is not None:
-            x = self.proj_concat(jnp.concatenate([x, s], axis=-1))
-            x = jax.nn.gelu(x)
+            x = self.act_fn(self.proj_concat(jnp.concatenate([x, s], axis=-1)))
         if self.pos_embed is not None:
             x = self.pos_embed(x)
         if self.use_cond:
@@ -241,9 +309,9 @@ class SwinNDUnet(eqx.Module):
     patch_embed: PatchEmbed
     cond_embed: Optional[object]
     down_blocks: list[SwinBlockDown]
-    middle: object  # ViTLayer (ae) or FilmSwinLayer (gyroswin windowed+rpb middle)
+    middle: Optional[object]
     middle_pe: Optional[APE]
-    middle_upscale: PatchExpand
+    middle_upscale: Optional[PatchExpand]
     up_blocks: list[SwinBlockUp]
     unpatch: PatchExpand
 
@@ -257,7 +325,6 @@ class SwinNDUnet(eqx.Module):
     down_dims: tuple = eqx.field(static=True)
     in_channels: int = eqx.field(static=True)
     out_channels: int = eqx.field(static=True)
-    norm_output: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -283,7 +350,6 @@ class SwinNDUnet(eqx.Module):
         merging_depth: int = 2,
         unmerging_depth: int = 2,
         act_fn: Callable = gelu,
-        norm_output: bool = False,
         use_checkpoint: bool = False,
         qkv_bias: bool = False,
         qk_norm: bool = False,
@@ -298,6 +364,7 @@ class SwinNDUnet(eqx.Module):
         n_cond: int = 0,
         cond_embed_dim: int = 128,
         middle_swin: bool = False,
+        build_middle: bool = True,
         conv_patch: bool = False,
         unpatch_patch_skip: bool = False,
         key,
@@ -319,15 +386,23 @@ class SwinNDUnet(eqx.Module):
         ki = 0
 
         self.patch_embed = PatchEmbed(
-            padded_base, patch_size, in_channels=in_channels, embed_dim=dim,
-            key=keys[ki], mlp_depth=merging_depth, mlp_ratio=merging_hidden_ratio,
-            rms_norm=rms_norm, act_fn=act_fn,
+            padded_base,
+            patch_size,
+            in_channels=in_channels,
+            embed_dim=dim,
+            key=keys[ki],
+            mlp_depth=merging_depth,
+            mlp_ratio=merging_hidden_ratio,
+            rms_norm=rms_norm,
+            act_fn=act_fn,
         )
         ki += 1
         # per-u-net conditioning embed (gyroswin): raw scalars to 4*cond_embed_dim; when present it drives cond_dim for all film/dit blocks below
         if n_cond > 0:
             self.cond_embed = ContinuousConditionEmbed(
-                dim=cond_embed_dim, n_cond=n_cond, key=jr.fold_in(key, 999),
+                dim=cond_embed_dim,
+                n_cond=n_cond,
+                key=jr.fold_in(key, 999),
             )
             cond_dim = self.cond_embed.cond_dim
         else:
@@ -337,15 +412,27 @@ class SwinNDUnet(eqx.Module):
         down_blocks = []
         for i in range(num_layers):
             blk = SwinBlockDown(
-                space, down_dims[i], grid_size=grid_sizes[i],
-                window_size=window_size, num_heads=num_heads[i], depth=depth[i],
-                key=keys[ki], use_abs_pe=use_abs_pe, drop_path=drop_path,
-                mlp_ratio=hidden_mlp_ratio, c_multiplier=c_multiplier,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
-                cond_dim=cond_dim, cond_mode=cond_mode,
+                space,
+                down_dims[i],
+                grid_size=grid_sizes[i],
+                window_size=window_size,
+                num_heads=num_heads[i],
+                depth=depth[i],
+                key=keys[ki],
+                use_abs_pe=use_abs_pe,
+                drop_path=drop_path,
+                mlp_ratio=hidden_mlp_ratio,
+                c_multiplier=c_multiplier,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
+                cond_dim=cond_dim,
+                cond_mode=cond_mode,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             ki += 1
@@ -357,44 +444,86 @@ class SwinNDUnet(eqx.Module):
         self.grid_sizes = tuple(grid_sizes)
         self.down_dims = tuple(down_dims)
 
-        # middle: global attention at the deepest grid; the ae uses a plain vit, gyroswin uses a windowed swinlayer with rpb whose window equals the bottleneck grid (so it's global) plus per-block film
-        if middle_swin and cond_mode == "dit":
+        # global attention at the deepest grid: a vit, or a swin layer whose window is the whole grid
+        if not build_middle:
+            self.middle = None
+        elif middle_swin and cond_mode == "dit":
             self.middle = DiTSwinLayer(
-                space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
-                grid_size=grid_sizes[-1], window_size=grid_sizes[-1], cond_dim=cond_dim,
-                key=keys[ki], mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm, use_rpb=use_rpb,
-                gated_attention=gated_attention, rms_norm=rms_norm,
+                space,
+                down_dims[-1],
+                depth=middle_depth,
+                num_heads=middle_num_heads,
+                grid_size=grid_sizes[-1],
+                window_size=grid_sizes[-1],
+                cond_dim=cond_dim,
+                key=keys[ki],
+                mlp_ratio=hidden_mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=False,  # only affects plain swin blocks
             )
         elif middle_swin:
             self.middle = FilmSwinLayer(
-                space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
-                grid_size=grid_sizes[-1], window_size=grid_sizes[-1], cond_dim=cond_dim,
-                key=keys[ki], mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm, use_rpb=use_rpb,
-                gated_attention=gated_attention, norm_affine=norm_affine, rms_norm=rms_norm,
+                space,
+                down_dims[-1],
+                depth=middle_depth,
+                num_heads=middle_num_heads,
+                grid_size=grid_sizes[-1],
+                window_size=grid_sizes[-1],
+                cond_dim=cond_dim,
+                key=keys[ki],
+                mlp_ratio=hidden_mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
         else:
             self.middle = ViTLayer(
-                space, down_dims[-1], depth=middle_depth, num_heads=middle_num_heads,
-                grid_size=grid_sizes[-1], key=keys[ki],
-                mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
-                gated_attention=gated_attention, norm_affine=norm_affine,
+                space,
+                down_dims[-1],
+                depth=middle_depth,
+                num_heads=middle_num_heads,
+                grid_size=grid_sizes[-1],
+                key=keys[ki],
+                mlp_ratio=hidden_mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
             )
         ki += 1
-        self.middle_pe = APE(down_dims[-1], grid_sizes[-1], init="sincos") if use_abs_pe else None
+        use_mid_pe = use_abs_pe and build_middle
+        self.middle_pe = APE(down_dims[-1], grid_sizes[-1], init="sincos") if use_mid_pe else None
         # middle_upscale always uses layernorm (unlike PatchMerge's rmsnorm)
-        self.middle_upscale = PatchExpand(
-            down_dims[-1], grid_sizes[-1], key=keys[ki],
-            target_grid_size=grid_sizes[-2], c_multiplier=c_multiplier,
-            mlp_depth=1, rms_norm=False, use_conv=conv_patch,
-        )
+        if build_middle:
+            self.middle_upscale = PatchExpand(
+                down_dims[-1],
+                grid_sizes[-1],
+                key=keys[ki],
+                target_grid_size=grid_sizes[-2],
+                c_multiplier=c_multiplier,
+                mlp_depth=1,
+                rms_norm=False,
+                use_conv=conv_patch,
+            )
+        else:
+            self.middle_upscale = None
         ki += 1
 
         # up path
@@ -402,22 +531,34 @@ class SwinNDUnet(eqx.Module):
         up_grid_sizes = grid_sizes[::-1][1:]
         up_blocks = []
         up_common = dict(
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention,
-            norm_affine=norm_affine, use_skip=up_use_skip,
-            rms_norm=rms_norm, cond_dim=cond_dim, cond_mode=cond_mode,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            use_rpb=use_rpb,
+            gated_attention=gated_attention,
+            norm_affine=norm_affine,
+            use_skip=up_use_skip,
+            rms_norm=rms_norm,
+            cond_dim=cond_dim,
+            cond_mode=cond_mode,
             legacy_double_shortcut=legacy_double_shortcut,
         )
         for i in range(num_layers - 1):
             up_blocks.append(
                 SwinBlockUp(
-                    space, up_dims[i], grid_size=up_grid_sizes[i],
+                    space,
+                    up_dims[i],
+                    grid_size=up_grid_sizes[i],
                     target_grid_size=up_grid_sizes[i + 1],
-                    window_size=window_size, num_heads=num_heads[::-1][i],
+                    window_size=window_size,
+                    num_heads=num_heads[::-1][i],
                     depth=depth[::-1][i],
-                    key=keys[ki], use_abs_pe=use_abs_pe, drop_path=drop_path,
-                    mlp_ratio=hidden_mlp_ratio, c_multiplier=c_multiplier,
-                    act_fn=act_fn, use_checkpoint=use_checkpoint,
+                    key=keys[ki],
+                    use_abs_pe=use_abs_pe,
+                    drop_path=drop_path,
+                    mlp_ratio=hidden_mlp_ratio,
+                    c_multiplier=c_multiplier,
+                    act_fn=act_fn,
+                    use_checkpoint=use_checkpoint,
                     **up_common,
                 )
             )
@@ -425,12 +566,19 @@ class SwinNDUnet(eqx.Module):
         # final decoder block: no upsample, SEQUENCE mode
         up_blocks.append(
             SwinBlockUp(
-                space, up_dims[-1], grid_size=up_grid_sizes[-1],
-                window_size=window_size, num_heads=num_heads[::-1][-1],
-                depth=depth[::-1][-1], key=keys[ki],
-                use_abs_pe=use_abs_pe, drop_path=drop_path,
-                mlp_ratio=hidden_mlp_ratio, c_multiplier=c_multiplier,
-                act_fn=act_fn, use_checkpoint=use_checkpoint,
+                space,
+                up_dims[-1],
+                grid_size=up_grid_sizes[-1],
+                window_size=window_size,
+                num_heads=num_heads[::-1][-1],
+                depth=depth[::-1][-1],
+                key=keys[ki],
+                use_abs_pe=use_abs_pe,
+                drop_path=drop_path,
+                mlp_ratio=hidden_mlp_ratio,
+                c_multiplier=c_multiplier,
+                act_fn=act_fn,
+                use_checkpoint=use_checkpoint,
                 mode=LayerModes.SEQUENCE,
                 **up_common,
             )
@@ -440,11 +588,16 @@ class SwinNDUnet(eqx.Module):
 
         # unpatch: expand back to padded base resolution (norm=False)
         self.unpatch = PatchExpand(
-            up_dims[-1], up_grid_sizes[-1], key=keys[ki],
+            up_dims[-1],
+            up_grid_sizes[-1],
+            key=keys[ki],
             expand_by=tuple(p if p > 0 else 1 for p in patch_size),
             out_channels=out_channels,
-            mlp_depth=unmerging_depth, mlp_ratio=unmerging_hidden_ratio,
-            norm=False, use_conv=conv_patch, patch_skip=unpatch_patch_skip,
+            mlp_depth=unmerging_depth,
+            mlp_ratio=unmerging_hidden_ratio,
+            norm=False,
+            use_conv=conv_patch,
+            patch_skip=unpatch_patch_skip,
             cond_dim=(cond_dim if self.cond_embed is not None else None),
         )
         self.space = space
@@ -454,7 +607,6 @@ class SwinNDUnet(eqx.Module):
         self.window_size = tuple(window_size)
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.norm_output = norm_output
 
     # forward path
 
@@ -476,6 +628,8 @@ class SwinNDUnet(eqx.Module):
         return jnp.moveaxis(x, -1, 0)
 
     def __call__(self, x: jnp.ndarray, *, key=None, inference=True):
+        if self.middle is None:
+            raise ValueError("built with build_middle=False; the owner runs its own bottleneck")
         z, pad_axes = self.patch_encode(x)
         skips = []
         for blk in self.down_blocks:
@@ -554,7 +708,10 @@ class Swin5DUnet(SwinNDUnet):
             # learnable pe for the collapsed mu axis
             vel_pe_resolution = (1, decoupled_dim, 1, 1, 1)
             self.vel_pe = APE(
-                full_in, vel_pe_resolution, init="normal", learnable=True,
+                full_in,
+                vel_pe_resolution,
+                init="normal",
+                learnable=True,
                 key=jr.PRNGKey(0),
             )
         else:

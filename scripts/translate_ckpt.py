@@ -22,8 +22,9 @@ def main():
     p.add_argument("--torch-ckpt", required=True, help="path to .pth (torch state_dict)")
     p.add_argument("--config", required=True, help="upstream Hydra config.yaml")
     p.add_argument("--out", required=True, help="path to write the equinox checkpoint")
-    p.add_argument("--strict", action="store_true",
-                   help="abort on any leaf that has no torch counterpart")
+    p.add_argument(
+        "--strict", action="store_true", help="abort on any leaf that has no torch counterpart"
+    )
     args = p.parse_args()
 
     torch_state = load_torch_state(args.torch_ckpt)
