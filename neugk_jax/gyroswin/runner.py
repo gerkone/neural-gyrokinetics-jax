@@ -17,13 +17,6 @@ from neugk_jax.training.runner import BaseRunner
 from neugk_jax.utils import config_dict
 
 
-def model_conditions(cfg) -> tuple:
-    conds = cfg.model.get("conditioning")
-    if conds is None:
-        conds = cfg.dataset.get("conditions", ("itg", "dg", "s_hat", "q"))
-    return tuple(conds or ())
-
-
 class GyroSwinRunner(BaseRunner):
     """Trains GyroSwinMultitask to predict the state at ``t + 1`` from ``t``."""
 
@@ -46,7 +39,7 @@ class GyroSwinRunner(BaseRunner):
             dist=self.dist,
             mode="next",
             fields=tuple(sorted(fields)),
-            conditions=model_conditions(cfg),
+            conditions=cfg.model.get("conditioning"),
             val_overrides={"tail_offset": tail},
         )
         self.separate_zf_loss = bool(m.get("extra_zf_loss", False) and self.train_ds.separate_zf)

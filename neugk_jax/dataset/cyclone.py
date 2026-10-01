@@ -12,7 +12,6 @@ backend (host numpy, or device jax for ``KvikIOBackend``), the scalars are numpy
 from __future__ import annotations
 
 import copy
-import dataclasses
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +24,17 @@ from neugk_jax.dataset.backend import DataBackend, expand_spec
 from neugk_jax.dataset.normalization import NormTable, load_stats, metadata_stats
 from neugk_jax.utils import RunningStats
 from neugk_jax.utils import separate_zf as separate_zf_fn
+
+# heat-flux steps averaged into the trajectory flux
+FLUX_AVG_WINDOW = 80
+# condition names of the scalar trajectory parameters -> their metadata keys
+COND_META_KEYS = {"itg": "ion_temp_grad", "dg": "density_grad", "s_hat": "s_hat", "q": "q"}
+DEFAULT_CONDITIONS = tuple(COND_META_KEYS)
+
+
+def avg_flux(flux) -> float:
+    """Mean heat flux of the last ``FLUX_AVG_WINDOW`` steps, the first step excluded."""
+    return float(np.mean(np.asarray(flux)[1:][-FLUX_AVG_WINDOW:]))
 
 
 def _f32(x):
@@ -96,7 +106,7 @@ class CycloneDataset:
         split: str = "train",
         trajectories: Optional[Any] = None,
         fields_to_load: Sequence[str] = ("df",),
-        conditions: Sequence[str] = ("itg", "dg", "s_hat", "q"),
+        conditions: Sequence[str] = DEFAULT_CONDITIONS,
         mode: str = "ae",
         normalization: Optional[dict] = None,
         normalization_scope: str = "dataset",
@@ -150,9 +160,9 @@ class CycloneDataset:
             metas = list(ex.map(backend.read_metadata, self.files))
         self.metadata: dict[int, dict] = {}
         kept_files = []
-        # metadata keys _build_sample hard-requires, plus any non-alias conditioning field
-        required = {"ion_temp_grad", "density_grad", "s_hat", "q", "flux", "timesteps"}
-        required |= {c for c in self.conditions if c not in ("itg", "dg", "s_hat", "q", "timestep")}
+        # metadata keys every sample needs, plus any other conditioning field
+        required = {*COND_META_KEYS.values(), "flux", "timesteps"}
+        required |= {c for c in self.conditions if c not in COND_META_KEYS and c != "timestep"}
         for fp, meta in zip(self.files, metas):
             if not self._passes_cond_filter(meta):
                 continue
@@ -209,7 +219,7 @@ class CycloneDataset:
             if not isinstance(cond_range[0], (list, tuple)):
                 cond_range = [cond_range]
             if cond_name == "flux":
-                bound = self.offset if self.offset > 0 else 80
+                bound = self.offset if self.offset > 0 else FLUX_AVG_WINDOW
                 cond = float(np.mean(cond[:bound] if where == "first" else cond[-bound:]))
             if not any(lo <= cond <= hi for lo, hi in cond_range):
                 return False
@@ -219,35 +229,81 @@ class CycloneDataset:
         return self.length
 
     def __getitem__(self, index: int) -> CycloneSample:
-        fid, t_idx = self.flat_index_to_file_and_tstep[index]
-        if self.mode == "diff" and self.precomputed_latents is not None:
-            return self._get_latent_sample(fid, t_idx)
-        if self.mode == "next":
-            return self._get_next_sample(fid, t_idx)
-        return self._get_ae_sample(fid, t_idx)
+        return self.sample(*self.flat_index_to_file_and_tstep[index])
 
     def with_mode(self, mode: str) -> "CycloneDataset":
         view = copy.copy(self)
         view.mode = mode
         return view
 
-    def get_target(self, fid: int, t_idx: int) -> dict[str, np.ndarray]:
-        """Normalized next-step targets ``y_*`` of ``(fid, t_idx)`` without reading the input."""
-        fid, t_idx = int(fid), int(t_idx)
-        meta = self.metadata[fid]
-        gt_t = t_idx + self.offset + self.bundle_seq_length
-        out: dict[str, np.ndarray] = {}
-        with self.backend.open(self.files[fid]) as handle:
-            if "df" in self.fields_to_load:
-                y_df = self.backend.read_df(handle, gt_t, self.df_shape)
-                if self.separate_zf:
-                    y_df = separate_zf_fn(y_df, axis=0)
-                out["df"] = y_df
-            if "phi" in self.fields_to_load:
-                out["phi"] = self.backend.read_phi(handle, gt_t, self.phi_resolution)
-        out["flux"] = np.asarray(meta["flux"][gt_t], dtype=np.float32)
-        out["fluxavg"] = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
+    def _frames(self, handle, fid: int, t: int) -> dict:
+        """Normalized float32 ``df``/``phi`` frames (those loaded) at raw frame index ``t``."""
+        out = {}
+        if "df" in self.fields_to_load:
+            df = self.backend.read_df(handle, t, self.df_shape)
+            out["df"] = separate_zf_fn(df, axis=0) if self.separate_zf else df
+        if "phi" in self.fields_to_load:
+            out["phi"] = self.backend.read_phi(handle, t, self.phi_resolution)
         return {k: _f32(self.norm.normalize(k, v, fid)) for k, v in out.items()}
+
+    def _targets(self, handle, fid: int, t_idx: int) -> dict:
+        """Normalized next-step targets (frames, ``flux``, ``fluxavg``) of sample ``(fid, t_idx)``."""
+        t = t_idx + self.offset + self.bundle_seq_length
+        flux = self.metadata[fid]["flux"]
+        out = self._frames(handle, fid, t)
+        out["flux"] = np.asarray(flux[t], dtype=np.float32)
+        out["fluxavg"] = np.float32(avg_flux(flux))
+        for k in ("flux", "fluxavg"):
+            out[k] = np.asarray(self.norm.normalize(k, out[k], fid), np.float32)
+        return out
+
+    def get_target(self, fid: int, t_idx: int) -> dict[str, np.ndarray]:
+        """Normalized next-step targets of ``(fid, t_idx)`` without reading the input."""
+        fid, t_idx = int(fid), int(t_idx)
+        with self.backend.open(self.files[fid]) as handle:
+            return self._targets(handle, fid, t_idx)
+
+    def sample(self, fid: int, t_idx: int) -> CycloneSample:
+        """The sample of trajectory ``fid`` at timestep index ``t_idx`` in the current mode."""
+        meta, t = self.metadata[fid], t_idx + self.offset
+        flux, timestep = meta["flux"][t], meta["timesteps"][t]
+        targets = {}
+        if self.mode == "diff" and self.precomputed_latents is not None:
+            cached = self.precomputed_latents[(fid, t_idx)]
+            frames = {"df": cached["x"].astype(np.float32), "phi": cached.get("phi")}
+            flux, timestep = cached.get("flux", flux), cached.get("timestep", timestep)
+        else:
+            with self.backend.open(self.files[fid]) as handle:
+                frames = self._frames(handle, fid, t)
+                if self.mode == "next":
+                    targets = self._targets(handle, fid, t_idx)
+        timestep = np.asarray(timestep, dtype=np.float32)
+        return CycloneSample(
+            df=frames.get("df"),
+            phi=frames.get("phi"),
+            flux=np.asarray(flux, dtype=np.float32),
+            avg_flux=np.float32(self.get_avg_flux(fid)),
+            timestep=timestep,
+            file_index=np.int64(fid),
+            timestep_index=np.int64(t_idx),
+            conditioning=self.conditioning(fid, timestep),
+            **{
+                k: np.asarray(np.squeeze(meta[v]), dtype=np.float32)
+                for k, v in COND_META_KEYS.items()
+            },
+            **{f"y_{k}": v for k, v in targets.items()},
+        )
+
+    def conditioning(self, fid: int, timestep) -> Optional[np.ndarray]:
+        """The ``conditions`` of trajectory ``fid`` at ``timestep``, packed in sorted order."""
+        if not self.conditions:
+            return None
+        meta = self.metadata[fid]
+        vals = [
+            timestep if k == "timestep" else np.squeeze(meta[COND_META_KEYS.get(k, k)])
+            for k in self.conditions
+        ]
+        return np.concatenate([np.atleast_1d(np.asarray(v, np.float32)) for v in vals])
 
     def num_ts(self, fid: int) -> int:
         """Raw timesteps of trajectory ``fid`` after ``offset``, tail and subsampled ones included.
@@ -262,116 +318,8 @@ class CycloneDataset:
             self.metadata[int(fid)]["timesteps"][int(t_idx) + self.offset], dtype=np.float32
         )
 
-    def _get_ae_sample(self, fid: int, t_idx: int) -> CycloneSample:
-        meta = self.metadata[fid]
-        original_t = t_idx + self.offset
-        f_path = self.files[fid]
-        df = phi = None
-        with self.backend.open(f_path) as handle:
-            if "df" in self.fields_to_load:
-                df = self.backend.read_df(handle, original_t, self.df_shape)
-                if self.separate_zf:
-                    df = separate_zf_fn(df, axis=0)
-            if "phi" in self.fields_to_load:
-                phi = self.backend.read_phi(handle, original_t, self.phi_resolution)
-
-        flux = np.asarray(meta["flux"][original_t], dtype=np.float32)
-        timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
-        if df is not None and self.normalization is not None:
-            df = _f32(self.norm.normalize("df", df, fid))
-        if phi is not None and self.normalization is not None:
-            phi = _f32(self.norm.normalize("phi", phi, fid))
-
-        return self._build_sample(fid, t_idx, df, phi, flux, timestep, meta)
-
-    def _get_next_sample(self, fid: int, t_idx: int) -> CycloneSample:
-        meta = self.metadata[fid]
-        original_t = t_idx + self.offset
-        gt_t = original_t + self.bundle_seq_length
-        df = y_df = phi = y_phi = None
-        with self.backend.open(self.files[fid]) as handle:
-            if "df" in self.fields_to_load:
-                df = self.backend.read_df(handle, original_t, self.df_shape)
-                y_df = self.backend.read_df(handle, gt_t, self.df_shape)
-                if self.separate_zf:
-                    df = separate_zf_fn(df, axis=0)
-                    y_df = separate_zf_fn(y_df, axis=0)
-            if "phi" in self.fields_to_load:
-                phi = self.backend.read_phi(handle, original_t, self.phi_resolution)
-                y_phi = self.backend.read_phi(handle, gt_t, self.phi_resolution)
-
-        flux = np.asarray(meta["flux"][original_t], dtype=np.float32)
-        y_flux = np.asarray(meta["flux"][gt_t], dtype=np.float32)
-        y_fluxavg = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
-        timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
-        if self.normalization is not None:
-            norm = self.norm.normalize
-            if df is not None:
-                df, y_df = norm("df", df, fid), norm("df", y_df, fid)
-            if phi is not None:
-                phi, y_phi = norm("phi", phi, fid), norm("phi", y_phi, fid)
-            y_flux = norm("flux", y_flux, fid)
-            y_fluxavg = norm("fluxavg", y_fluxavg, fid)
-        sample = self._build_sample(fid, t_idx, _f32(df), _f32(phi), flux, timestep, meta)
-        return dataclasses.replace(
-            sample,
-            y_df=_f32(y_df),
-            y_phi=_f32(y_phi),
-            y_flux=np.asarray(y_flux, np.float32),
-            y_fluxavg=np.asarray(y_fluxavg, np.float32),
-        )
-
-    def _get_latent_sample(self, fid: int, t_idx: int) -> CycloneSample:
-        cached = self.precomputed_latents[(fid, t_idx)]
-        meta = self.metadata[fid]
-        flux = np.asarray(cached.get("flux", meta["flux"][t_idx + self.offset]), dtype=np.float32)
-        timestep = np.asarray(
-            cached.get("timestep", meta["timesteps"][t_idx + self.offset]), dtype=np.float32
-        )
-        return self._build_sample(
-            fid,
-            t_idx,
-            cached["x"].astype(np.float32),
-            cached.get("phi"),
-            flux,
-            timestep,
-            meta,
-        )
-
-    def _build_sample(self, fid, t_idx, df, phi, flux, timestep, meta) -> CycloneSample:
-        itg = np.asarray(np.squeeze(meta["ion_temp_grad"]), dtype=np.float32)
-        dg = np.asarray(np.squeeze(meta["density_grad"]), dtype=np.float32)
-        s_hat = np.asarray(np.squeeze(meta["s_hat"]), dtype=np.float32)
-        q = np.asarray(np.squeeze(meta["q"]), dtype=np.float32)
-        cond_vec = None
-        if self.conditions:
-            packed = []
-            local = {"itg": itg, "dg": dg, "s_hat": s_hat, "q": q, "timestep": timestep}
-            for k in self.conditions:
-                v = local.get(k)
-                if v is None:
-                    v = np.asarray(np.squeeze(meta[k]), dtype=np.float32)
-                packed.append(np.atleast_1d(v))
-            cond_vec = np.concatenate(packed).astype(np.float32)
-
-        avg = float(np.mean(meta["flux"][-80:]))
-        return CycloneSample(
-            df=df,
-            phi=phi,
-            flux=flux,
-            avg_flux=np.float32(avg),
-            timestep=timestep,
-            file_index=np.int64(fid),
-            timestep_index=np.int64(t_idx),
-            conditioning=cond_vec,
-            itg=itg,
-            dg=dg,
-            s_hat=s_hat,
-            q=q,
-        )
-
     def get_avg_flux(self, fid: int) -> float:
-        return float(np.mean(self.metadata[fid]["flux"][-80:]))
+        return avg_flux(self.metadata[fid]["flux"])
 
     def get_ds(self, fid: int) -> float | None:
         # parallel (s) grid spacing; None when the trajectory metadata doesn't carry it

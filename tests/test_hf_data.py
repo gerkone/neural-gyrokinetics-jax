@@ -55,14 +55,14 @@ def test_h5_loader_reads_the_release_snapshot(hf_sample, raw):
     meta = ds.metadata[0]
     assert float(meta["flux"][0]) == pytest.approx(float(raw["meta"]["fluxes"][0]))
     assert ds.get_ds(0) == pytest.approx(0.0625)
-    s = ds._get_ae_sample(0, 0)
+    s = ds.sample(0, 0)
     np.testing.assert_array_equal(s.df, raw["df"])
     assert float(s.timestep) == pytest.approx(float(raw["meta"]["timesteps"][0]))
     want = [raw["meta"][k][0] for k in ("density_grad", "ion_temp_grad", "q", "s_hat")]
     assert ds.conditions == ["dg", "itg", "q", "s_hat"]
     np.testing.assert_allclose(s.conditioning, want, rtol=1e-6)
 
-    norm = _dataset(hf_sample, stats, separate_zf=True)._get_ae_sample(0, 0).df
+    norm = _dataset(hf_sample, stats, separate_zf=True).sample(0, 0).df
     with open(stats, "rb") as f:
         full = pickle.load(f)["df"]["full"]
     ref = (separate_zf(raw["df"], axis=0) - full["mean"]) / full["std"]

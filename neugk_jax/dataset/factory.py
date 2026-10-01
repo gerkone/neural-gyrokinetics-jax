@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Optional, Sequence
 
 from neugk_jax.dataset.backend import make_backend
-from neugk_jax.dataset.cyclone import CycloneDataset
+from neugk_jax.dataset.cyclone import DEFAULT_CONDITIONS, CycloneDataset
 from neugk_jax.utils import config_dict
 
 
@@ -46,9 +46,7 @@ def build_dataset(
         trajectories=trajectories if isinstance(trajectories, str) else list(trajectories),
         fields_to_load=tuple(fields or dcfg.get("input_fields", ("df",))),
         conditions=tuple(
-            conditions
-            if conditions is not None
-            else dcfg.get("conditions", ("itg", "dg", "s_hat", "q"))
+            conditions if conditions is not None else dcfg.get("conditions", DEFAULT_CONDITIONS)
         ),
         mode=mode,
         separate_zf=bool(dcfg.get("separate_zf", False)),

@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import jax.numpy as jnp
 import numpy as np
 
+from neugk_jax.dataset.cyclone import COND_META_KEYS
 from neugk_jax.training.ddp import barrier
 from neugk_jax.utils import RunningStats, atomic_write, progress
 
@@ -134,20 +135,18 @@ def precompute_latents(
 
 
 def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
+    from neugk_jax.training.data import eval_plans, stack_fields
+
     latents_dict: dict[tuple[int, int], dict] = {}
-    n = len(dataset)
-    for start in progress(
-        range(0, n, batch_size), True, desc=f"precompute {dataset.split} latents"
-    ):
-        samples = [dataset[i] for i in range(start, min(start + batch_size, n))]
-        # pad the tail so the encoder sees one batch shape
-        padded = samples + [samples[-1]] * (batch_size - len(samples))
-        df_batch = jnp.stack([jnp.asarray(s.df) for s in padded])
-        cond_batch = None
-        if samples[0].conditioning is not None:
-            cond_batch = jnp.stack([jnp.asarray(s.conditioning) for s in padded])
-        z_np = np.asarray(encode_fn(df_batch, cond_batch))
-        for b, s in enumerate(samples):
+    # the tail batch repeats its last sample so the encoder sees one batch shape
+    plans = eval_plans(None, range(len(dataset)), batch_size)
+    for plan in progress(plans, True, desc=f"precompute {dataset.split} latents"):
+        samples = [dataset[int(i)] for i in plan.indices]
+        batch = {
+            k: jnp.asarray(v) for k, v in stack_fields(samples, ("df", "conditioning")).items()
+        }
+        z_np = np.asarray(encode_fn(batch["df"], batch.get("conditioning")))
+        for b, s in enumerate(samples[: int(plan.mask.sum())]):
             entry = {
                 "x": z_np[b],
                 "phi": np.asarray(s.phi) if s.phi is not None else None,
@@ -164,12 +163,11 @@ def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
 
 def latent_arrays(dataset) -> tuple[np.ndarray, np.ndarray | None]:
     """Latents ``(N, *latent_shape)`` and conditioning ``(N, n_cond)`` in flat-index order."""
-    n = len(dataset)
-    keys = [dataset.flat_index_to_file_and_tstep[i] for i in range(n)]
+    keys = [dataset.flat_index_to_file_and_tstep[i] for i in range(len(dataset))]
     z = np.stack([np.asarray(dataset.precomputed_latents[k]["x"], np.float32) for k in keys])
     if not dataset.conditions:
         return z, None
-    return z, np.stack([np.asarray(dataset[i].conditioning, np.float32) for i in range(n)])
+    return z, np.stack([dataset.conditioning(f, dataset.get_timestep(f, t)) for f, t in keys])
 
 
 def load_precomputed_latents(
@@ -206,9 +204,6 @@ def load_precomputed_latents(
     _compute_latent_stats(dataset)
 
 
-_COND_ALIASES = {"itg": "ion_temp_grad", "dg": "density_grad", "s_hat": "s_hat", "q": "q"}
-
-
 def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     """Re-key a cache built with a different file ordering onto this dataset's fids.
 
@@ -218,11 +213,11 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     """
 
     def _tuple_of(get):
-        return np.array([float(np.squeeze(get(k))) for k in ("itg", "dg", "s_hat", "q")])
+        return np.array([float(np.squeeze(get(k))) for k in COND_META_KEYS])
 
     ours = {}
     for fid, meta in dataset.metadata.items():
-        key = tuple(np.round(_tuple_of(lambda k: meta[_COND_ALIASES[k]]), 6))
+        key = tuple(np.round(_tuple_of(lambda k: meta[COND_META_KEYS[k]]), 6))
         if key in ours:
             raise ValueError(
                 f"trajectories {ours[key]} and {fid} share conditions {key}; "
@@ -237,7 +232,7 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     mapping: dict[int, int] = {}
     for cfid in cache_fids:
         entry = cache[(cfid, steps[cfid][0])]
-        if not all(k in entry for k in _COND_ALIASES):
+        if not all(k in entry for k in COND_META_KEYS):
             raise ValueError("cache entries carry no scalar conditions; cannot remap")
         d = np.abs(keys - _tuple_of(lambda k: entry[k])).max(axis=1)
         j = int(np.argmin(d))
@@ -282,11 +277,10 @@ def verify_latent_cache(dataset, cache: dict, *, latent_shape=None) -> None:
             f"latent cache shape {tuple(x.shape)} != model latent {tuple(latent_shape)}"
         )
     # the scalar conditions pin the fid -> trajectory mapping
-    aliases = _COND_ALIASES
     bad = []
     for fid in sorted({k[0] for k in wanted}):
         entry = cache[(fid, sorted(t for f, t in wanted if f == fid)[0])]
-        for short, meta_key in aliases.items():
+        for short, meta_key in COND_META_KEYS.items():
             if short not in entry:
                 continue
             want = float(np.squeeze(dataset.metadata[fid][meta_key]))

@@ -164,6 +164,6 @@ def test_forward_parity_real_sample(translated, torch_model, hf_sample):
         normalization={"df": {"type": "zscore"}},
         normalization_stats=hf_sample.stats,
     )
-    s = ds._get_ae_sample(0, 0)
+    s = ds.sample(0, 0)
     assert ds.conditions == torch_model[1]
     _compare(translated, torch_model, np.asarray(s.df, np.float32), np.asarray(s.conditioning))
