@@ -120,12 +120,7 @@ def _process_traj(traj_dir: str, bits: str, force: bool) -> tuple[str, int, int,
 
 
 def run_quantize(
-    *,
-    path: str,
-    trajs: str | Sequence[str],
-    bits: str,
-    num_workers: int = 4,
-    force: bool = False,
+    *, path: str, trajs: str | Sequence[str], bits: str, num_workers: int = 4, force: bool = False
 ) -> None:
     traj_dirs = [d for d in resolve_traj_dirs(path, trajs) if os.path.isdir(d)]
     if not traj_dirs:

@@ -14,10 +14,7 @@ import json
 import os
 import re
 
-SPLIT_TRAJECTORIES = {
-    "id": "iteration_{8,115,131,148,235,262}",
-    "ood": "ood_iteration_{0-4}",
-}
+SPLIT_TRAJECTORIES = {"id": "iteration_{8,115,131,148,235,262}", "ood": "ood_iteration_{0-4}"}
 
 
 def _save_plot(obj, path: str) -> None:

@@ -63,10 +63,7 @@ class MixingBlock(eqx.Module):
         self.drop_path = _DropPath(drop_path)
         self.norm2 = LayerNorm(left_dim, elementwise_affine=True)
         self.mlp = MLP(
-            [left_dim, int(left_dim * mlp_ratio), left_dim],
-            act_fn=act_fn,
-            drop=drop,
-            key=k2,
+            [left_dim, int(left_dim * mlp_ratio), left_dim], act_fn=act_fn, drop=drop, key=k2
         )
 
     def __call__(

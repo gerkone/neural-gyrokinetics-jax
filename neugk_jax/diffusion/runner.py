@@ -119,10 +119,7 @@ class FlowMatchingRunner(BaseRunner):
                 load_precomputed_latents(ds, path, latent_shape=self.latent_shape, meta=meta)
             else:
                 cache = latent_cache_path(
-                    ds,
-                    ds.split,
-                    cfg.ae_checkpoint,
-                    decouple_mu=dcfg.get("norm_decouple_mu", False),
+                    ds, ds.split, cfg.ae_checkpoint, decouple_mu=dcfg.get("norm_decouple_mu", False)
                 )
                 precompute_latents(
                     ds,

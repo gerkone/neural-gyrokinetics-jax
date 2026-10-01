@@ -92,10 +92,7 @@ class LayerNorm(eqx.Module):
 
     def __init__(self, dim: int, *, eps: float = 1e-5, elementwise_affine: bool = True):
         self.inner = eqx.nn.LayerNorm(
-            (dim,),
-            eps=eps,
-            use_weight=elementwise_affine,
-            use_bias=elementwise_affine,
+            (dim,), eps=eps, use_weight=elementwise_affine, use_bias=elementwise_affine
         )
         self.dim = dim
 

@@ -12,12 +12,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
-from neugk_jax.models.patching import (
-    fold_patches,
-    pad_to_blocks,
-    unfold_patches,
-    unpad,
-)
+from neugk_jax.models.patching import fold_patches, pad_to_blocks, unfold_patches, unpad
 
 
 @pytest.mark.parametrize(

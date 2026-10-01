@@ -89,9 +89,7 @@ def test_phi_to_spc_extracts_centred_window_odd_nkx():
     np.testing.assert_allclose(got, spec, atol=1e-10)
     real = F.spec_to_phi(got)
     np.testing.assert_allclose(
-        F.phi_to_spec(real, got.shape)[..., : nky // 2],
-        spec[..., : nky // 2],
-        atol=1e-10,
+        F.phi_to_spec(real, got.shape)[..., : nky // 2], spec[..., : nky // 2], atol=1e-10
     )
 
 

@@ -149,9 +149,7 @@ class BaseRunner:
         configure_compilation_cache(cfg)
         self.dist = init_distributed()
         self.logger = Logger(
-            is_rank0=self.dist.is_rank0,
-            config=to_dict(cfg),
-            logging=to_dict(cfg.get("logging")),
+            is_rank0=self.dist.is_rank0, config=to_dict(cfg), logging=to_dict(cfg.get("logging"))
         )
         self.output_path = Path(output_path or cfg.get("output_path") or "outputs/run")
         self.tcfg = cfg.training

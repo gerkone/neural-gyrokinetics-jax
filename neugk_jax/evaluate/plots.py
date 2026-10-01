@@ -18,10 +18,7 @@ import numpy as np
 
 from neugk_jax.utils import recombine_zf
 
-GK_LABELS = {
-    5: [r"v_{\parallel}", r"\mu", r"s", r"k_x", r"k_y"],
-    3: [r"k_x", r"s", r"k_y"],
-}
+GK_LABELS = {5: [r"v_{\parallel}", r"\mu", r"s", r"k_x", r"k_y"], 3: [r"k_x", r"s", r"k_y"]}
 
 
 def _force_aspect(ax, aspect: float = 1.0):
@@ -62,10 +59,7 @@ def plot_nd(x: np.ndarray, y: Optional[np.ndarray] = None, *, cmap: str = "RdBu_
     labels = GK_LABELS.get(ndim, [f"d_{i}" for i in range(ndim)])
     comb = [list(c) for c in combinations(range(ndim), 2)]
     fig, axes = plt.subplots(
-        ndim,
-        ndim,
-        figsize=(ndim * (3.5 if y is not None else 2), ndim * 1.8),
-        squeeze=False,
+        ndim, ndim, figsize=(ndim * (3.5 if y is not None else 2), ndim * 1.8), squeeze=False
     )
     cmap_obj = matplotlib.colormaps[cmap].copy()
     cmap_obj.set_bad("gray")
@@ -134,10 +128,7 @@ def generate_val_plots(
 
 
 def avg_flux_confidence(
-    pred_means: np.ndarray,
-    pred_stds: np.ndarray,
-    tgt_vals: np.ndarray,
-    traj_ids: list,
+    pred_means: np.ndarray, pred_stds: np.ndarray, tgt_vals: np.ndarray, traj_ids: list
 ):
     """Per-trajectory flux mean ± std vs ground truth."""
     fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)

@@ -42,15 +42,7 @@ def _make_geometry(resolution):
         "little_g": np.tile(np.array([1.0, 0.0, 1.0]), (s, 1)),
         **{
             k: np.ones((1,), dtype=np.float64)
-            for k in (
-                "mas",
-                "tmp",
-                "de",
-                "d2X",
-                "signz",
-                "signB",
-                "vthrat",
-            )
+            for k in ("mas", "tmp", "de", "d2X", "signz", "signB", "vthrat")
         },
     }
 

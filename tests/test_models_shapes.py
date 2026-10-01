@@ -108,13 +108,7 @@ def test_patch_merge_then_expand():
     assert z.shape == (*grid, expand.out_dim)
 
 
-@pytest.mark.parametrize(
-    "space,grid,window",
-    [
-        (2, (8, 8), (4, 4)),
-        (3, (8, 12, 8), (4, 4, 4)),
-    ],
-)
+@pytest.mark.parametrize("space,grid,window", [(2, (8, 8), (4, 4)), (3, (8, 12, 8), (4, 4, 4))])
 def test_swin_layer(space, grid, window):
     lyr = swin_layer(32, 2, 4, grid, window, key=jr.PRNGKey(0))
     x = jr.normal(jr.PRNGKey(1), (*grid, 32))
@@ -180,13 +174,7 @@ def test_dit_forward():
     z_dim = 16
     dim = 32
     model = DiT(
-        z_dim=z_dim,
-        dim=dim,
-        grid_size=grid,
-        depth=2,
-        num_heads=4,
-        n_cond=4,
-        key=jr.PRNGKey(0),
+        z_dim=z_dim, dim=dim, grid_size=grid, depth=2, num_heads=4, n_cond=4, key=jr.PRNGKey(0)
     )
     x = jr.normal(jr.PRNGKey(1), (*grid, z_dim))
     out = model(x, tstep=jnp.float32(0.5), condition=jnp.array([0.1, 0.2, -0.3, 1.0]))

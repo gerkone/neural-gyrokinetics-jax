@@ -139,8 +139,7 @@ def metrics_from_spectral_sums(sums: Dict[str, np.ndarray]) -> Dict[str, float]:
 
 
 def time_averaged_spectral_metrics(
-    pred_diags: List[Dict[str, np.ndarray]],
-    gt_diags: List[Dict[str, np.ndarray]],
+    pred_diags: List[Dict[str, np.ndarray]], gt_diags: List[Dict[str, np.ndarray]]
 ) -> Dict[str, float]:
     """Spectral metrics of one trajectory's paired snapshot diagnostics."""
     return metrics_from_spectral_sums(spectral_sums(pred_diags, gt_diags))

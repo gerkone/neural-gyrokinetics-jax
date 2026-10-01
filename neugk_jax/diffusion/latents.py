@@ -170,11 +170,7 @@ def latent_arrays(dataset) -> tuple[np.ndarray, np.ndarray | None]:
 
 
 def load_precomputed_latents(
-    dataset,
-    pickle_path: str | Path,
-    *,
-    latent_shape=None,
-    meta: Optional[dict] = None,
+    dataset, pickle_path: str | Path, *, latent_shape=None, meta: Optional[dict] = None
 ) -> None:
     """Populate ``dataset.precomputed_latents`` from a cache pickle and switch to ``mode="diff"``.
 
