@@ -24,13 +24,18 @@ Quantized layout per file::
 Usage::
 
     python -m neugk_jax.dataset.preprocess --mode=preprocess --trajs 'iteration_{0-9}' \\
-        --target-dir /local00/bioinf/galletti
+        --root /path/to/gkw --target-dir /path/to/out
     python -m neugk_jax.dataset.preprocess --mode=rewrite-phi \\
-        --path /local00/bioinf/galletti/preprocessed_kvikio --poten-backup /path/to/backup
-    python -m neugk_jax.dataset.preprocess --mode=gyaradax --gyaradax-dirs /path/to/run
+        --path /path/to/out/preprocessed_kvikio --poten-backup /path/to/backup
+    python -m neugk_jax.dataset.preprocess --mode=gyaradax --gyaradax-dirs /path/to/run \\
+        --target-dir /path/to/out
     python -m neugk_jax.dataset.preprocess --mode=quantize \\
-        --path /local00/bioinf/galletti/preprocessed_kvikio \\
+        --path /path/to/out/preprocessed_kvikio \\
         --trajs 'iteration_{0-299}_ifft_realpotens' --bits bf16 --num-workers 8
+
+``--root`` (raw GKW root holding ``<raw-subdir>/<run>``), ``--target-dir`` and ``--path``
+default to ``$NEUGK_RAW_ROOT``, ``$NEUGK_TARGET_DIR`` and
+``$NEUGK_TARGET_DIR/preprocessed_kvikio``; without them the flags are required.
 """
 
 from __future__ import annotations
@@ -50,8 +55,8 @@ from typing import Iterable, Optional, Sequence
 
 import numpy as np
 
-RAW_ROOT = os.environ.get("NEUGK_RAW_ROOT", "/restricteddata/ukaea/gyrokinetics")
-TARGET_DIR = os.environ.get("NEUGK_TARGET_DIR", "/local00/bioinf/galletti")
+RAW_ROOT = os.environ.get("NEUGK_RAW_ROOT")
+TARGET_DIR = os.environ.get("NEUGK_TARGET_DIR")
 KVIKIO_SUBDIR = "preprocessed_kvikio"
 LIGHT_DROP_KEYS = ("df_min", "df_max", "df_var", "df_mean", "df_std", "phi_min", "phi_max",
                    "phi_var")
@@ -669,7 +674,7 @@ def preprocess(
     spatial_ifft: bool = True,
     separate_zf: bool = False,
     split_into_bands: Optional[int] = None,
-    root: str = RAW_ROOT,
+    root: Optional[str] = RAW_ROOT,
     raw_subdir: str = "raw",
     target_dir: Optional[str] = TARGET_DIR,
     metadata_only: bool = False,
@@ -695,6 +700,8 @@ def preprocess(
     if "Lin" in filename:
         raise ValueError(f"{filename}: linear runs are not converted by preprocess")
     backend = backend or NumpyBackend()
+    if root is None:
+        raise ValueError("preprocess needs the raw GKW root (root= or $NEUGK_RAW_ROOT)")
     target_dir = root if target_dir is None else target_dir
     dir_in = f"{root}/{raw_subdir}/{filename}"
     dir_out = os.path.join(target_dir, KVIKIO_SUBDIR)
@@ -875,7 +882,7 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
 def preprocess_gyaradax(
     traj_dir: str,
     backend=None,
-    target_dir: str = TARGET_DIR,
+    target_dir: Optional[str] = TARGET_DIR,
     out_name: Optional[str] = None,
     metadata_only: bool = False,
     verify: bool = True,
@@ -896,6 +903,8 @@ def preprocess_gyaradax(
     backend = backend or NumpyBackend()
     traj_dir = str(traj_dir)
     name = out_name or os.path.basename(os.path.normpath(traj_dir))
+    if target_dir is None:
+        raise ValueError("preprocess_gyaradax needs target_dir (or $NEUGK_TARGET_DIR)")
     dir_out = os.path.join(target_dir, KVIKIO_SUBDIR)
     os.makedirs(dir_out, exist_ok=True)
     out_path = backend.format_path(os.path.join(dir_out, name), spatial_ifft=True,
@@ -1022,7 +1031,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--mode", choices=("preprocess", "rewrite-phi", "gyaradax", "quantize"),
                     default="quantize")
-    ap.add_argument("--path", default=os.path.join(TARGET_DIR, KVIKIO_SUBDIR),
+    ap.add_argument("--path", default=TARGET_DIR and os.path.join(TARGET_DIR, KVIKIO_SUBDIR),
                     help="preprocessed dataset root (rewrite-phi, quantize)")
     ap.add_argument("--trajs", nargs="+", default=None,
                     help="brace pattern (single string) OR explicit list of trajectories; "
@@ -1055,6 +1064,12 @@ def main(argv: Iterable[str] | None = None) -> None:
                    help="quantization target (fp16 / bf16 / i8 / i4)")
     g.add_argument("--force", action="store_true", help="overwrite existing quantized shards")
     args = ap.parse_args(argv)
+    required = {"quantize": ("path",), "rewrite-phi": ("path",), "preprocess": ("root",),
+                "gyaradax": ("target_dir",)}[args.mode]
+    for name in required:
+        if getattr(args, name) is None:
+            ap.error(f"--mode={args.mode} needs --{name.replace('_', '-')} "
+                     "(or the NEUGK_RAW_ROOT / NEUGK_TARGET_DIR environment variables)")
 
     if args.mode == "quantize":
         run_quantize(path=args.path, trajs=args.trajs or ["iteration_{0-299}_ifft_realpotens"],

@@ -1,5 +1,6 @@
 name: cyclone
-path: /local00/bioinf/galletti/preprocessed_kvikio
+# preprocessed dataset root (required): export NEUGK_DATA or pass dataset.path=...
+path: ${oc.env:NEUGK_DATA}
 backend: kvikio
 training_trajectories: iteration_{0-3}
 validation_trajectories: iteration_{4-4}
@@ -23,7 +24,7 @@ normalization:
     agg_axes: null
 normalization_scope: dataset
 # must carry every normalized target: df_flux_phi for flux, df_fluxavg_phi for fluxavg
-normalization_stats: /restricteddata/ukaea/checkpoints/neurips26/norm_files/df_flux_phi_offset80_mu_57f5caf2_stats.pkl
+normalization_stats: ${dataset.path}/df_flux_phi_offset80_mu_57f5caf2_stats.pkl
 training_cond_filters:
   last_flux: [1., .inf]
   first_flux: [1., .inf]

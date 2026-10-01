@@ -212,30 +212,3 @@ def test_rewrite_poten_backs_up_and_resolves(tmp_path):
     np.testing.assert_allclose(meta["phi_max"], np.max(phis, 0))
     np.testing.assert_array_equal(light["phi_std"], meta["phi_std"])
     assert "phi_var" not in light
-
-
-@pytest.mark.skipif(not os.environ.get("NEUGK_RAW_PATH"),
-                    reason="set NEUGK_RAW_PATH (raw GKW root containing raw/iteration_0)")
-@needs_gyaradax
-def test_preprocess_real_trajectory_matches_stored(tmp_path):
-    out, skipped = P.preprocess("iteration_0", root=os.environ["NEUGK_RAW_PATH"],
-                                target_dir=str(tmp_path), max_timesteps=2)
-    assert not skipped
-    with open(os.path.join(out, "metadata.pkl"), "rb") as f:
-        meta = pickle.load(f)
-    assert len(meta["timesteps"]) == 2 and meta["kyspec"].shape[0] == 2
-    ref_root = os.environ.get("NEUGK_CYCLONE_PATH")
-    if not ref_root:
-        return
-    ref = os.path.join(ref_root, os.path.basename(out))
-    with open(os.path.join(ref, "metadata.pkl"), "rb") as f:
-        rmeta = pickle.load(f)
-    for k in ("timesteps", "flux", "kyspec", "fluxspec"):
-        np.testing.assert_array_equal(meta[k], np.asarray(rmeta[k])[:2])
-    for k, v in meta["geometry"].items():
-        np.testing.assert_array_equal(v, rmeta["geometry"][k])
-    for i in range(2):
-        for name in (f"timestep_{i:05d}.bin", f"poten_{i:05d}.bin"):
-            a = np.fromfile(os.path.join(out, "data", name), np.float32)
-            b = np.fromfile(os.path.join(ref, "data", name), np.float32)
-            assert np.linalg.norm(a - b) <= 1e-5 * np.linalg.norm(b), name

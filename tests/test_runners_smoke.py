@@ -158,9 +158,10 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
 
 
 @pytest.mark.parametrize("experiment", ["ae", "diffusion", "gyroswin"])
-def test_experiment_presets_compose(experiment):
+def test_experiment_presets_compose(experiment, monkeypatch, tmp_path):
     from hydra import compose, initialize_config_dir
 
+    monkeypatch.setenv("NEUGK_DATA", str(tmp_path))
     cfg_dir = str(Path(__file__).resolve().parents[1] / "configs")
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):
         cfg = compose(config_name="main", overrides=[f"experiment={experiment}"])
@@ -168,6 +169,20 @@ def test_experiment_presets_compose(experiment):
     assert cfg.training.num_workers > 0 and "logging" in cfg
     if experiment == "diffusion":
         assert list(cfg.model.conditioning) == ["itg", "dg", "s_hat", "q"]
-        assert cfg.ae_checkpoint is not None
+        assert cfg.ae_checkpoint is None
+    assert cfg.dataset.path == str(tmp_path)
     stats = cfg.dataset.get("normalization_stats")
-    assert stats is None or stats.endswith("_stats.pkl")
+    assert stats is None or (stats.startswith(str(tmp_path)) and stats.endswith("_stats.pkl"))
+
+
+def test_dataset_path_is_required():
+    from hydra import compose, initialize_config_dir
+    from omegaconf.errors import InterpolationResolutionError
+
+    cfg_dir = str(Path(__file__).resolve().parents[1] / "configs")
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        cfg = compose(config_name="main", overrides=["experiment=ae"])
+    if "NEUGK_DATA" in __import__("os").environ:
+        pytest.skip("NEUGK_DATA is set")
+    with pytest.raises(InterpolationResolutionError, match="NEUGK_DATA"):
+        _ = cfg.dataset.path

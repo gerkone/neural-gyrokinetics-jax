@@ -1,6 +1,6 @@
 # @package _global_
 # latent flow matching on a frozen ae:
-#   python main.py experiment=diffusion [ae_checkpoint=<ae_run_dir>] [validation.eval_sampling=true]
+#   python main.py experiment=diffusion ae_checkpoint=<ae_run_dir> [validation.eval_sampling=true]
 # the dataset section must match the one the ae was trained with (zf layout, offset, normalization).
 defaults:
   - override /model: diff/flow_matching
@@ -10,7 +10,6 @@ defaults:
 workflow: diffusion
 # sampler latent scale; null computes 1 / std of the train latents (saved to config and checkpoint)
 latent_scale: null
-ae_checkpoint: /restricteddata/ukaea/checkpoints/neurips26/AE_noCond/20260405_022851_327
 model:
   # dit conditioning: a subset of dataset.conditions
   conditioning: [itg, dg, s_hat, q]

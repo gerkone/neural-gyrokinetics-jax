@@ -1,5 +1,6 @@
 name: cyclone
-path: /local00/bioinf/galletti/preprocessed_kvikio
+# preprocessed dataset root (required): export NEUGK_DATA or pass dataset.path=...
+path: ${oc.env:NEUGK_DATA}
 backend: kvikio  # gpu-direct reads via cupy+kvikio, zero-copy to jax; falls back to numpy
 # train-only wire dtype (null/fp32, fp16, bf16, i8, i4); shards from ``python -m neugk_jax.dataset.preprocess --mode=quantize``
 prefer_dtype: null
@@ -19,7 +20,7 @@ normalization:
     agg_axes: [0, 1, 2]
 normalization_scope: dataset
 # stats of the ae_noCond training set (offset 80, decoupled mu)
-normalization_stats: /local00/bioinf/galletti/preprocessed_kvikio/diff_df_flux_phi_offset80_mu_57f5caf2_stats.pkl
+normalization_stats: ${dataset.path}/diff_df_flux_phi_offset80_mu_57f5caf2_stats.pkl
 # lightweight_metadata defaults on when normalization_stats is set
 # drop stable/non-turbulent runs (mean flux below 1.0 over the first/last 80 steps); null disables
 training_cond_filters:
