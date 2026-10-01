@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
-from neugk_jax.dataset.backend import KvikIOBackend, NumpyBackend
+from neugk_jax.dataset.backend import H5Backend, KvikIOBackend, NumpyBackend
 from neugk_jax.dataset.cyclone import CycloneDataset
 from neugk_jax.utils import config_dict
 
 
 def make_backend(dcfg, *, local_rank: int = 0, prefer_dtype: Optional[str] = None):
-    if dcfg.get("backend", "kvikio") == "kvikio":
+    name = dcfg.get("backend", "kvikio")
+    if name == "kvikio":
         return KvikIOBackend(rank=local_rank, prefer_dtype=prefer_dtype)
+    if name == "h5":
+        return H5Backend()
     return NumpyBackend(prefer_dtype=prefer_dtype)
 
 

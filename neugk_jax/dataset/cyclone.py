@@ -302,10 +302,10 @@ class CycloneDataset:
         ``normalization_stats`` can be:
 
         * a ``dict`` already in the ``stats[field][key]`` form — used as-is;
-        * a ``str`` / ``Path`` pointing at a stats pickle (``RunningMeanStd``
-          per field) — loaded and reduced with the per-field ``agg_axes``
-          from ``self.normalization`` into the aggregation the model
-          config requests.
+        * a ``str`` / ``Path`` pointing at a stats pickle: ``RunningMeanStd`` per
+          field, reduced with the per-field ``agg_axes`` from ``self.normalization``
+          into the aggregation the model config requests, or a pickled dict already
+          in the ``stats[field][key]`` form (used as-is).
         """
         if isinstance(self.normalization_stats, (str, os.PathLike)):
             return self._load_stats_pkl(self.normalization_stats)
@@ -343,6 +343,8 @@ class CycloneDataset:
         """
         with open(path, "rb") as f:
             raw = _StatsUnpickler(f).load()
+        if all(isinstance(v, dict) for v in raw.values()):
+            return {str(k): v for k, v in raw.items()}
         out: dict[str, dict] = {}
         for k, rms in raw.items():
             mean = np.asarray(rms.mean, dtype=np.float64)

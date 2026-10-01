@@ -393,3 +393,35 @@ def build_gyroswin_from_config(cfg_path, *, key,
         key=key,
     )
     return force_f32(model)
+
+
+# swin keys of the release configs that no model code reads
+_RELEASE_DEAD_SWIN_KEYS = ("flux_layernorms",)
+RELEASE_RESOLUTION = (32, 8, 16, 85, 32)
+
+
+def release_config(cfg_path, *, resolution: Optional[Sequence[int]] = None) -> dict:
+    """Builder config of a GyroSwin release checkpoint config (``ml-jku/gyroswin_*``).
+
+    Drops the swin keys no model code reads, sets ``legacy_swin_shortcut=False`` (the
+    release checkpoints use the single swin residual), and keeps ``separate_zf`` /
+    ``real_potens`` of the dataset section with ``resolution`` (default
+    :data:`RELEASE_RESOLUTION`).
+    """
+    import copy
+
+    from neugk_jax.translate import load_config
+    cfg = copy.deepcopy(load_config(cfg_path))
+    mcfg = cfg["model"]
+    for k in _RELEASE_DEAD_SWIN_KEYS:
+        mcfg["swin"].pop(k, None)
+    mcfg["legacy_swin_shortcut"] = False
+    ds = cfg.get("dataset") or {}
+    dataset = {"separate_zf": bool(ds.get("separate_zf", True)),
+               "real_potens": bool(ds.get("real_potens", True)),
+               "resolution": [int(r) for r in (resolution or RELEASE_RESOLUTION)]}
+    return {"model": mcfg, "dataset": dataset}
+
+
+def build_release_gyroswin(cfg_path, *, key, resolution: Optional[Sequence[int]] = None):
+    return build_gyroswin_from_config(release_config(cfg_path, resolution=resolution), key=key)

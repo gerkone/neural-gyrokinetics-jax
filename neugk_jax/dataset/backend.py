@@ -436,6 +436,92 @@ class KvikIOBackend(NumpyBackend):
         return self._read(fp, tuple(shape))
 
 
+_GEOMETRY_DEFAULTS = (("adiabatic", 1.0), ("de", 1.0), ("beta", 0.0), ("nlapar", 0.0), ("nlbpar", 0.0))
+
+
+class H5Backend(DataBackend):
+    """Reader for single-file ``<trajectory>.h5`` trajectories (``ml-jku/gyroswin_cbc_id_ood``).
+
+    Layout::
+
+        traj.h5
+        ├── data/timestep_00000            (2, vp, mu, s, x, y) float32, spatial
+        ├── data/poten_00000               (x, s, y), optional
+        ├── metadata/{timesteps, flux|fluxes, ion_temp_grad, density_grad, s_hat, q, resolution}
+        └── geometry/<key>
+
+    ``fluxes`` is read as ``flux``; a uniform parallel grid without ``ds`` gets
+    ``ds = ints[0]``. Missing electrostatic geometry flags get the ``NumpyBackend`` defaults.
+    """
+
+    def is_valid(self, path: str) -> bool:
+        return os.path.isfile(self.format_path(path, True))
+
+    def exists(self, path: str) -> bool:
+        return self.is_valid(path)
+
+    def format_path(
+        self, path: str, spatial_ifft: bool,
+        split_into_bands: Optional[int] = None,
+        real_potens: bool = True,
+    ) -> str:
+        return path if path.endswith(".h5") else path + ".h5"
+
+    def read_metadata(
+        self, path: str, input_fields: Sequence[str] = ("df",),
+        lightweight: bool = False,
+    ) -> dict:
+        import h5py
+        with h5py.File(self.format_path(path, True), "r") as f:
+            meta = {k: np.asarray(v[()]) for k, v in f["metadata"].items()}
+            geom = {k: np.asarray(v[()]) for k, v in f["geometry"].items()} if "geometry" in f else None
+        if "flux" not in meta and "fluxes" in meta:
+            meta["flux"] = meta.pop("fluxes")
+        meta["resolution"] = tuple(int(r) for r in np.atleast_1d(meta["resolution"]))
+        if geom is not None:
+            for k, v in _GEOMETRY_DEFAULTS:
+                geom.setdefault(k, np.array(v, dtype=np.float64))
+            if "ffun" not in geom and "ints" in geom:
+                geom["ffun"] = np.ones_like(geom["ints"], dtype=np.float64)
+            ints = np.asarray(geom.get("ints", ()), np.float64)
+            # uniform parallel grid: the s quadrature weight is the grid spacing
+            if "ds" not in meta and ints.size and np.allclose(ints, ints[0]):
+                meta["ds"] = np.float64(ints[0])
+            meta["geometry"] = geom
+        return meta
+
+    @contextlib.contextmanager
+    def open(self, path: str):
+        import h5py
+        f = h5py.File(self.format_path(path, True), "r")
+        try:
+            yield f
+        finally:
+            f.close()
+
+    @staticmethod
+    def _read(f, name: str, shape: Sequence[int]) -> np.ndarray:
+        if name not in f:
+            raise FileNotFoundError(f"{f.filename} has no {name}")
+        arr = np.asarray(f[name][()], dtype=np.float32)
+        if arr.size != int(np.prod(shape)):
+            raise IOError(f"{f.filename}:{name}: expected {int(np.prod(shape))} elements, "
+                          f"got {arr.size}")
+        return arr.reshape(tuple(shape))
+
+    def read_df(
+        self, f, timestamp: str, shape: Sequence[int],
+        active_keys: Optional[Sequence[int]] = None,
+    ) -> np.ndarray:
+        k = self._read(f, f"data/timestep_{timestamp}", shape)
+        if active_keys is None or tuple(active_keys) == (0, 1):
+            return k
+        return k[list(active_keys)]
+
+    def read_phi(self, f, timestamp: str, shape: Sequence[int]) -> np.ndarray:
+        return self._read(f, f"data/poten_{timestamp}", shape)
+
+
 def resolve_trajectories(path: str, trajectories) -> list[str]:
     """Expand a trajectories spec (string with ``{1-5}`` ranges, or list)."""
     if isinstance(trajectories, str):
