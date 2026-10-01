@@ -88,8 +88,6 @@ class LayerNorm(eqx.Module):
     """
 
     inner: eqx.nn.LayerNorm
-    eps: float = eqx.field(static=True)
-    elementwise_affine: bool = eqx.field(static=True)
     dim: int = eqx.field(static=True)
 
     def __init__(self, dim: int, *, eps: float = 1e-5, elementwise_affine: bool = True):
@@ -99,8 +97,6 @@ class LayerNorm(eqx.Module):
             use_weight=elementwise_affine,
             use_bias=elementwise_affine,
         )
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
         self.dim = dim
 
     @property
@@ -133,7 +129,6 @@ class MLP(eqx.Module):
 
     layers: list[Linear]
     act: Callable = eqx.field(static=True)
-    last_act: bool = eqx.field(static=True)
     drop: float = eqx.field(static=True)
 
     def __init__(
@@ -143,7 +138,6 @@ class MLP(eqx.Module):
         key,
         act_fn: Callable = gelu,
         use_bias: bool = True,
-        last_act: bool = False,
         drop: float = 0.0,
     ):
         keys = jr.split(key, len(dims) - 1)
@@ -152,15 +146,13 @@ class MLP(eqx.Module):
             for i in range(len(dims) - 1)
         ]
         self.act = act_fn
-        self.last_act = last_act
         self.drop = drop
 
     def __call__(self, x: jax.Array, *, key=None, inference: bool = True) -> jax.Array:
         n = len(self.layers)
-        keys = [None] * n if key is None else list(jr.split(key, n))
-        for i, lyr in enumerate(self.layers):
-            x = dropout(lyr(x), self.drop, key=keys[i], inference=inference)
-            if i < n - 1 or self.last_act:
+        for i, (lyr, k) in enumerate(zip(self.layers, split_key(key, n))):
+            x = dropout(lyr(x), self.drop, key=k, inference=inference)
+            if i < n - 1:
                 x = self.act(x)
         return x
 
@@ -169,13 +161,9 @@ class DiTModulation(eqx.Module):
     """DiT-style 6-way modulation: (scale1, shift1, gate1, scale2, shift2, gate2)."""
 
     proj: Linear
-    dim: int = eqx.field(static=True)
 
     def __init__(self, cond_dim: int, dim: int, *, key):
-        # small init keeps the initial residual near identity
-        wkey, _ = jr.split(key)
-        self.proj = Linear(cond_dim, 6 * dim, key=wkey)
-        self.dim = dim
+        self.proj = Linear(cond_dim, 6 * dim, key=key)
 
     def __call__(self, cond: jax.Array):
         # cond: (..., cond_dim) → 6 tensors of shape (..., dim); SiLU already applied in ContinuousConditionEmbed
@@ -190,21 +178,17 @@ class RMSNorm(eqx.Module):
 
     weight: jax.Array | None
     eps: float = eqx.field(static=True)
-    dim: int = eqx.field(static=True)
-    elementwise_affine: bool = eqx.field(static=True)
 
     def __init__(self, dim: int, *, eps: float = 1e-8, elementwise_affine: bool = True):
         self.weight = jnp.ones((dim,)) if elementwise_affine else None
         self.eps = eps
-        self.dim = dim
-        self.elementwise_affine = elementwise_affine
 
     def __call__(self, x: jax.Array) -> jax.Array:
         in_dtype = x.dtype
         x32 = x.astype(jnp.float32)
         rms = jnp.sqrt(jnp.mean(x32**2, axis=-1, keepdims=True) + self.eps)
         y = x32 / rms
-        if self.elementwise_affine:
+        if self.weight is not None:
             y = y * self.weight
         return y.astype(in_dtype)
 

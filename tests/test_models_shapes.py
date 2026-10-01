@@ -13,19 +13,16 @@ from neugk_jax.models import (
     APE,
     MLP,
     ContinuousConditionEmbed,
-    DiTLayer,
-    DiTSwinLayer,
     Film,
     LayerNorm,
     Linear,
     PatchEmbed,
     PatchExpand,
     PatchMerge,
-    Swin5DUnet,
-    SwinLayer,
-    ViTLayer,
     pad_to_blocks,
+    swin_layer,
     unpad,
+    vit_layer,
 )
 
 
@@ -58,16 +55,9 @@ def test_film():
 
 
 def test_ape():
-    pe = APE(8, (4, 6))
-    x = jnp.zeros((4, 6, 8))
-    assert pe(x).shape == (4, 6, 8)
-
-
-def test_ape_3d():
-    pe = APE(16, (3, 5, 7))
+    pe = APE(16, (3, 5, 7), key=jr.PRNGKey(0))
     x = jnp.zeros((3, 5, 7, 16))
-    out = pe(x)
-    assert out.shape == x.shape
+    assert jnp.array_equal(pe(x), pe.pos_embed)
 
 
 def test_continuous_condition_embed():
@@ -80,10 +70,10 @@ def test_continuous_condition_embed():
 
 def test_pad_to_blocks():
     x = jnp.zeros((7, 13, 4))
-    padded, pads = pad_to_blocks(x, (4, 5))
+    padded = pad_to_blocks(x, (4, 5))
     assert padded.shape[0] % 4 == 0
     assert padded.shape[1] % 5 == 0
-    restored = unpad(padded, pads, (7, 13))
+    restored = unpad(padded, (7, 13))
     assert restored.shape[:2] == (7, 13)
 
 
@@ -126,43 +116,20 @@ def test_patch_merge_then_expand():
     ],
 )
 def test_swin_layer(space, grid, window):
-    lyr = SwinLayer(
-        space=space,
-        dim=32,
-        depth=2,
-        num_heads=4,
-        grid_size=grid,
-        window_size=window,
-        key=jr.PRNGKey(0),
-    )
+    lyr = swin_layer(32, 2, 4, grid, window, key=jr.PRNGKey(0))
     x = jr.normal(jr.PRNGKey(1), (*grid, 32))
     out = lyr(x, inference=True)
     assert out.shape == x.shape
 
 
 def test_vit_layer():
-    lyr = ViTLayer(
-        space=3,
-        dim=32,
-        depth=2,
-        num_heads=4,
-        grid_size=(2, 3, 4),
-        key=jr.PRNGKey(0),
-    )
+    lyr = vit_layer(32, 2, 4, key=jr.PRNGKey(0))
     x = jr.normal(jr.PRNGKey(1), (2, 3, 4, 32))
     assert lyr(x, inference=True).shape == x.shape
 
 
 def test_dit_layer():
-    lyr = DiTLayer(
-        space=3,
-        dim=32,
-        depth=2,
-        num_heads=4,
-        grid_size=(2, 3, 4),
-        key=jr.PRNGKey(0),
-        cond_dim=64,
-    )
+    lyr = vit_layer(32, 2, 4, key=jr.PRNGKey(0), cond_dim=64, norm_affine=True)
     x = jr.normal(jr.PRNGKey(1), (2, 3, 4, 32))
     cond = jr.normal(jr.PRNGKey(2), (64,))
     assert lyr(x, cond, inference=True).shape == x.shape
@@ -170,47 +137,10 @@ def test_dit_layer():
 
 def test_dit_swin_layer():
     grid = (8, 8, 4)
-    lyr = DiTSwinLayer(
-        space=3,
-        dim=32,
-        depth=2,
-        num_heads=4,
-        grid_size=grid,
-        window_size=(4, 4, 2),
-        key=jr.PRNGKey(0),
-        cond_dim=64,
-    )
+    lyr = swin_layer(32, 2, 4, grid, (4, 4, 2), key=jr.PRNGKey(0), cond_dim=64)
     x = jr.normal(jr.PRNGKey(1), (*grid, 32))
     cond = jr.normal(jr.PRNGKey(2), (64,))
     assert lyr(x, cond, inference=True).shape == x.shape
-
-
-def test_swin_5d_unet_no_decouple():
-    """Smaller-than-real 5D backbone: shape preservation."""
-    space = 5
-    base = (4, 4, 4, 16, 8)  # vp, mu, s, x, y
-    model = Swin5DUnet(
-        space=space,
-        decouple_mu=False,
-        dim=16,
-        base_resolution=base,
-        in_channels=2,
-        out_channels=2,
-        patch_size=(2, 2, 2, 4, 2),
-        window_size=(2, 2, 2, 2, 2),
-        depth=2,
-        num_heads=2,
-        num_layers=2,
-        merging_depth=1,
-        unmerging_depth=1,
-        merging_hidden_ratio=2.0,
-        unmerging_hidden_ratio=2.0,
-        hidden_mlp_ratio=2.0,
-        key=jr.PRNGKey(0),
-    )
-    x = jr.normal(jr.PRNGKey(1), (2, *base))
-    out = model(x)
-    assert out.shape == x.shape
 
 
 def test_swin5d_ae_decouple_mu():
@@ -239,7 +169,7 @@ def test_swin5d_ae_decouple_mu():
         key=jr.PRNGKey(0),
     )
     x = jr.normal(jr.PRNGKey(1), (2, *base))
-    z, _ = ae.encode(x)
+    z = ae.encode(x)
     assert z.shape == (*ae.bottleneck_grid_size, ae.bottleneck_dim)
     out = ae(x)
     assert out["df"].shape == x.shape
@@ -250,7 +180,6 @@ def test_dit_forward():
     z_dim = 16
     dim = 32
     model = DiT(
-        space=3,
         z_dim=z_dim,
         dim=dim,
         grid_size=grid,

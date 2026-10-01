@@ -236,7 +236,6 @@ def test_diffusion_evaluator_samples_and_scores(tiny_setup):
     ds, ae = tiny_setup
     grid = tuple(ae.bottleneck_grid_size)
     dit = DiT(
-        space=len(grid),
         z_dim=int(ae.bottleneck_dim),
         dim=16,
         grid_size=grid,

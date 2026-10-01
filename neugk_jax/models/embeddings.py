@@ -14,84 +14,16 @@ import numpy as _np
 from neugk_jax.models.utils import MLP, Linear, relu
 
 
-def _sincos_1d(length: int, dim: int, base: float = 10000.0) -> jnp.ndarray:
-    """Standard sinusoidal embedding of shape (length, dim). dim must be even."""
-    assert dim % 2 == 0, "sincos dim must be even"
-    pos = jnp.arange(length, dtype=jnp.float32)
-    # force f32 — x64 mode promotes math.log(base) to f64, which would contaminate downstream dtypes
-    freqs = jnp.exp(-math.log(base) * jnp.arange(0, dim, 2, dtype=jnp.float32) / dim).astype(
-        jnp.float32
-    )
-    angles = pos[:, None] * freqs[None, :]
-    return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1).astype(jnp.float32)
-
-
-def _sincos_nd(grid_size: Sequence[int], dim: int) -> jnp.ndarray:
-    """N-D sincos embedding of shape (*grid_size, dim).
-
-    Splits ``dim`` across axes evenly (last axis absorbs the remainder).
-    """
-    n = len(grid_size)
-    per_axis = dim // n
-    rem = dim - per_axis * (n - 1)
-    pe_parts = []
-    for i, size in enumerate(grid_size):
-        d = rem if i == n - 1 else per_axis
-        # round d up to even — sincos requires even dim
-        if d % 2 == 1:
-            d += 1
-        pe_i = _sincos_1d(size, d)  # (size, d)
-        # broadcast pe_i to full grid shape
-        shape = [1] * n + [d]
-        shape[i] = size
-        pe_parts.append(pe_i.reshape(shape))
-    pe = jnp.concatenate(
-        [jnp.broadcast_to(p, (*grid_size, p.shape[-1])) for p in pe_parts], axis=-1
-    )
-    # trim any rounding overshoot to exactly dim
-    return pe[..., :dim]
-
-
 class APE(eqx.Module):
-    """Absolute positional embedding broadcast-added to the last axis.
-
-    ``learnable=False`` makes ``pos_embed`` a buffer (see ``trainable_mask``).
-    """
+    """Learnable absolute positional embedding (normal init, std 0.02) added to the last axis."""
 
     pos_embed: jax.Array
-    learnable: bool = eqx.field(static=True)
 
-    @property
-    def buffer_fields(self):
-        return () if self.learnable else ("pos_embed",)
-
-    def __init__(
-        self,
-        dim: int,
-        grid_size: Sequence[int],
-        *,
-        learnable: bool = False,
-        init: str = "sincos",
-        key=None,
-    ):
-        if init == "sincos":
-            pe = _sincos_nd(tuple(grid_size), dim)
-        elif init == "zeros":
-            pe = jnp.zeros((*grid_size, dim))
-        elif init == "normal":
-            assert key is not None
-            pe = 0.02 * jr.normal(key, (*grid_size, dim))
-        else:
-            raise ValueError(init)
-        self.pos_embed = pe
-        self.learnable = learnable
+    def __init__(self, dim: int, grid_size: Sequence[int], *, key):
+        self.pos_embed = 0.02 * jr.normal(key, (*grid_size, dim))
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        pe = self.pos_embed if self.learnable else jax.lax.stop_gradient(self.pos_embed)
-        # prepend singleton batch axes so pe broadcasts over x
-        while pe.ndim < x.ndim:
-            pe = pe[None, ...]
-        return x + pe
+        return x + self.pos_embed
 
 
 class ContinuousConditionEmbed(eqx.Module):
@@ -106,24 +38,13 @@ class ContinuousConditionEmbed(eqx.Module):
     mlp: list  # [Linear]
     omega: jax.Array
     buffer_fields = ("omega",)
-    dim: int = eqx.field(static=True)
     n_cond: int = eqx.field(static=True)
     cond_dim: int = eqx.field(static=True)
     padding: int = eqx.field(static=True)
     cond_per_wave: int = eqx.field(static=True)
-    max_wavelength: float = eqx.field(static=True)
 
-    def __init__(
-        self,
-        dim: int,
-        n_cond: int,
-        *,
-        key,
-        max_wavelength: float = 10000.0,
-    ):
-        self.dim = dim
+    def __init__(self, dim: int, n_cond: int, *, key, max_wavelength: float = 10000.0):
         self.n_cond = n_cond
-        self.max_wavelength = max_wavelength
 
         ndim_padding = dim % n_cond
         dim_per_ndim = (dim - ndim_padding) // n_cond
@@ -212,19 +133,10 @@ class RPB(eqx.Module):
     buffer_fields = ("rpb", "rpb_idx")
     num_heads: int = eqx.field(static=True)
     seq_len: int = eqx.field(static=True)
-    space: int = eqx.field(static=True)
 
-    def __init__(
-        self,
-        window_size: Sequence[int],
-        num_heads: int,
-        *,
-        key,
-        hidden: int = 512,
-    ):
-        space = len(window_size)
+    def __init__(self, window_size: Sequence[int], num_heads: int, *, key):
         kw1, kw2 = jr.split(key, 2)
-        self.cpb_mlp = MLP([space, hidden, num_heads], key=kw1, act_fn=relu)
+        self.cpb_mlp = MLP([len(window_size), 512, num_heads], key=kw1, act_fn=relu)
         last = self.cpb_mlp.layers[-1]
         self.cpb_mlp = eqx.tree_at(
             lambda m: m.layers[-1],
@@ -233,12 +145,8 @@ class RPB(eqx.Module):
         )
         self.rpb = _build_rpb_table(window_size)
         self.rpb_idx = _build_rpb_idx(window_size)
-        seq_len = 1
-        for w in window_size:
-            seq_len *= w
-        self.seq_len = seq_len
+        self.seq_len = math.prod(window_size)
         self.num_heads = num_heads
-        self.space = space
 
     def __call__(self) -> jax.Array:
         bias_table = self.cpb_mlp(self.rpb)

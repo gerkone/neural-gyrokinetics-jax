@@ -10,17 +10,17 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from neugk_jax.models.embeddings import RPB
-from neugk_jax.models.utils import Gate, Linear, RMSNorm, dropout
+from neugk_jax.models.utils import Gate, Linear, RMSNorm, dropout, split_key
 
 
-def _einsum_attention(q, k, v, scale, bias, attn_drop=0.0, key=None, inference=True):
-    # q, k, v: (n, heads, head_dim)
-    logits = jnp.einsum("nhd,mhd->hnm", q, k) * scale
+def einsum_attention(q, k, v, scale, bias=None, attn_drop=0.0, key=None, inference=True):
+    """Softmax attention of ``q`` (..., n, heads, head_dim) over ``k``/``v`` (..., m, heads, head_dim)."""
+    logits = jnp.einsum("...nhd,...mhd->...hnm", q, k) * scale
     if bias is not None:
         logits = logits + bias
     attn = jax.nn.softmax(logits, axis=-1)
     attn = dropout(attn, attn_drop, key=key, inference=inference)
-    return jnp.einsum("hnm,mhd->nhd", attn, v)
+    return jnp.einsum("...hnm,...mhd->...nhd", attn, v)
 
 
 class MultiHeadSelfAttention(eqx.Module):
@@ -101,8 +101,8 @@ class MultiHeadSelfAttention(eqx.Module):
         if self.rpb is not None:
             rpb_bias = self.rpb()  # shape: (heads, sl, sl)
             attn_bias = rpb_bias if attn_bias is None else attn_bias + rpb_bias
-        ka, kp = (None, None) if key is None else jr.split(key)
-        out = _einsum_attention(q, k, v, self.scale, attn_bias, self.attn_drop, ka, inference)
+        ka, kp = split_key(key, 2)
+        out = einsum_attention(q, k, v, self.scale, attn_bias, self.attn_drop, ka, inference)
         # out: (n, H, D); apply optional headwise gate before flattening to (n, dim)
         if self.gate is not None:
             out = self.gate(out, q)
@@ -161,7 +161,7 @@ class MultiHeadCrossAttention(eqx.Module):
         kv = self.kv(right).reshape(n_kv, 2, self.num_heads, self.head_dim)
         k = kv[:, 0]
         v = kv[:, 1]
-        ka, kp = (None, None) if key is None else jr.split(key)
-        out = _einsum_attention(q, k, v, self.scale, None, self.attn_drop, ka, inference)
+        ka, kp = split_key(key, 2)
+        out = einsum_attention(q, k, v, self.scale, None, self.attn_drop, ka, inference)
         out = out.reshape(n_q, -1)
         return dropout(self.proj(out), self.proj_drop, key=kp, inference=inference)

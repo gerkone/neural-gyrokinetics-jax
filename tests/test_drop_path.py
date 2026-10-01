@@ -41,7 +41,6 @@ def test_ae_drop_path():
 
 def test_dit_drop_path():
     dit = DiT(
-        space=3,
         z_dim=4,
         dim=16,
         grid_size=(2, 2, 2),

@@ -92,7 +92,7 @@ def load_autoencoder(path, *, resolution=None, dataset: dict | None = None):
 
 @eqx.filter_jit
 def encode_batch(ae, df):
-    return jax.vmap(lambda x: ae.encode(x)[0])(df)
+    return jax.vmap(ae.encode)(df)
 
 
 def _fm_loss(model, z, cond, key, *, latent_scale, use_ot, train: bool, mask=None):

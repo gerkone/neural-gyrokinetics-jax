@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from neugk_jax.gyroswin.models.gyroswin import GyroSwinMultitask
-from neugk_jax.gyroswin.models.x_layers import FluxDecoder, MixingBlock, VSpaceReduce
+from neugk_jax.gyroswin.models.x_layers import FluxDecoder, MixingBlock, QueryPool, velocity_pool
 from neugk_jax.models.attention import MultiHeadCrossAttention, MultiHeadSelfAttention
 from neugk_jax.models.utils import MLP, dropout
 
@@ -20,7 +20,7 @@ def _shapes(model):
 
 
 def _check(fwd):
-    train = [fwd(jr.PRNGKey(i), False) for i in range(1, 5)]
+    train = [fwd(jr.PRNGKey(i), False) for i in range(1, 9)]
     assert any(not jnp.allclose(train[0], t) for t in train[1:])
     assert jnp.array_equal(fwd(jr.PRNGKey(1), True), fwd(None, True))
     assert jnp.array_equal(fwd(None, False), fwd(None, True))
@@ -67,8 +67,8 @@ def test_mixing_vspace_flux_dropout():
     _check(lambda k, inf: mix(left, right, key=k, inference=inf))
 
     df = jr.normal(jr.PRNGKey(5), (4, 2, 3, 2, 16))
-    vs = VSpaceReduce(16, 8, 2, key=jr.PRNGKey(0), decouple_mu=True, attn_drop=0.5)
-    _check(lambda k, inf: vs(df, key=k, inference=inf))
+    vs = QueryPool(16, 8, 2, key=jr.PRNGKey(0), attn_drop=0.5)
+    _check(lambda k, inf: velocity_pool(vs, df, key=k, inference=inf))
 
     head = FluxDecoder([16], [8], 2, 1, key=jr.PRNGKey(0), attn_drop=0.5, drop=0.5)
     _check(
@@ -89,7 +89,7 @@ def _gyroswin(**kw):
         num_layers=1,
         merging_hidden_ratio=2.0,
         unmerging_hidden_ratio=2.0,
-        outputs=("df", "phi", "fluxavg"),
+        flux_key="fluxavg",
         n_cond=2,
         flux_num_heads=2,
         drop_path=0.0,

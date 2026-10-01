@@ -180,7 +180,7 @@ def _gyroswin_name_map(jax_name: str) -> list[str]:
 
     Reuses the AE renames inside each U-Net subtree, plus the cross-attention
     layer name mappings that are unique to gyroswin (``MixingBlock``,
-    ``VSpaceReduce`` — the ``.kv.`` / ``.proj.`` / ``integral_token`` fields
+    ``QueryPool`` — the ``.kv.`` / ``.proj.`` / ``integral_token`` fields
     already align with torch names).
     """
     base = jax_name.replace(".inner.", ".")
@@ -327,7 +327,6 @@ def build_dit_from_config(cfg_path, ae, *, key):
     grid = tuple(ae.bottleneck_grid_size)
     return force_f32(
         DiT(
-            space=len(grid),
             z_dim=int(ae.bottleneck_dim),
             dim=mcfg["latent_dim"],
             grid_size=grid,

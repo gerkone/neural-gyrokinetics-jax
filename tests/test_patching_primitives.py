@@ -6,6 +6,8 @@ grid that divides cleanly.
 
 from __future__ import annotations
 
+import math
+
 import jax.numpy as jnp
 import jax.random as jr
 import pytest
@@ -32,10 +34,7 @@ def test_fold_unfold_inverse(spatial, patch):
     folded = fold_patches(x, patch)
     # folded shape: (*grid, prod(patch)*c)
     grid = tuple(s // p for s, p in zip(spatial, patch))
-    prod_p = 1
-    for p in patch:
-        prod_p *= p
-    assert folded.shape == (*grid, prod_p * 6)
+    assert folded.shape == (*grid, math.prod(patch) * 6)
     # round trip
     restored = unfold_patches(folded, patch, out_channels=6)
     assert restored.shape == x.shape
@@ -55,8 +54,7 @@ def test_fold_groups_by_axis_first():
 
 def test_pad_unpad_roundtrip():
     x = jr.normal(jr.PRNGKey(0), (7, 13, 3))
-    padded, pads = pad_to_blocks(x, (4, 5))
-    assert padded.shape[0] % 4 == 0
-    assert padded.shape[1] % 5 == 0
-    restored = unpad(padded, pads, (7, 13))
+    padded = pad_to_blocks(x, (4, 5))
+    assert padded.shape == (8, 15, 3)
+    restored = unpad(padded, (7, 13))
     assert jnp.allclose(restored, x)

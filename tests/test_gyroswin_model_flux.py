@@ -76,10 +76,9 @@ def test_flux_decoder_conditioning_changes_output():
     assert not plain.use_cond and plain.blocks[0].cond_embed is None
 
 
-@pytest.mark.parametrize("reduction", ["max", "mean", "integral"])
-def test_flux_reductions(reduction):
+def test_flux_max_reduction():
     left, right = jr.normal(jr.PRNGKey(1), (3, 2, 16)), jr.normal(jr.PRNGKey(2), (5, 8))
-    head = FluxDecoder([16], [8], 2, 1, key=jr.PRNGKey(0), reduction=reduction)
+    head = FluxDecoder([16], [8], 2, 1, key=jr.PRNGKey(0))
     assert head.mix(0, left, right).shape == (16,)
 
 
@@ -102,6 +101,7 @@ def test_builder_flux_conditioning(tmp_path):
         (lambda c: c["model"]["swin"].update(act_fn="SiLU"), NotImplementedError),
         (lambda c: c["model"]["swin"].update(modulation="adaln"), NotImplementedError),
         (lambda c: c["model"]["swin"].update(bogus_key=1), ValueError),
+        (lambda c: c["model"]["swin"].update(flux_reduce="mean"), NotImplementedError),
         (lambda c: c["model"].update(bundle_seq_length=2), NotImplementedError),
         (lambda c: c["dataset"].update(real_potens=False), NotImplementedError),
         (lambda c: c["training"].update(predict_delta=True), NotImplementedError),
