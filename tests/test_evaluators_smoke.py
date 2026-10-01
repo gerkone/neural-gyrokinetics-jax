@@ -218,11 +218,13 @@ def test_ae_evaluator_padded_last_batch_and_no_retrace(tiny_setup):
     assert [p.indices.shape for p in ev.plans] == [(bs,)] * -(-3 // bs)
     assert ev.plans[-1].mask.tolist() == [1.0] * tail + [0.0] * (bs - tail)
     full = AEEvaluator(_cfg(eval_integrals=True), val_ds=ds, batch_size=1)
-    m1, _ = ev(ae, epoch=1)
-    TRACE_COUNTS.clear()
-    m2, _ = ev(ae, epoch=2)
-    assert TRACE_COUNTS["ae_eval_step"] == 0 and TRACE_COUNTS["ae_target_integrals"] == 0
-    ref, _ = full(ae, epoch=1)
+    # batch-size invariance only holds without reduced-precision matmuls
+    with jax.default_matmul_precision("highest"):
+        m1, _ = ev(ae, epoch=1)
+        TRACE_COUNTS.clear()
+        m2, _ = ev(ae, epoch=2)
+        assert TRACE_COUNTS["ae_eval_step"] == 0 and TRACE_COUNTS["ae_target_integrals"] == 0
+        ref, _ = full(ae, epoch=1)
     for k in m1:
         assert m1[k] == pytest.approx(m2[k]) and m1[k] == pytest.approx(ref[k], rel=1e-4), k
 
