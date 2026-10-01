@@ -38,10 +38,29 @@ def _make_traj(root: Path, name: str, *, n_t: int, resolution):
         "s_hat": np.array([0.8], dtype=np.float32),
         "q": np.array([1.4], dtype=np.float32),
         "resolution": np.array(resolution),
-        "geometry": {k: np.ones((1,), dtype=np.float64)
-                     for k in ("krho","ints","intmu","intvp","vpgr","mugr",
-                              "bn","efun","rfun","bt_frac","parseval",
-                              "mas","tmp","d2X","signz","signB","kxrh","little_g")},
+        "geometry": {
+            k: np.ones((1,), dtype=np.float64)
+            for k in (
+                "krho",
+                "ints",
+                "intmu",
+                "intvp",
+                "vpgr",
+                "mugr",
+                "bn",
+                "efun",
+                "rfun",
+                "bt_frac",
+                "parseval",
+                "mas",
+                "tmp",
+                "d2X",
+                "signz",
+                "signB",
+                "kxrh",
+                "little_g",
+            )
+        },
     }
     with open(traj / "metadata.pkl", "wb") as f:
         pickle.dump(meta, f)
@@ -56,57 +75,77 @@ def cyclone_dir(tmp_path):
 
 
 def _tiny_ae_cfg(path, resolution):
-    return OmegaConf.create({
-        "workflow": "ae",
-        "seed": 0,
-        "output_path": str(path / "out"),
-        "model": {
-            "name": "ae",
-            "decouple_mu": True,
-            "latent_dim": 16,
-            "patch": {
-                "patch_size": [2, 0, 2, 4, 2],
-                "window_size": [2, 0, 2, 2, 2],
-                "merging_depth": 1, "unmerging_depth": 1,
-                "merging_hidden_ratio": 2.0, "unmerging_hidden_ratio": 2.0,
-                "c_multiplier": 1,
+    return OmegaConf.create(
+        {
+            "workflow": "ae",
+            "seed": 0,
+            "output_path": str(path / "out"),
+            "model": {
+                "name": "ae",
+                "decouple_mu": True,
+                "latent_dim": 16,
+                "patch": {
+                    "patch_size": [2, 0, 2, 4, 2],
+                    "window_size": [2, 0, 2, 2, 2],
+                    "merging_depth": 1,
+                    "unmerging_depth": 1,
+                    "merging_hidden_ratio": 2.0,
+                    "unmerging_hidden_ratio": 2.0,
+                    "c_multiplier": 1,
+                },
+                "vit": {
+                    "num_heads": [2],
+                    "depth": [1],
+                    "use_rpb": False,
+                    "gated_attention": False,
+                    "qk_norm": False,
+                    "qkv_bias": False,
+                },
+                "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2, "normalized_latent": False},
+                "hidden_mlp_ratio": 2.0,
             },
-            "vit": {
-                "num_heads": [2], "depth": [1],
-                "use_rpb": False, "gated_attention": False, "qk_norm": False, "qkv_bias": False,
+            "dataset": {
+                "name": "cyclone",
+                "path": str(path),
+                "backend": "numpy",
+                "training_trajectories": "iteration_0",
+                "validation_trajectories": "iteration_1",
+                "input_fields": ["df"],
+                "conditions": ["itg", "dg", "s_hat", "q"],
+                "separate_zf": False,
+                "offset": 0,
+                "normalization": None,
             },
-            "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2, "normalized_latent": False},
-            "hidden_mlp_ratio": 2.0,
-        },
-        "dataset": {
-            "name": "cyclone", "path": str(path), "backend": "numpy",
-            "training_trajectories": "iteration_0",
-            "validation_trajectories": "iteration_1",
-            "input_fields": ["df"], "conditions": ["itg", "dg", "s_hat", "q"],
-            "separate_zf": False, "offset": 0,
-            "normalization": None,
-        },
-        "training": {
-            "batch_size": 1, "n_epochs": 1, "learning_rate": 3e-4,
-            "final_learning_rate": 1e-6, "weight_decay": 0.0,
-            "clip_grad": True, "clip_to": 1.0, "exclude_from_wd": [],
-        },
-        "validation": {"validate_every_n_epochs": 1},
-        "logging": {"mode": "disabled", "tqdm": False},
-    })
+            "training": {
+                "batch_size": 1,
+                "n_epochs": 1,
+                "learning_rate": 3e-4,
+                "final_learning_rate": 1e-6,
+                "weight_decay": 0.0,
+                "clip_grad": True,
+                "clip_to": 1.0,
+                "exclude_from_wd": [],
+            },
+            "validation": {"validate_every_n_epochs": 1},
+            "logging": {"mode": "disabled", "tqdm": False},
+        }
+    )
 
 
 def test_ae_runner_constructs_and_steps(cyclone_dir):
     path, resolution = cyclone_dir
     cfg = _tiny_ae_cfg(path, resolution)
     from neugk_jax.autoencoders.runner import AERunner
+
     r = AERunner(cfg, output_path=cfg.output_path)
     assert len(r.train_ds) > 0
     assert r.opt_state is not None
     from neugk_jax.training.runner import train_step
+
     batch = r.load_batch(r.train_ds, [0], r.loader.read)
-    r.model, r.opt_state, logs = train_step((batch, r.ctx, jr.PRNGKey(0)), r.model,
-                                            r.opt_state, r.spec)
+    r.model, r.opt_state, logs = train_step(
+        (batch, r.ctx, jr.PRNGKey(0)), r.model, r.opt_state, r.spec
+    )
     assert jnp.isfinite(logs["total"])
 
 
@@ -119,6 +158,7 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     # build + save a tiny ae so the fm runner has something to load
     from neugk_jax.training.checkpoint import save_model_only
     from scripts.translate_ckpt import build_ae_from_config
+
     # FlowMatchingRunner expects ae config at <ae_ckpt_dir>/config.yaml with resolution for build_ae_from_config
     ae_dir = tmp_path / "ae_ckpt"
     ae_dir.mkdir(exist_ok=True)
@@ -127,22 +167,26 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     ae_cfg_path = ae_dir / "config.yaml"
     OmegaConf.save(ae_cfg_with_res, ae_cfg_path)
     ae_weights = ae_dir / "ae.eqx"
-    ae = build_ae_from_config(str(ae_cfg_path), key=jr.PRNGKey(0),
-                              resolution=resolution)
+    ae = build_ae_from_config(str(ae_cfg_path), key=jr.PRNGKey(0), resolution=resolution)
     save_model_only(ae_weights, ae)
 
     fm_cfg = OmegaConf.create(OmegaConf.to_container(ae_cfg))
     fm_cfg.workflow = "diffusion"
     fm_cfg.ae_checkpoint = str(ae_weights)
-    fm_cfg.model = OmegaConf.create({
-        "name": "latent_dit", "model_type": "latent_dit",
-        "latent_dim": 32, "minibatch_ot": False,
-        "vit": {"num_heads": 2, "depth": 1, "mlp_ratio": 2.0, "drop_path": 0.0},
-        "diffusion": {"noise_distribution": "gaussian", "continuous_time": True},
-    })
+    fm_cfg.model = OmegaConf.create(
+        {
+            "name": "latent_dit",
+            "model_type": "latent_dit",
+            "latent_dim": 32,
+            "minibatch_ot": False,
+            "vit": {"num_heads": 2, "depth": 1, "mlp_ratio": 2.0, "drop_path": 0.0},
+            "diffusion": {"noise_distribution": "gaussian", "continuous_time": True},
+        }
+    )
     fm_cfg.training.batch_size = 2
 
     from neugk_jax.diffusion.runner import FlowMatchingRunner
+
     r = FlowMatchingRunner(fm_cfg, output_path=fm_cfg.output_path)
     assert len(r.train_ds) > 0
     assert r.latent_shape == (*r.ae.bottleneck_grid_size, r.ae.bottleneck_dim)
@@ -150,10 +194,12 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     assert r.ctx["latents"].shape == (len(r.train_ds), *r.latent_shape)
     assert np.allclose(np.asarray(r.ctx["latents"][1]), r.train_ds[1].df)
     from neugk_jax.training.runner import train_step
+
     batch = r.load_batch(r.train_ds, [0, 1], r.loader.read)
     assert set(batch) == {"idx"}
-    r.model, r.opt_state, logs = train_step((batch, r.ctx, jr.PRNGKey(0)), r.model,
-                                            r.opt_state, r.spec)
+    r.model, r.opt_state, logs = train_step(
+        (batch, r.ctx, jr.PRNGKey(0)), r.model, r.opt_state, r.spec
+    )
     assert jnp.isfinite(logs["fm_loss"])
 
 

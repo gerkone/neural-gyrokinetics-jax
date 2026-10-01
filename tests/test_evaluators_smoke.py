@@ -26,7 +26,7 @@ def _make_geometry(resolution):
     """Shape-consistent single-species geometry for gyaradax on a tiny grid."""
     vp, mu, s, x, y = resolution
     return {
-        "krho": np.arange(y, dtype=np.float64) * 0.5,          # ky=0 zonal mode at index 0
+        "krho": np.arange(y, dtype=np.float64) * 0.5,  # ky=0 zonal mode at index 0
         "kxrh": (np.arange(x, dtype=np.float64) - x // 2) * 0.4,
         "ints": np.full(s, 1.0 / s, dtype=np.float64),
         "intmu": np.linspace(0.1, 0.4, mu, dtype=np.float64),
@@ -40,9 +40,18 @@ def _make_geometry(resolution):
         "bt_frac": np.ones(s, dtype=np.float64),
         "parseval": np.where(np.arange(y) == 0, 1.0, 2.0).astype(np.float64),
         "little_g": np.tile(np.array([1.0, 0.0, 1.0]), (s, 1)),
-        **{k: np.ones((1,), dtype=np.float64) for k in (
-            "mas", "tmp", "de", "d2X", "signz", "signB", "vthrat",
-        )},
+        **{
+            k: np.ones((1,), dtype=np.float64)
+            for k in (
+                "mas",
+                "tmp",
+                "de",
+                "d2X",
+                "signz",
+                "signB",
+                "vthrat",
+            )
+        },
     }
 
 
@@ -76,22 +85,39 @@ def tiny_setup(tmp_path):
     resolution = (4, 4, 4, 16, 8)
     _make_traj(tmp_path, "iteration_0", n_t=4, resolution=resolution)
     from neugk_jax.dataset import CycloneDataset, NumpyBackend
+
     ds = CycloneDataset(
-        path=str(tmp_path), split="train", trajectories="iteration_0",
-        fields_to_load=("df",), conditions=("itg", "dg", "s_hat", "q"),
-        mode="ae", backend=NumpyBackend(), separate_zf=False, normalization=None,
+        path=str(tmp_path),
+        split="train",
+        trajectories="iteration_0",
+        fields_to_load=("df",),
+        conditions=("itg", "dg", "s_hat", "q"),
+        mode="ae",
+        backend=NumpyBackend(),
+        separate_zf=False,
+        normalization=None,
     )
     from neugk_jax.autoencoders import Swin5DAE
-    ae = Swin5DAE(
-        space=5, decouple_mu=True, dim=16,
-        base_resolution=resolution,
-        in_channels=2, out_channels=2,
-        patch_size=[2, 0, 2, 4, 2], window_size=[2, 0, 2, 2, 2],
-        depth=[1], num_heads=[2], num_layers=1,
 
-        bottleneck_dim=8, bottleneck_depth=1, bottleneck_num_heads=2,
-        merging_depth=1, unmerging_depth=1,
-        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,
+    ae = Swin5DAE(
+        space=5,
+        decouple_mu=True,
+        dim=16,
+        base_resolution=resolution,
+        in_channels=2,
+        out_channels=2,
+        patch_size=[2, 0, 2, 4, 2],
+        window_size=[2, 0, 2, 2, 2],
+        depth=[1],
+        num_heads=[2],
+        num_layers=1,
+        bottleneck_dim=8,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
         hidden_mlp_ratio=2.0,
         key=jr.PRNGKey(0),
     )
@@ -124,8 +150,14 @@ def test_ae_evaluator_integrals_plain_df(tiny_setup):
     ds, ae = tiny_setup
     ev = AEEvaluator(_cfg(eval_integrals=True), val_ds=ds, batch_size=1)
     metrics, plots = ev(ae, epoch=1)
-    for key in ("df_mse", "df_rel_l2", "phi_int_mse", "phi_int_rel_l2", "flux_int_mse",
-                "flux_int_rel_err"):
+    for key in (
+        "df_mse",
+        "df_rel_l2",
+        "phi_int_mse",
+        "phi_int_rel_l2",
+        "flux_int_mse",
+        "flux_int_rel_err",
+    ):
         assert np.isfinite(metrics[key]), key
     assert any(k.startswith("df ") for k in plots) and any(k.startswith("phi ") for k in plots)
 
@@ -140,12 +172,14 @@ def test_ae_integrals_use_denormalized_df(tmp_path):
     common = dict(path=str(tmp_path), trajectories="iteration_0", backend=NumpyBackend())
     raw = CycloneDataset(**common)
     std = 3.0
-    ds = CycloneDataset(**common, normalization={"df": {"type": "zscore"}},
-                        normalization_stats={"df": {"full": {"mean": 0.0, "std": std}}})
+    ds = CycloneDataset(
+        **common,
+        normalization={"df": {"type": "zscore"}},
+        normalization_stats={"df": {"full": {"mean": 0.0, "std": std}}},
+    )
     gt = precompute_geometry(raw.metadata[0]["geometry"])
     solve = jax.jit(flux_integral)
-    eflux = np.asarray([float(solve(gt, jnp.asarray(raw[i].df))[1][1])
-                        for i in range(len(raw))])
+    eflux = np.asarray([float(solve(gt, jnp.asarray(raw[i].df))[1][1]) for i in range(len(raw))])
 
     ev = AEEvaluator(_cfg(eval_integrals=True), val_ds=ds, batch_size=2)
     metrics, _ = ev(Scaled(2.0), epoch=1)
@@ -199,17 +233,37 @@ def test_diffusion_evaluator_samples_and_scores(tiny_setup):
 
     ds, ae = tiny_setup
     grid = tuple(ae.bottleneck_grid_size)
-    dit = DiT(space=len(grid), z_dim=int(ae.bottleneck_dim), dim=16, grid_size=grid, depth=1,
-              num_heads=2, n_cond=2, key=jr.PRNGKey(1))
+    dit = DiT(
+        space=len(grid),
+        z_dim=int(ae.bottleneck_dim),
+        dim=16,
+        grid_size=grid,
+        depth=1,
+        num_heads=2,
+        n_cond=2,
+        key=jr.PRNGKey(1),
+    )
     cfg = _cfg(eval_integrals=True, eval_sample_steps=2, eval_n_samples=2)
-    ev = DiffusionEvaluator(cfg, val_ds=ds, autoencoder=ae, latent_scale=1.0,
-                            cond_slots=np.asarray([0, 1]), batch_size=2)
+    ev = DiffusionEvaluator(
+        cfg,
+        val_ds=ds,
+        autoencoder=ae,
+        latent_scale=1.0,
+        cond_slots=np.asarray([0, 1]),
+        batch_size=2,
+    )
     metrics, plots = ev(dit, epoch=1)
     TRACE_COUNTS.clear()
     ev(dit, epoch=2)
     assert TRACE_COUNTS["diffusion_eval_step"] == 0
-    for key in ("df_mse", "df_rel_l2", "avg_flux_rmse", "avg_flux_rel_err",
-                "avg_flux_pred/iteration_0", "avg_flux_std/iteration_0"):
+    for key in (
+        "df_mse",
+        "df_rel_l2",
+        "avg_flux_rmse",
+        "avg_flux_rel_err",
+        "avg_flux_pred/iteration_0",
+        "avg_flux_std/iteration_0",
+    ):
         assert np.isfinite(metrics[key]), key
     assert metrics["avg_flux_gt/iteration_0"] == pytest.approx(ds.get_avg_flux(0))
     assert "avg_flux_UQ" in plots
@@ -222,15 +276,21 @@ def test_spectral_sums_split_over_processes_match_the_whole():
     rng = np.random.default_rng(0)
 
     def diag():
-        return {"kyspec": rng.random(4), "qspec": rng.random(4), "kxspec": rng.random(6),
-                **{k: rng.standard_normal(6) for k in ("zfphi", "zfflow", "zfshear")}}
+        return {
+            "kyspec": rng.random(4),
+            "qspec": rng.random(4),
+            "kxspec": rng.random(6),
+            **{k: rng.standard_normal(6) for k in ("zfphi", "zfflow", "zfshear")},
+        }
 
     pred = {f: [diag() for _ in range(5)] for f in (0, 2)}
     gt = {f: [diag() for _ in range(5)] for f in (0, 2)}
     whole = {f: m.time_averaged_spectral_metrics(pred[f], gt[f]) for f in (0, 2)}
     want = {k: np.mean([whole[f][k] for f in (0, 2)]) for k in whole[0]}
-    parts = [{f: m.spectral_sums(pred[f][sl], gt[f][sl]) for f in (0, 2)}
-             for sl in (slice(0, 2), slice(2, 5))]
+    parts = [
+        {f: m.spectral_sums(pred[f][sl], gt[f][sl]) for f in (0, 2)}
+        for sl in (slice(0, 2), slice(2, 5))
+    ]
     packed = sum(m.pack_spectral_store(p, 3, 4) for p in parts)
     got = m.merged_spectral_metrics(m.unpack_spectral_store(packed, 4))
     assert set(got) == set(want)

@@ -12,8 +12,9 @@ import pytest
 from neugk_jax.dataset import CycloneDataset, NumpyBackend
 
 
-def _make_synthetic_traj(root: Path, name: str, *, n_t: int, resolution,
-                         drop_keys=(), extra_meta=None):
+def _make_synthetic_traj(
+    root: Path, name: str, *, n_t: int, resolution, drop_keys=(), extra_meta=None
+):
     """Write a fake trajectory directory: metadata.pkl + N data/.bin files."""
     traj = root / f"{name}_ifft_realpotens"
     data = traj / "data"
@@ -36,10 +37,26 @@ def _make_synthetic_traj(root: Path, name: str, *, n_t: int, resolution,
         "resolution": np.array(resolution),
         "geometry": {
             k: np.ones((1,), dtype=np.float64)
-            for k in ("krho", "ints", "intmu", "intvp", "vpgr", "mugr",
-                     "bn", "efun", "rfun", "bt_frac", "parseval",
-                     "mas", "tmp", "d2X", "signz", "signB",
-                     "kxrh", "little_g")
+            for k in (
+                "krho",
+                "ints",
+                "intmu",
+                "intvp",
+                "vpgr",
+                "mugr",
+                "bn",
+                "efun",
+                "rfun",
+                "bt_frac",
+                "parseval",
+                "mas",
+                "tmp",
+                "d2X",
+                "signz",
+                "signB",
+                "kxrh",
+                "little_g",
+            )
         },
         "df_mean": np.zeros(1, dtype=np.float32),
         "df_std": np.ones(1, dtype=np.float32),
@@ -65,12 +82,14 @@ def synthetic_dir(tmp_path):
 def test_dataset_construction(synthetic_dir):
     root, res = synthetic_dir
     ds = CycloneDataset(
-        path=str(root), split="train",
+        path=str(root),
+        split="train",
         trajectories=["iteration_001", "iteration_002"],
         fields_to_load=("df",),
         conditions=("itg", "dg", "s_hat", "q"),
         mode="ae",
-        offset=0, bundle_seq_length=1,
+        offset=0,
+        bundle_seq_length=1,
         backend=NumpyBackend(),
     )
     assert len(ds.files) == 2
@@ -82,7 +101,8 @@ def test_dataset_construction(synthetic_dir):
 def test_getitem_shapes(synthetic_dir):
     root, res = synthetic_dir
     ds = CycloneDataset(
-        path=str(root), split="train",
+        path=str(root),
+        split="train",
         trajectories=["iteration_001"],
         fields_to_load=("df",),
         conditions=("itg", "dg", "s_hat", "q"),
@@ -104,7 +124,8 @@ def test_getitem_shapes(synthetic_dir):
 def test_collate_batches(synthetic_dir):
     root, _ = synthetic_dir
     ds = CycloneDataset(
-        path=str(root), split="train",
+        path=str(root),
+        split="train",
         trajectories=["iteration_001"],
         fields_to_load=("df",),
         conditions=("itg", "dg", "s_hat", "q"),
@@ -120,7 +141,8 @@ def test_collate_batches(synthetic_dir):
 def test_normalize_denormalize_roundtrip(synthetic_dir):
     root, _ = synthetic_dir
     ds = CycloneDataset(
-        path=str(root), split="train",
+        path=str(root),
+        split="train",
         trajectories=["iteration_001"],
         fields_to_load=("df",),
         normalization={"df": {"type": "zscore"}},
@@ -138,7 +160,8 @@ def test_normalize_denormalize_roundtrip(synthetic_dir):
 def test_separate_zf_doubles_channels(synthetic_dir):
     root, _ = synthetic_dir
     ds = CycloneDataset(
-        path=str(root), split="train",
+        path=str(root),
+        split="train",
         trajectories=["iteration_001"],
         fields_to_load=("df",),
         separate_zf=True,
@@ -180,7 +203,12 @@ def test_npz_metadata_matches_pkl(tmp_path):
     assert "ffun" in g
     # missing flags default to electrostatic with adiabatic electrons
     assert {k: float(g[k]) for k in ("adiabatic", "de", "beta", "nlapar", "nlbpar")} == {
-        "adiabatic": 1.0, "de": 1.0, "beta": 0.0, "nlapar": 0.0, "nlbpar": 0.0}
+        "adiabatic": 1.0,
+        "de": 1.0,
+        "beta": 0.0,
+        "nlapar": 0.0,
+        "nlbpar": 0.0,
+    }
     # resolution special-cased back to a tuple of ints
     assert tuple(meta_npz["resolution"]) == res
 
@@ -208,11 +236,11 @@ def test_backend_exists(tmp_path):
 def test_missing_required_field_excludes_trajectory(tmp_path):
     res = (2, 2, 2, 4, 2)
     _make_synthetic_traj(tmp_path, "iteration_001", n_t=8, resolution=res)
-    _make_synthetic_traj(tmp_path, "iteration_002", n_t=8, resolution=res,
-                         drop_keys=("s_hat",))
+    _make_synthetic_traj(tmp_path, "iteration_002", n_t=8, resolution=res, drop_keys=("s_hat",))
     with pytest.warns(UserWarning, match="s_hat"):
         ds = CycloneDataset(
-            path=str(tmp_path), split="train",
+            path=str(tmp_path),
+            split="train",
             trajectories=["iteration_001", "iteration_002"],
             backend=NumpyBackend(),
         )
@@ -224,11 +252,17 @@ def test_missing_required_field_excludes_trajectory(tmp_path):
 
 def test_missing_cond_filter_field_excludes_trajectory(tmp_path):
     res = (2, 2, 2, 4, 2)
-    _make_synthetic_traj(tmp_path, "iteration_001", n_t=8, resolution=res,
-                         extra_meta={"beta": np.array([0.5], dtype=np.float32)})
+    _make_synthetic_traj(
+        tmp_path,
+        "iteration_001",
+        n_t=8,
+        resolution=res,
+        extra_meta={"beta": np.array([0.5], dtype=np.float32)},
+    )
     _make_synthetic_traj(tmp_path, "iteration_002", n_t=8, resolution=res)
     ds = CycloneDataset(
-        path=str(tmp_path), split="train",
+        path=str(tmp_path),
+        split="train",
         trajectories=["iteration_001", "iteration_002"],
         cond_filters={"beta": (0.0, 1.0)},
         backend=NumpyBackend(),
@@ -241,7 +275,10 @@ def test_missing_cond_filter_field_excludes_trajectory(tmp_path):
 def test_normalized_field_without_stats_raises(synthetic_dir):
     root, _ = synthetic_dir
     ds = CycloneDataset(
-        path=str(root), split="train", trajectories=["iteration_001"], fields_to_load=("df",),
+        path=str(root),
+        split="train",
+        trajectories=["iteration_001"],
+        fields_to_load=("df",),
         normalization={"df": {"type": "zscore"}, "flux": {"type": "zscore"}},
         normalization_stats={"df": {"full": {"mean": 0.0, "std": 1.0}}},
         backend=NumpyBackend(),

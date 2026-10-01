@@ -14,23 +14,34 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-needs_gyaradax = pytest.mark.skipif(importlib.util.find_spec("gyaradax") is None,
-                                    reason="gyaradax not installed")
+needs_gyaradax = pytest.mark.skipif(
+    importlib.util.find_spec("gyaradax") is None, reason="gyaradax not installed"
+)
 
 
 def _dataset(sample, stats=None, **kwargs):
     from neugk_jax.dataset import CycloneDataset, H5Backend
+
     norm = {"df": {"type": "zscore"}} if stats else None
-    return CycloneDataset(path=sample.root, trajectories=[sample.name], backend=H5Backend(),
-                          normalization=norm, normalization_stats=stats, **kwargs)
+    return CycloneDataset(
+        path=sample.root,
+        trajectories=[sample.name],
+        backend=H5Backend(),
+        normalization=norm,
+        normalization_stats=stats,
+        **kwargs,
+    )
 
 
 @pytest.fixture(scope="module")
 def raw(hf_sample):
     import h5py
+
     with h5py.File(hf_sample.h5, "r") as f:
-        return {"df": f["data/timestep_00000"][()],
-                "meta": {k: v[()] for k, v in f["metadata"].items()}}
+        return {
+            "df": f["data/timestep_00000"][()],
+            "meta": {k: v[()] for k, v in f["metadata"].items()},
+        }
 
 
 def test_h5_loader_reads_the_release_snapshot(hf_sample, raw):

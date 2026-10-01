@@ -82,8 +82,9 @@ class AEEvaluator(BaseEvaluator):
             tgt_int = None
             if self.eval_integrals:
                 if plan.number not in self._tgt_int:
-                    self._tgt_int[plan.number] = jax.device_get(target_integrals(
-                        batch["df"], batch["file_index"], self.denorm, geom))
+                    self._tgt_int[plan.number] = jax.device_get(
+                        target_integrals(batch["df"], batch["file_index"], self.denorm, geom)
+                    )
                 tgt_int = self.place(self._tgt_int[plan.number])
             acc, pred_d, tgt_d, phi = ae_eval_step(model, batch, acc, self.denorm, geom, tgt_int)
             if self.eval_spectra:
@@ -98,12 +99,15 @@ class AEEvaluator(BaseEvaluator):
 
     def _spectra(self, store, pred_d, tgt_d, plan) -> None:
         from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-        accumulate_spectral_diagnostics(store, pred_d, tgt_d, plan_fids(self.ds, plan), self.ds,
-                                        valid=plan.mask > 0)
+
+        accumulate_spectral_diagnostics(
+            store, pred_d, tgt_d, plan_fids(self.ds, plan), self.ds, valid=plan.mask > 0
+        )
 
     @staticmethod
     def _plots(pred_d, tgt_d, phi, tgt_int, batch) -> dict[str, Any]:
         from neugk_jax.evaluate.plots import generate_val_plots
+
         rollout, gt = {"df": pred_d[0]}, {"df": tgt_d[0]}
         if phi is not None:
             rollout["phi"], gt["phi"] = phi[0], tgt_int[0][0]

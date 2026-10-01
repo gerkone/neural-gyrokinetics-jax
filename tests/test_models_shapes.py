@@ -57,8 +57,6 @@ def test_film():
     assert out.shape == x.shape
 
 
-
-
 def test_ape():
     pe = APE(8, (4, 6))
     x = jnp.zeros((4, 6, 8))
@@ -78,8 +76,6 @@ def test_continuous_condition_embed():
     out = emb(jnp.array([0.1, 0.5, -0.3, 1.0]))
     assert out.shape == (emb.cond_dim,)
     assert emb.cond_dim == 4 * 32
-
-
 
 
 def test_pad_to_blocks():
@@ -122,16 +118,22 @@ def test_patch_merge_then_expand():
     assert z.shape == (*grid, expand.out_dim)
 
 
-
-
-@pytest.mark.parametrize("space,grid,window", [
-    (2, (8, 8), (4, 4)),
-    (3, (8, 12, 8), (4, 4, 4)),
-])
+@pytest.mark.parametrize(
+    "space,grid,window",
+    [
+        (2, (8, 8), (4, 4)),
+        (3, (8, 12, 8), (4, 4, 4)),
+    ],
+)
 def test_swin_layer(space, grid, window):
     lyr = SwinLayer(
-        space=space, dim=32, depth=2, num_heads=4,
-        grid_size=grid, window_size=window, key=jr.PRNGKey(0),
+        space=space,
+        dim=32,
+        depth=2,
+        num_heads=4,
+        grid_size=grid,
+        window_size=window,
+        key=jr.PRNGKey(0),
     )
     x = jr.normal(jr.PRNGKey(1), (*grid, 32))
     out = lyr(x, inference=True)
@@ -140,8 +142,12 @@ def test_swin_layer(space, grid, window):
 
 def test_vit_layer():
     lyr = ViTLayer(
-        space=3, dim=32, depth=2, num_heads=4,
-        grid_size=(2, 3, 4), key=jr.PRNGKey(0),
+        space=3,
+        dim=32,
+        depth=2,
+        num_heads=4,
+        grid_size=(2, 3, 4),
+        key=jr.PRNGKey(0),
     )
     x = jr.normal(jr.PRNGKey(1), (2, 3, 4, 32))
     assert lyr(x, inference=True).shape == x.shape
@@ -149,8 +155,13 @@ def test_vit_layer():
 
 def test_dit_layer():
     lyr = DiTLayer(
-        space=3, dim=32, depth=2, num_heads=4,
-        grid_size=(2, 3, 4), key=jr.PRNGKey(0), cond_dim=64,
+        space=3,
+        dim=32,
+        depth=2,
+        num_heads=4,
+        grid_size=(2, 3, 4),
+        key=jr.PRNGKey(0),
+        cond_dim=64,
     )
     x = jr.normal(jr.PRNGKey(1), (2, 3, 4, 32))
     cond = jr.normal(jr.PRNGKey(2), (64,))
@@ -160,15 +171,18 @@ def test_dit_layer():
 def test_dit_swin_layer():
     grid = (8, 8, 4)
     lyr = DiTSwinLayer(
-        space=3, dim=32, depth=2, num_heads=4,
-        grid_size=grid, window_size=(4, 4, 2),
-        key=jr.PRNGKey(0), cond_dim=64,
+        space=3,
+        dim=32,
+        depth=2,
+        num_heads=4,
+        grid_size=grid,
+        window_size=(4, 4, 2),
+        key=jr.PRNGKey(0),
+        cond_dim=64,
     )
     x = jr.normal(jr.PRNGKey(1), (*grid, 32))
     cond = jr.normal(jr.PRNGKey(2), (64,))
     assert lyr(x, cond, inference=True).shape == x.shape
-
-
 
 
 def test_swin_5d_unet_no_decouple():
@@ -184,10 +198,13 @@ def test_swin_5d_unet_no_decouple():
         out_channels=2,
         patch_size=(2, 2, 2, 4, 2),
         window_size=(2, 2, 2, 2, 2),
-        depth=2, num_heads=2, num_layers=2,
-
-        merging_depth=1, unmerging_depth=1,
-        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,
+        depth=2,
+        num_heads=2,
+        num_layers=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
         hidden_mlp_ratio=2.0,
         key=jr.PRNGKey(0),
     )
@@ -208,11 +225,16 @@ def test_swin5d_ae_decouple_mu():
         out_channels=2,
         patch_size=(2, 0, 2, 4, 2),
         window_size=(2, 0, 2, 2, 2),
-        depth=2, num_heads=2, num_layers=2,
-
-        bottleneck_dim=24, bottleneck_depth=1, bottleneck_num_heads=2,
-        merging_depth=1, unmerging_depth=1,
-        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,
+        depth=2,
+        num_heads=2,
+        num_layers=2,
+        bottleneck_dim=24,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
         hidden_mlp_ratio=2.0,
         key=jr.PRNGKey(0),
     )
@@ -228,8 +250,13 @@ def test_dit_forward():
     z_dim = 16
     dim = 32
     model = DiT(
-        space=3, z_dim=z_dim, dim=dim, grid_size=grid,
-        depth=2, num_heads=4, n_cond=4,
+        space=3,
+        z_dim=z_dim,
+        dim=dim,
+        grid_size=grid,
+        depth=2,
+        num_heads=4,
+        n_cond=4,
         key=jr.PRNGKey(0),
     )
     x = jr.normal(jr.PRNGKey(1), (*grid, z_dim))
@@ -238,19 +265,28 @@ def test_dit_forward():
     assert model.latent_shape == (*grid, z_dim)
 
 
-
 def test_swin5d_ae_vmapped_batch():
     """Vmap over a batch axis works without extra plumbing."""
     base = (4, 4, 4, 16, 8)
     ae = Swin5DAE(
-        space=5, decouple_mu=True, dim=8,
-        base_resolution=base, in_channels=2, out_channels=2,
-        patch_size=(2, 0, 2, 4, 2), window_size=(2, 0, 2, 2, 2),
-        depth=1, num_heads=2, num_layers=2,
-
-        bottleneck_dim=16, bottleneck_depth=1, bottleneck_num_heads=2,
-        merging_depth=1, unmerging_depth=1,
-        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,
+        space=5,
+        decouple_mu=True,
+        dim=8,
+        base_resolution=base,
+        in_channels=2,
+        out_channels=2,
+        patch_size=(2, 0, 2, 4, 2),
+        window_size=(2, 0, 2, 2, 2),
+        depth=1,
+        num_heads=2,
+        num_layers=2,
+        bottleneck_dim=16,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
         hidden_mlp_ratio=2.0,
         key=jr.PRNGKey(0),
     )

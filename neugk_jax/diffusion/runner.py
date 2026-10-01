@@ -54,6 +54,7 @@ def check_ae_dataset(ae_dataset: dict, dataset: dict) -> None:
     sets ``normalization_stats``.
     """
     import warnings
+
     bad = []
     for k, default in (("separate_zf", False), ("offset", 0)):
         a, b = ae_dataset.get(k, default), dataset.get(k, default)
@@ -68,8 +69,10 @@ def check_ae_dataset(ae_dataset: dict, dataset: dict) -> None:
         if not _same_path(a, b):
             bad.append(("normalization_stats", a, b))
     elif (a is None) != (b is None):
-        warnings.warn(f"ae normalization_stats={a!r}, diffusion normalization_stats={b!r}: "
-                      "cannot check that both normalize df with the same statistics")
+        warnings.warn(
+            f"ae normalization_stats={a!r}, diffusion normalization_stats={b!r}: "
+            "cannot check that both normalize df with the same statistics"
+        )
     if bad:
         lines = "\n".join(f"  dataset.{k}: ae={a!r} diffusion={b!r}" for k, a, b in bad)
         raise ValueError(f"diffusion dataset does not match the AE run's dataset:\n{lines}")
@@ -78,6 +81,7 @@ def check_ae_dataset(ae_dataset: dict, dataset: dict) -> None:
 def load_autoencoder(path, *, resolution=None, dataset: dict | None = None):
     """AE of a run directory or checkpoint file; ``dataset`` is checked against the run's."""
     from neugk_jax.translate import build_ae_from_config, load_config, load_or_translate
+
     ae_file = resolve_ae_checkpoint(path)
     ae_cfg = load_config(str(ae_file.parent / "config.yaml"))
     if dataset is not None:
@@ -99,16 +103,32 @@ def _fm_loss(model, z, cond, key, *, latent_scale, use_ot, train: bool, mask=Non
         k = rest[-1] if train else None
         return model(x, t, c, key=k, inference=not train)
 
-    return fm_forward_loss(fwd, z, cond, key=fm_key, latent_scale=latent_scale, use_ot=use_ot,
-                           dropout_key=drop_key if train else None, mask=mask)
+    return fm_forward_loss(
+        fwd,
+        z,
+        cond,
+        key=fm_key,
+        latent_scale=latent_scale,
+        use_ot=use_ot,
+        dropout_key=drop_key if train else None,
+        mask=mask,
+    )
 
 
 @eqx.filter_jit
 def fm_val_loss(model, latents, cond, idx, mask, key, latent_scale: float, use_ot: bool):
     count_trace("fm_val_loss")
     c = None if cond is None else cond[idx]
-    return _fm_loss(model, latents[idx], c, key, latent_scale=latent_scale, use_ot=use_ot,
-                    train=False, mask=mask)
+    return _fm_loss(
+        model,
+        latents[idx],
+        c,
+        key,
+        latent_scale=latent_scale,
+        use_ot=use_ot,
+        train=False,
+        mask=mask,
+    )
 
 
 class FlowMatchingRunner(AERunner):
@@ -127,28 +147,39 @@ class FlowMatchingRunner(AERunner):
             raise ValueError("diffusion workflow requires ae_checkpoint")
         super().setup_data()
         dcfg = config_dict(cfg.dataset)
-        self.ae = load_autoencoder(cfg.ae_checkpoint, resolution=self.train_ds.resolution,
-                                   dataset=dcfg)
+        self.ae = load_autoencoder(
+            cfg.ae_checkpoint, resolution=self.train_ds.resolution, dataset=dcfg
+        )
         self.latent_shape = (*self.ae.bottleneck_grid_size, int(self.ae.bottleneck_dim))
         ae_file = resolve_ae_checkpoint(cfg.ae_checkpoint)
         for ds, key in ((self.train_ds, "latents_cache_train"), (self.val_ds, "latents_cache_val")):
-            meta = latent_cache_meta(ds, ae_file, normalization_stats=dcfg.get("normalization_stats"))
+            meta = latent_cache_meta(
+                ds, ae_file, normalization_stats=dcfg.get("normalization_stats")
+            )
             path = dcfg.get(key)
             if path:
                 load_precomputed_latents(ds, path, latent_shape=self.latent_shape, meta=meta)
             else:
                 cache = latent_cache_path(
-                    ds, ds.split, cfg.ae_checkpoint,
+                    ds,
+                    ds.split,
+                    cfg.ae_checkpoint,
                     decouple_mu=dcfg.get("norm_decouple_mu", False),
                     timestep_std_filter=dcfg.get("timestep_std_filter"),
                 )
-                precompute_latents(ds, encode_fn=lambda df, _c: encode_batch(self.ae, df),
-                                   cache_file=cache, batch_size=self.tcfg.get("precompute_batch", 2),
-                                   meta=meta, latent_shape=self.latent_shape)
+                precompute_latents(
+                    ds,
+                    encode_fn=lambda df, _c: encode_batch(self.ae, df),
+                    cache_file=cache,
+                    batch_size=self.tcfg.get("precompute_batch", 2),
+                    meta=meta,
+                    latent_shape=self.latent_shape,
+                )
         # df-mode view of the val split for sample targets
         self.val_df_ds = self.val_ds.with_mode("ae")
-        self.cond_slots = conditioning_slots(self.train_ds.conditions,
-                                             list(cfg.model.get("conditioning") or []))
+        self.cond_slots = conditioning_slots(
+            self.train_ds.conditions, list(cfg.model.get("conditioning") or [])
+        )
         if cfg.get("latent_scale") is not None:
             self.latent_scale = float(cfg.latent_scale)
         else:
@@ -180,8 +211,15 @@ class FlowMatchingRunner(AERunner):
 
     def loss_fn(self, model, batch, key):
         idx, cond = batch["idx"], batch["cond"]
-        loss = _fm_loss(model, batch["latents"][idx], None if cond is None else cond[idx], key,
-                        latent_scale=self.latent_scale, use_ot=self.use_ot, train=True)
+        loss = _fm_loss(
+            model,
+            batch["latents"][idx],
+            None if cond is None else cond[idx],
+            key,
+            latent_scale=self.latent_scale,
+            use_ot=self.use_ot,
+            train=True,
+        )
         return loss, {"fm_loss": loss}
 
     def make_evaluator(self):
@@ -189,11 +227,18 @@ class FlowMatchingRunner(AERunner):
         if not (self.cfg.get("validation") or {}).get("eval_sampling", False):
             return None
         from neugk_jax.diffusion.eval import DiffusionEvaluator
+
         vcfg = self.cfg.validation
-        return DiffusionEvaluator(self.cfg, val_ds=self.val_df_ds, autoencoder=self.ae,
-                                  latent_scale=self.latent_scale, cond_slots=self.cond_slots,
-                                  dist=self.dist, loader=self.loader,
-                                  batch_size=vcfg.get("batch_size") or self.tcfg.batch_size)
+        return DiffusionEvaluator(
+            self.cfg,
+            val_ds=self.val_df_ds,
+            autoencoder=self.ae,
+            latent_scale=self.latent_scale,
+            cond_slots=self.cond_slots,
+            dist=self.dist,
+            loader=self.loader,
+            batch_size=vcfg.get("batch_size") or self.tcfg.batch_size,
+        )
 
     def evaluate(self, epoch: int) -> tuple[dict, dict]:
         bs, n = self.tcfg.batch_size, len(self.val_ds)
@@ -203,9 +248,16 @@ class FlowMatchingRunner(AERunner):
         for i, start in enumerate(range(0, n, bs)):
             idx = np.arange(start, start + bs) % n
             mask = (np.arange(start, start + bs) < n).astype(np.float32)
-            loss = fm_val_loss(model, self.val_tables["latents"], self.val_tables["cond"],
-                               jnp.asarray(idx, jnp.int32), jnp.asarray(mask), jr.fold_in(key, i),
-                               self.latent_scale, self.use_ot)
+            loss = fm_val_loss(
+                model,
+                self.val_tables["latents"],
+                self.val_tables["cond"],
+                jnp.asarray(idx, jnp.int32),
+                jnp.asarray(mask),
+                jr.fold_in(key, i),
+                self.latent_scale,
+                self.use_ot,
+            )
             total += float(loss) * float(mask.sum())
         out = {"fm_loss": total / n if n else float("nan")}
         plots = {}

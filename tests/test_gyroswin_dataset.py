@@ -21,7 +21,9 @@ def _make_traj(root: Path, name: str, *, n_t: int, seed: int):
     # every df/phi entry of step t equals t + seed/100, so a read identifies (trajectory, step)
     for t in range(n_t):
         np.full((2, *RES), t + seed / 100, np.float32).tofile(data / f"timestep_{t:05d}.bin")
-        np.full((RES[3], RES[2], RES[4]), -(t + seed / 100), np.float32).tofile(data / f"poten_{t:05d}.bin")
+        np.full((RES[3], RES[2], RES[4]), -(t + seed / 100), np.float32).tofile(
+            data / f"poten_{t:05d}.bin"
+        )
     meta = {
         "timesteps": np.arange(n_t, dtype=np.float64) * 0.5 + seed,
         "flux": rng.standard_normal(n_t).astype(np.float32),
@@ -45,10 +47,21 @@ def two_trajs(tmp_path):
 
 def _stats(flux_mean=1.0, flux_std=2.0, avg_mean=-1.0, avg_std=4.0):
     def one(m, s):
-        return {"full": {"mean": np.asarray(m, np.float32), "std": np.asarray(s, np.float32),
-                         "min": np.asarray(m - s, np.float32), "max": np.asarray(m + s, np.float32)}}
-    return {"df": one(0.5, 2.0), "phi": one(-0.5, 3.0),
-            "flux": one(flux_mean, flux_std), "fluxavg": one(avg_mean, avg_std)}
+        return {
+            "full": {
+                "mean": np.asarray(m, np.float32),
+                "std": np.asarray(s, np.float32),
+                "min": np.asarray(m - s, np.float32),
+                "max": np.asarray(m + s, np.float32),
+            }
+        }
+
+    return {
+        "df": one(0.5, 2.0),
+        "phi": one(-0.5, 3.0),
+        "flux": one(flux_mean, flux_std),
+        "fluxavg": one(avg_mean, avg_std),
+    }
 
 
 _NORM = {k: {"type": "zscore"} for k in ("df", "phi", "flux", "fluxavg")}
@@ -56,9 +69,14 @@ _NORM = {k: {"type": "zscore"} for k in ("df", "phi", "flux", "fluxavg")}
 
 def test_next_step_index_never_crosses_trajectories(two_trajs):
     root, metas = two_trajs
-    ds = CycloneDataset(path=str(root), trajectories=["iteration_0", "iteration_1"],
-                        fields_to_load=("df", "phi"), mode="next", backend=NumpyBackend(),
-                        offset=1)
+    ds = CycloneDataset(
+        path=str(root),
+        trajectories=["iteration_0", "iteration_1"],
+        fields_to_load=("df", "phi"),
+        mode="next",
+        backend=NumpyBackend(),
+        offset=1,
+    )
     # per file: (n_t - offset) - 2 * bundle + 1 samples
     assert len(ds) == (6 - 1 - 1) + (7 - 1 - 1)
     for i in range(len(ds)):
@@ -75,8 +93,15 @@ def test_next_step_index_never_crosses_trajectories(two_trajs):
 
 def test_next_step_tail_offset_keeps_rollout_targets(two_trajs):
     root, _ = two_trajs
-    ds = CycloneDataset(path=str(root), trajectories=["iteration_0"], fields_to_load=("df",),
-                        mode="next", backend=NumpyBackend(), tail_offset=2, split="val")
+    ds = CycloneDataset(
+        path=str(root),
+        trajectories=["iteration_0"],
+        fields_to_load=("df",),
+        mode="next",
+        backend=NumpyBackend(),
+        tail_offset=2,
+        split="val",
+    )
     assert len(ds) == 6 - 2 - 1
     last = int(ds[len(ds) - 1].timestep_index)
     # the tail keeps full rollouts: every step capped by num_ts has a target on disk
@@ -90,9 +115,16 @@ def test_next_step_tail_offset_keeps_rollout_targets(two_trajs):
 
 def test_rollout_cap_with_subsample(two_trajs):
     root, _ = two_trajs
-    ds = CycloneDataset(path=str(root), trajectories=["iteration_1"], fields_to_load=("df",),
-                        mode="next", backend=NumpyBackend(), tail_offset=2, split="val",
-                        subsample=2)
+    ds = CycloneDataset(
+        path=str(root),
+        trajectories=["iteration_1"],
+        fields_to_load=("df",),
+        mode="next",
+        backend=NumpyBackend(),
+        tail_offset=2,
+        split="val",
+        subsample=2,
+    )
     t0 = [int(ds[i].timestep_index) for i in range(len(ds))]
     assert t0 == [0, 2]
     # num_ts and timestep_index are both raw, so no sample loses its rollout
@@ -101,11 +133,22 @@ def test_rollout_cap_with_subsample(two_trajs):
 
 def test_next_step_normalization(two_trajs):
     root, metas = two_trajs
-    ds = CycloneDataset(path=str(root), trajectories=["iteration_0"], fields_to_load=("df", "phi"),
-                        mode="next", backend=NumpyBackend(), normalization=_NORM,
-                        normalization_stats=_stats())
-    raw = CycloneDataset(path=str(root), trajectories=["iteration_0"],
-                         fields_to_load=("df", "phi"), mode="next", backend=NumpyBackend())[2]
+    ds = CycloneDataset(
+        path=str(root),
+        trajectories=["iteration_0"],
+        fields_to_load=("df", "phi"),
+        mode="next",
+        backend=NumpyBackend(),
+        normalization=_NORM,
+        normalization_stats=_stats(),
+    )
+    raw = CycloneDataset(
+        path=str(root),
+        trajectories=["iteration_0"],
+        fields_to_load=("df", "phi"),
+        mode="next",
+        backend=NumpyBackend(),
+    )[2]
     s = ds[2]
     assert np.allclose(s.df, (raw.df - 0.5) / 2.0)
     assert np.allclose(s.y_df, (raw.y_df - 0.5) / 2.0)
@@ -118,24 +161,41 @@ def test_next_step_normalization(two_trajs):
 
 def test_timestep_condition(two_trajs):
     root, metas = two_trajs
-    ds = CycloneDataset(path=str(root), trajectories=["iteration_0", "iteration_1"],
-                        fields_to_load=("df",), mode="next", backend=NumpyBackend(),
-                        conditions=("timestep", "itg"))
+    ds = CycloneDataset(
+        path=str(root),
+        trajectories=["iteration_0", "iteration_1"],
+        fields_to_load=("df",),
+        mode="next",
+        backend=NumpyBackend(),
+        conditions=("timestep", "itg"),
+    )
     assert len(ds.files) == 2
     assert ds.conditions == ["itg", "timestep"]
     s = ds[3]
-    assert s.conditioning[1] == pytest.approx(metas[int(s.file_index)]["timesteps"][int(s.timestep_index)])
-    assert ds.get_timestep(int(s.file_index), int(s.timestep_index)) == pytest.approx(s.conditioning[1])
+    assert s.conditioning[1] == pytest.approx(
+        metas[int(s.file_index)]["timesteps"][int(s.timestep_index)]
+    )
+    assert ds.get_timestep(int(s.file_index), int(s.timestep_index)) == pytest.approx(
+        s.conditioning[1]
+    )
 
 
 def test_scale_shift_batches_per_trajectory_stats(two_trajs):
     root, _ = two_trajs
     stats = _stats()
-    stats["flux"] = {0: {"mean": np.ones(1, np.float32), "std": np.full(1, 2.0, np.float32)},
-                     1: {"mean": np.zeros(1, np.float32), "std": np.full(1, 3.0, np.float32)}}
-    ds = CycloneDataset(path=str(root), trajectories=["iteration_0", "iteration_1"], mode="next",
-                        backend=NumpyBackend(), normalization=_NORM, normalization_stats=stats,
-                        normalization_scope="trajectory")
+    stats["flux"] = {
+        0: {"mean": np.ones(1, np.float32), "std": np.full(1, 2.0, np.float32)},
+        1: {"mean": np.zeros(1, np.float32), "std": np.full(1, 3.0, np.float32)},
+    }
+    ds = CycloneDataset(
+        path=str(root),
+        trajectories=["iteration_0", "iteration_1"],
+        mode="next",
+        backend=NumpyBackend(),
+        normalization=_NORM,
+        normalization_stats=stats,
+        normalization_scope="trajectory",
+    )
     scale, shift = ds.scale_shift([0, 1, 0], "flux", 0)
     assert scale.shape == (3,) and np.allclose(scale, [2.0, 3.0, 2.0])
     assert np.allclose(shift, [1.0, 0.0, 1.0])

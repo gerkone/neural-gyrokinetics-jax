@@ -58,15 +58,23 @@ import numpy as np
 RAW_ROOT = os.environ.get("NEUGK_RAW_ROOT")
 TARGET_DIR = os.environ.get("NEUGK_TARGET_DIR")
 KVIKIO_SUBDIR = "preprocessed_kvikio"
-LIGHT_DROP_KEYS = ("df_min", "df_max", "df_var", "df_mean", "df_std", "phi_min", "phi_max",
-                   "phi_var")
+LIGHT_DROP_KEYS = (
+    "df_min",
+    "df_max",
+    "df_var",
+    "df_mean",
+    "df_std",
+    "phi_min",
+    "phi_max",
+    "phi_var",
+)
 PHI_STAT_KEYS = ("phi_mean", "phi_var", "phi_std", "phi_min", "phi_max")
 
 _DTYPE_SUFFIX = {
     "fp16": ".fp16.bin",
     "bf16": ".bf16.bin",
-    "i8":   ".i8.bin",
-    "i4":   ".i4.bin",
+    "i8": ".i8.bin",
+    "i4": ".i4.bin",
 }
 
 
@@ -88,6 +96,7 @@ def quantize_array(arr_f32: np.ndarray, bits: str) -> tuple[np.ndarray, np.float
         return arr_f32.astype(np.float16), None
     if bits == "bf16":
         from ml_dtypes import bfloat16
+
         return arr_f32.astype(bfloat16), None
     if bits == "i8":
         qmax = 127
@@ -110,7 +119,9 @@ def quantize_array(arr_f32: np.ndarray, bits: str) -> tuple[np.ndarray, np.float
     raise ValueError(f"unknown bits={bits!r}; expected one of {list(_DTYPE_SUFFIX)}")
 
 
-def dequantize_array(payload: np.ndarray, scale: np.float32 | None, bits: str, n_elems: int) -> np.ndarray:
+def dequantize_array(
+    payload: np.ndarray, scale: np.float32 | None, bits: str, n_elems: int
+) -> np.ndarray:
     """Inverse of :func:`quantize_array` — returns fp32."""
     if bits == "fp16":
         return payload.astype(np.float32)
@@ -158,6 +169,7 @@ def read_quantized(path: str, bits: str, n_elems: int, *, return_raw: bool = Fal
             payload = np.frombuffer(f.read(), dtype=np.float16)
         elif bits == "bf16":
             from ml_dtypes import bfloat16
+
             payload = np.frombuffer(f.read(), dtype=bfloat16)
         elif bits == "i8":
             payload = np.frombuffer(f.read(), dtype=np.int8)
@@ -244,8 +256,12 @@ def _process_traj(traj_dir: str, bits: str, force: bool) -> tuple[str, int, int,
 
 
 def run_quantize(
-    *, path: str, trajs: str | Sequence[str], bits: str,
-    num_workers: int = 4, force: bool = False,
+    *,
+    path: str,
+    trajs: str | Sequence[str],
+    bits: str,
+    num_workers: int = 4,
+    force: bool = False,
 ) -> None:
     traj_dirs = [d for d in resolve_traj_dirs(path, trajs) if os.path.isdir(d)]
     if not traj_dirs:
@@ -447,8 +463,9 @@ def do_ifft(knth: np.ndarray) -> np.ndarray:
     return np.stack([knth.real, knth.imag]).squeeze().astype("float32")
 
 
-def check_ifft(transformed: np.ndarray, orig: np.ndarray, zf_separated: bool = False,
-               atol: float = 1e-5) -> bool:
+def check_ifft(
+    transformed: np.ndarray, orig: np.ndarray, zf_separated: bool = False, atol: float = 1e-5
+) -> bool:
     """True when the real-space df transforms back onto the raw spectral dump within ``atol``."""
     if zf_separated:
         cplx = np.sum(transformed[::2], axis=0) + 1j * np.sum(transformed[1::2], axis=0)
@@ -472,11 +489,11 @@ def phi_to_spc(phi, gt_spc=None, out_shape=None, norm: str = "forward") -> np.nd
     """
     phi_fft = np.fft.fftn(phi, axes=(0, 2), norm=norm)
     phi_fft = np.fft.fftshift(phi_fft, axes=(0, 2))
-    phi_fft = phi_fft[..., phi_fft.shape[-1] // 2:]
+    phi_fft = phi_fft[..., phi_fft.shape[-1] // 2 :]
     nkx, _, nky = out_shape
     xpad = (phi_fft.shape[0] - nkx) // 2
     xpad = xpad + 1 if (phi_fft.shape[0] % 2 == 0) else xpad
-    phi_fft = phi_fft[xpad:nkx + xpad, :, :nky]
+    phi_fft = phi_fft[xpad : nkx + xpad, :, :nky]
     if gt_spc is not None:
         assert _check_spc(np.abs(phi_fft), gt_spc), "Spectral space of Phi incorrect"
     return phi_fft
@@ -489,7 +506,7 @@ def phi_fft_to_real(fft: np.ndarray, out_shape, norm: str = "forward") -> np.nda
         nx, _, ny = fft.shape
         xpad = (nkx - nx) // 2 + 1
         padded = np.zeros(out_shape).astype(fft.dtype)
-        padded[xpad:xpad + nx, :, :ny] = fft
+        padded[xpad : xpad + nx, :, :ny] = fft
     else:
         nkx, _, nky = fft.shape
         padded = fft
@@ -511,15 +528,17 @@ def realspace_to_solver_df(df: np.ndarray) -> np.ndarray:
 
 
 def _numeric_geometry(geometry: dict) -> dict:
-    return {k: np.asarray(v) for k, v in geometry.items()
-            if np.asarray(v).dtype.kind in "fiub"}
+    return {k: np.asarray(v) for k, v in geometry.items() if np.asarray(v).dtype.kind in "fiub"}
 
 
 def _eflux_ky(g: dict, spec, phi, apar, bpar):
     import jax.numpy as jnp
 
-    chi = (g["bessel"] * phi - 2.0 * g["vthrat"] * g["vpgr"] * g["bessel"] * apar
-           + 2.0 * g["mugr"] * g["tmp"] / g["signz"] * g["bessel_bpar"] * bpar)
+    chi = (
+        g["bessel"] * phi
+        - 2.0 * g["vthrat"] * g["vpgr"] * g["bessel"] * apar
+        + 2.0 * g["mugr"] * g["tmp"] / g["signz"] * g["bessel_bpar"] * bpar
+    )
     dum1 = jnp.imag(g["parseval"] * g["ints"] * g["efun"] * g["krho"] * spec * jnp.conj(chi))
     d3v = g["ints"] * g["d2X"] * g["intmu"] * g["bn"] * g["intvp"]
     ef = d3v * (g["vpgr"] ** 2 * dum1 + 2.0 * g["mugr"] * g["bn"] * dum1) * g["de"] * g["tmp"]
@@ -707,7 +726,9 @@ def preprocess(
     dir_out = os.path.join(target_dir, KVIKIO_SUBDIR)
     os.makedirs(dir_out, exist_ok=True)
     out_path = backend.format_path(
-        os.path.join(dir_out, filename.replace("/", "_")), spatial_ifft, split_into_bands,
+        os.path.join(dir_out, filename.replace("/", "_")),
+        spatial_ifft,
+        split_into_bands,
         real_potens=True,
     )
     if backend.exists(out_path) and not (metadata_only or geometry_only):
@@ -764,8 +785,14 @@ def preprocess(
     solver = FieldSolver(geometry, x64=x64)
     df_stats, phi_stats, flux_stats = _running_stats(), _running_stats(), _running_stats()
     os.makedirs(os.path.join(out_path, "data"), exist_ok=True)
-    it = _progress(enumerate(zip(ks, potens)), show_tqdm, desc=filename, total=len(ks),
-                   position=position, leave=False)
+    it = _progress(
+        enumerate(zip(ks, potens)),
+        show_tqdm,
+        desc=filename,
+        total=len(ks),
+        position=position,
+        leave=False,
+    )
     for idx, (k, pot) in it:
         knth = load_k_dump(f"{dir_in}/{k}", resolution)
         orig_knth = knth.copy()
@@ -775,8 +802,9 @@ def preprocess(
             knth = np.concatenate(_split_modes(knth, split_into_bands), axis=0)
         else:
             knth = do_ifft(knth)
-        assert check_ifft(knth, orig_knth, zf_separated=separate_zf), \
-            "error transforming back to original space"
+        assert check_ifft(
+            knth, orig_knth, zf_separated=separate_zf
+        ), "error transforming back to original space"
 
         a = np.loadtxt(f"{dir_in}/{pot}")
         phi_gkw = np.reshape(a, (nx, ns, ny), order="F").astype("float32").copy()
@@ -788,8 +816,10 @@ def preprocess(
         df2 = knth.reshape(-1, 2, *knth.shape[1:]).sum(0) if knth.shape[0] != 2 else knth
         phi_int, eflux = solver(df2)
         if not np.isclose(eflux, orig_fluxes[idx], rtol=0.0, atol=1e-2):
-            warnings.warn(f"Flux integral does not match original flux! "
-                          f"Computed: {eflux}, Original: {orig_fluxes[idx]}")
+            warnings.warn(
+                f"Flux integral does not match original flux! "
+                f"Computed: {eflux}, Original: {orig_fluxes[idx]}"
+            )
         assert np.isclose(eflux, orig_fluxes[idx], rtol=0.0, atol=1.0), "strong deviation for flux"
         rel = np.linalg.norm(phi_gkw - phi_int) / np.linalg.norm(phi_int)
         assert rel < 1e-2, f"poten {pot} does not match the field solve of {k} (rel-L2 {rel:.3e})"
@@ -846,8 +876,11 @@ def rewrite_poten(traj_dir: str, backup_dir: str, x64: bool = True) -> str:
     os.makedirs(bdir, exist_ok=True)
     data = os.path.join(traj_dir, "data")
     potens = sorted(glob.glob(os.path.join(data, "poten_[0-9][0-9][0-9][0-9][0-9].bin")))
-    metas = [p for p in (_meta_path(os.path.join(traj_dir, m)) for m in ("metadata", "metadata_light"))
-             if p is not None]
+    metas = [
+        p
+        for p in (_meta_path(os.path.join(traj_dir, m)) for m in ("metadata", "metadata_light"))
+        if p is not None
+    ]
     for p in potens + metas:
         b = os.path.join(bdir, os.path.basename(p))
         if not os.path.exists(b):
@@ -907,8 +940,9 @@ def preprocess_gyaradax(
         raise ValueError("preprocess_gyaradax needs target_dir (or $NEUGK_TARGET_DIR)")
     dir_out = os.path.join(target_dir, KVIKIO_SUBDIR)
     os.makedirs(dir_out, exist_ok=True)
-    out_path = backend.format_path(os.path.join(dir_out, name), spatial_ifft=True,
-                                   split_into_bands=None, real_potens=True)
+    out_path = backend.format_path(
+        os.path.join(dir_out, name), spatial_ifft=True, split_into_bands=None, real_potens=True
+    )
 
     cfg = OmegaConf.load(os.path.join(traj_dir, "config.yaml"))
     with open(os.path.join(traj_dir, "geometry.pkl"), "rb") as fh:
@@ -921,8 +955,13 @@ def preprocess_gyaradax(
 
     ints = np.asarray(np_geom["ints"])
     ns = len(ints)
-    resolution = (len(np.asarray(np_geom["intvp"])), len(np.asarray(np_geom["intmu"])), ns,
-                  len(np.asarray(np_geom["kxrh"])), len(np.asarray(np_geom["krho"])))
+    resolution = (
+        len(np.asarray(np_geom["intvp"])),
+        len(np.asarray(np_geom["intmu"])),
+        ns,
+        len(np.asarray(np_geom["kxrh"])),
+        len(np.asarray(np_geom["krho"])),
+    )
     # the flux kernel weights ints twice, so the ky factor carries one 1/ints = ns
     if not np.allclose(ints, 1.0 / ns):
         raise NotImplementedError("gyaradax import assumes a uniform s grid (ints == 1/ns)")
@@ -941,15 +980,18 @@ def preprocess_gyaradax(
     times, fluxes, kyspecs, fluxspecs = [], [], [], []
     df_stats, phi_stats, flux_stats = _running_stats(), _running_stats(), _running_stats()
     os.makedirs(os.path.join(out_path, "data"), exist_ok=True)
-    for idx, step_path in _progress(enumerate(steps), show_tqdm, total=len(steps), desc=name,
-                                    leave=False):
+    for idx, step_path in _progress(
+        enumerate(steps), show_tqdm, total=len(steps), desc=name, leave=False
+    ):
         d = np.load(step_path)
         df_real = solver_df_to_realspace(d["df"])
         phi, eflux_total = solver(df_real)
         reported = float(d["fluxes"][1])
         if verify and not np.isclose(eflux_total, reported, rtol=0.0, atol=flux_atol):
-            warnings.warn(f"{name} step {int(d['step'])}: flux {eflux_total:.4f} != reported "
-                          f"{reported:.4f}")
+            warnings.warn(
+                f"{name} step {int(d['step'])}: flux {eflux_total:.4f} != reported "
+                f"{reported:.4f}"
+            )
         fluxspecs.append(solver.flux_spectrum(df_real).astype(np.float32))
         kyspecs.append(np.asarray(d["ky_spec"], dtype=np.float32))
         times.append(float(d["time"]))
@@ -993,17 +1035,28 @@ def _gkw_datasets(args) -> list[str]:
 def _run_preprocess(args) -> None:
     datasets = _gkw_datasets(args)
     kwargs = dict(
-        spatial_ifft=True, separate_zf=args.separate_zf, split_into_bands=args.split_into_bands,
-        root=args.root, raw_subdir=args.raw_subdir, target_dir=args.target_dir,
-        metadata_only=args.metadata_only, geometry_only=args.geometry_only,
-        phi_source=args.phi_source, max_timesteps=args.max_timesteps, x64=not args.fp32,
+        spatial_ifft=True,
+        separate_zf=args.separate_zf,
+        split_into_bands=args.split_into_bands,
+        root=args.root,
+        raw_subdir=args.raw_subdir,
+        target_dir=args.target_dir,
+        metadata_only=args.metadata_only,
+        geometry_only=args.geometry_only,
+        phi_source=args.phi_source,
+        max_timesteps=args.max_timesteps,
+        x64=not args.fp32,
         show_tqdm=args.tqdm,
     )
 
     def one(i_name):
         i, name = i_name
         try:
-            return name, *preprocess(name, position=1 + i % max(1, args.num_workers), **kwargs), None
+            return (
+                name,
+                *preprocess(name, position=1 + i % max(1, args.num_workers), **kwargs),
+                None,
+            )
         except (OSError, ValueError, AssertionError, IndexError, KeyError) as e:
             return name, None, False, e
 
@@ -1020,8 +1073,10 @@ def _run_preprocess(args) -> None:
                 meta = load_meta(os.path.join(out_path, "metadata"))
                 msg = f"{out_path}: {len(meta['timesteps'])} points"
                 if "df_mean" in meta:
-                    msg += (f", mean {meta['df_mean'][0].mean():.2e}, "
-                            f"std {meta['df_std'][0].mean():.2e}")
+                    msg += (
+                        f", mean {meta['df_mean'][0].mean():.2e}, "
+                        f"std {meta['df_std'][0].mean():.2e}"
+                    )
                 print(msg, flush=True)
     if skipped:
         print(f"Skipped {len(skipped)} trajectories (already processed).")
@@ -1029,28 +1084,49 @@ def _run_preprocess(args) -> None:
 
 def main(argv: Iterable[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--mode", choices=("preprocess", "rewrite-phi", "gyaradax", "quantize"),
-                    default="quantize")
-    ap.add_argument("--path", default=TARGET_DIR and os.path.join(TARGET_DIR, KVIKIO_SUBDIR),
-                    help="preprocessed dataset root (rewrite-phi, quantize)")
-    ap.add_argument("--trajs", nargs="+", default=None,
-                    help="brace pattern (single string) OR explicit list of trajectories; "
-                         "raw run names for preprocess, trajectory dirs otherwise")
+    ap.add_argument(
+        "--mode", choices=("preprocess", "rewrite-phi", "gyaradax", "quantize"), default="quantize"
+    )
+    ap.add_argument(
+        "--path",
+        default=TARGET_DIR and os.path.join(TARGET_DIR, KVIKIO_SUBDIR),
+        help="preprocessed dataset root (rewrite-phi, quantize)",
+    )
+    ap.add_argument(
+        "--trajs",
+        nargs="+",
+        default=None,
+        help="brace pattern (single string) OR explicit list of trajectories; "
+        "raw run names for preprocess, trajectory dirs otherwise",
+    )
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--tqdm", action="store_true")
     ap.add_argument("--fp32", action="store_true", help="field solve in float32 (default float64)")
     g = ap.add_argument_group("preprocess")
     g.add_argument("--root", default=RAW_ROOT)
     g.add_argument("--raw-subdir", default="raw")
-    g.add_argument("--target-dir", default=TARGET_DIR,
-                   help="output root; data goes to <target-dir>/preprocessed_kvikio")
-    g.add_argument("--num-iterations", type=int, default=300,
-                   help="iteration_0 .. iteration_N-1 when neither --trajs nor --trajs-file is set")
+    g.add_argument(
+        "--target-dir",
+        default=TARGET_DIR,
+        help="output root; data goes to <target-dir>/preprocessed_kvikio",
+    )
+    g.add_argument(
+        "--num-iterations",
+        type=int,
+        default=300,
+        help="iteration_0 .. iteration_N-1 when neither --trajs nor --trajs-file is set",
+    )
     g.add_argument("--trajs-file", default=None, help="file with one raw run name per line")
-    g.add_argument("--metadata-only", action="store_true",
-                   help="only rewrite metadata (with statistics), no field data")
-    g.add_argument("--geometry-only", action="store_true",
-                   help="only rewrite metadata without statistics (existing ones are kept)")
+    g.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="only rewrite metadata (with statistics), no field data",
+    )
+    g.add_argument(
+        "--geometry-only",
+        action="store_true",
+        help="only rewrite metadata without statistics (existing ones are kept)",
+    )
     g.add_argument("--phi-source", choices=("field_solve", "gkw"), default="field_solve")
     g.add_argument("--max-timesteps", type=int, default=None)
     g.add_argument("--separate-zf", action="store_true")
@@ -1060,20 +1136,35 @@ def main(argv: Iterable[str] | None = None) -> None:
     g = ap.add_argument_group("gyaradax")
     g.add_argument("--gyaradax-dirs", nargs="+", default=None)
     g = ap.add_argument_group("quantize")
-    g.add_argument("--bits", choices=tuple(_DTYPE_SUFFIX), default="bf16",
-                   help="quantization target (fp16 / bf16 / i8 / i4)")
+    g.add_argument(
+        "--bits",
+        choices=tuple(_DTYPE_SUFFIX),
+        default="bf16",
+        help="quantization target (fp16 / bf16 / i8 / i4)",
+    )
     g.add_argument("--force", action="store_true", help="overwrite existing quantized shards")
     args = ap.parse_args(argv)
-    required = {"quantize": ("path",), "rewrite-phi": ("path",), "preprocess": ("root",),
-                "gyaradax": ("target_dir",)}[args.mode]
+    required = {
+        "quantize": ("path",),
+        "rewrite-phi": ("path",),
+        "preprocess": ("root",),
+        "gyaradax": ("target_dir",),
+    }[args.mode]
     for name in required:
         if getattr(args, name) is None:
-            ap.error(f"--mode={args.mode} needs --{name.replace('_', '-')} "
-                     "(or the NEUGK_RAW_ROOT / NEUGK_TARGET_DIR environment variables)")
+            ap.error(
+                f"--mode={args.mode} needs --{name.replace('_', '-')} "
+                "(or the NEUGK_RAW_ROOT / NEUGK_TARGET_DIR environment variables)"
+            )
 
     if args.mode == "quantize":
-        run_quantize(path=args.path, trajs=args.trajs or ["iteration_{0-299}_ifft_realpotens"],
-                     bits=args.bits, num_workers=args.num_workers, force=args.force)
+        run_quantize(
+            path=args.path,
+            trajs=args.trajs or ["iteration_{0-299}_ifft_realpotens"],
+            bits=args.bits,
+            num_workers=args.num_workers,
+            force=args.force,
+        )
     elif args.mode == "preprocess":
         _run_preprocess(args)
     elif args.mode == "rewrite-phi":
@@ -1081,8 +1172,9 @@ def main(argv: Iterable[str] | None = None) -> None:
             ap.error("--mode=rewrite-phi requires --poten-backup")
         traj_dirs = resolve_traj_dirs(args.path, args.trajs)
         with ThreadPoolExecutor(max(1, args.num_workers)) as ex:
-            futures = [ex.submit(rewrite_poten, d, args.poten_backup, not args.fp32)
-                       for d in traj_dirs]
+            futures = [
+                ex.submit(rewrite_poten, d, args.poten_backup, not args.fp32) for d in traj_dirs
+            ]
             for fut in as_completed(futures):
                 print(fut.result(), flush=True)
     elif args.mode == "gyaradax":
@@ -1091,13 +1183,20 @@ def main(argv: Iterable[str] | None = None) -> None:
         from neugk_jax.dataset.backend import load_meta
 
         for traj_dir in args.gyaradax_dirs:
-            out = preprocess_gyaradax(traj_dir, target_dir=args.target_dir,
-                                      metadata_only=args.metadata_only, show_tqdm=args.tqdm,
-                                      x64=not args.fp32)
+            out = preprocess_gyaradax(
+                traj_dir,
+                target_dir=args.target_dir,
+                metadata_only=args.metadata_only,
+                show_tqdm=args.tqdm,
+                x64=not args.fp32,
+            )
             meta = load_meta(os.path.join(out, "metadata"))
-            print(f"{out}: {len(meta['timesteps'])} steps, "
-                  f"df mean/std {meta['df_mean'].mean():.3e}/{meta['df_std'].mean():.3e}, "
-                  f"flux mean {float(np.mean(meta['flux'])):.3f}", flush=True)
+            print(
+                f"{out}: {len(meta['timesteps'])} steps, "
+                f"df mean/std {meta['df_mean'].mean():.3e}/{meta['df_std'].mean():.3e}, "
+                f"flux mean {float(np.mean(meta['flux'])):.3f}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

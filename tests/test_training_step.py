@@ -16,8 +16,16 @@ from neugk_jax.training.runner import build_optimizer, train_update
 
 
 def test_buffers_frozen_under_weight_decay():
-    layer = SwinLayer(2, 8, depth=2, num_heads=2, grid_size=(4, 8), window_size=(2, 4),
-                      key=jr.PRNGKey(0), use_rpb=True)
+    layer = SwinLayer(
+        2,
+        8,
+        depth=2,
+        num_heads=2,
+        grid_size=(4, 8),
+        window_size=(2, 4),
+        key=jr.PRNGKey(0),
+        use_rpb=True,
+    )
     model = (layer, APE(8, (4, 8)))
     mask = trainable_mask(model)
     blk = layer.blocks[1]
@@ -36,6 +44,7 @@ def test_buffers_frozen_under_weight_decay():
     after = [nblk.attn_mask, nblk.attn.rpb.rpb, nblk.attn.rpb.rpb_idx, new[1].pos_embed]
     for a, b in zip(frozen, after):
         assert jnp.array_equal(a, b)
-    moved = jax.tree_util.tree_map(lambda a, b: not jnp.array_equal(a, b),
-                                   eqx.filter(model, mask), eqx.filter(new, mask))
+    moved = jax.tree_util.tree_map(
+        lambda a, b: not jnp.array_equal(a, b), eqx.filter(model, mask), eqx.filter(new, mask)
+    )
     assert all(jax.tree_util.tree_leaves(moved))

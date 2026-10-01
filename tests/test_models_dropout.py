@@ -73,17 +73,31 @@ def test_mixing_vspace_flux_dropout():
     _check(lambda k, inf: vs(df, key=k, inference=inf))
 
     head = FluxDecoder([16], [8], 2, 1, key=jr.PRNGKey(0), attn_drop=0.5, drop=0.5)
-    _check(lambda k, inf: head([head.mix(0, left, right, key=k, inference=inf)],
-                               key=k, inference=inf))
+    _check(
+        lambda k, inf: head([head.mix(0, left, right, key=k, inference=inf)], key=k, inference=inf)
+    )
 
 
 def _gyroswin(**kw):
     return GyroSwinMultitask(
-        dim=16, df_base_resolution=RES, df_patch_size=[2, 1, 2, 5, 2],
-        df_window_size=[2, 1, 2, 2, 2], depth=1, num_heads=2, in_channels=4, out_channels=4,
-        num_layers=1, merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0,
-        outputs=("df", "phi", "fluxavg"), n_cond=2, flux_num_heads=2, drop_path=0.0,
-        key=jr.PRNGKey(0), **kw)
+        dim=16,
+        df_base_resolution=RES,
+        df_patch_size=[2, 1, 2, 5, 2],
+        df_window_size=[2, 1, 2, 2, 2],
+        depth=1,
+        num_heads=2,
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
+        outputs=("df", "phi", "fluxavg"),
+        n_cond=2,
+        flux_num_heads=2,
+        drop_path=0.0,
+        key=jr.PRNGKey(0),
+        **kw,
+    )
 
 
 def test_gyroswin_dropout_no_new_params():

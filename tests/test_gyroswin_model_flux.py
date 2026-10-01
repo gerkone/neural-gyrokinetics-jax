@@ -16,19 +16,38 @@ from neugk_jax.translate import iter_leaves
 RES = [8, 2, 4, 10, 8]
 CFG = {
     "model": {
-        "name": "gyroswin_multi", "latent_dim": 16, "num_layers": 1, "decouple_mu": True,
-        "conditioning": ["timestep", "itg"], "drop_path": 0.0,
+        "name": "gyroswin_multi",
+        "latent_dim": 16,
+        "num_layers": 1,
+        "decouple_mu": True,
+        "conditioning": ["timestep", "itg"],
+        "drop_path": 0.0,
         "loss_weights": {"df": 1.0, "phi": 0.1, "flux": 0.0, "fluxavg": 0.0},
         "loss_scheduler": {"fluxavg": {"type": "linear", "start": 1, "end": 1}},
-        "swin": {"patch_size": [2, 1, 2, 5, 2], "window_size": [2, 1, 2, 2, 2],
-                 "phi_patch_size": [1, 5, 2], "phi_window_size": [2, 2, 2],
-                 "num_heads": 2, "depth": 1, "merging_hidden_ratio": 2.0,
-                 "unmerging_hidden_ratio": 2.0, "c_multiplier": 2, "flux_num_heads": 2,
-                 "flux_depth": 1, "flux_reduce": "max", "modulation": "dit",
-                 "norm_fn": "RMSNorm", "act_fn": "GELU", "swin_bottleneck": True,
-                 "latent_cross_attn": True, "use_abs_pe": False, "use_rope": False,
-                 "cosine_attn": False, "init_weights": "kaiming_uniform",
-                 "flux_conditioning": True},
+        "swin": {
+            "patch_size": [2, 1, 2, 5, 2],
+            "window_size": [2, 1, 2, 2, 2],
+            "phi_patch_size": [1, 5, 2],
+            "phi_window_size": [2, 2, 2],
+            "num_heads": 2,
+            "depth": 1,
+            "merging_hidden_ratio": 2.0,
+            "unmerging_hidden_ratio": 2.0,
+            "c_multiplier": 2,
+            "flux_num_heads": 2,
+            "flux_depth": 1,
+            "flux_reduce": "max",
+            "modulation": "dit",
+            "norm_fn": "RMSNorm",
+            "act_fn": "GELU",
+            "swin_bottleneck": True,
+            "latent_cross_attn": True,
+            "use_abs_pe": False,
+            "use_rope": False,
+            "cosine_attn": False,
+            "init_weights": "kaiming_uniform",
+            "flux_conditioning": True,
+        },
     },
     "dataset": {"separate_zf": True, "real_potens": True, "resolution": RES},
     "training": {"predict_delta": False, "pushforward": {"unrolls": [0, 0]}},
@@ -75,17 +94,20 @@ def test_builder_flux_conditioning(tmp_path):
     assert not plain.flux_head.use_cond
 
 
-@pytest.mark.parametrize("edit,exc", [
-    (lambda c: c["model"]["swin"].update(use_rope=True), NotImplementedError),
-    (lambda c: c["model"]["swin"].update(swin_bottleneck=False), NotImplementedError),
-    (lambda c: c["model"]["swin"].update(act_fn="SiLU"), NotImplementedError),
-    (lambda c: c["model"]["swin"].update(modulation="adaln"), NotImplementedError),
-    (lambda c: c["model"]["swin"].update(bogus_key=1), ValueError),
-    (lambda c: c["model"].update(bundle_seq_length=2), NotImplementedError),
-    (lambda c: c["dataset"].update(real_potens=False), NotImplementedError),
-    (lambda c: c["training"].update(predict_delta=True), NotImplementedError),
-    (lambda c: c["training"]["pushforward"].update(unrolls=[0, 2]), NotImplementedError),
-])
+@pytest.mark.parametrize(
+    "edit,exc",
+    [
+        (lambda c: c["model"]["swin"].update(use_rope=True), NotImplementedError),
+        (lambda c: c["model"]["swin"].update(swin_bottleneck=False), NotImplementedError),
+        (lambda c: c["model"]["swin"].update(act_fn="SiLU"), NotImplementedError),
+        (lambda c: c["model"]["swin"].update(modulation="adaln"), NotImplementedError),
+        (lambda c: c["model"]["swin"].update(bogus_key=1), ValueError),
+        (lambda c: c["model"].update(bundle_seq_length=2), NotImplementedError),
+        (lambda c: c["dataset"].update(real_potens=False), NotImplementedError),
+        (lambda c: c["training"].update(predict_delta=True), NotImplementedError),
+        (lambda c: c["training"]["pushforward"].update(unrolls=[0, 2]), NotImplementedError),
+    ],
+)
 def test_builder_rejects_unsupported(tmp_path, edit, exc):
     with pytest.raises(exc):
         _build(tmp_path, edit)

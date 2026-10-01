@@ -96,7 +96,8 @@ def plot_nd(
 
     comb = [list(c) for c in combinations(range(ndim), 2)]
     fig, axes = plt.subplots(
-        ndim, ndim,
+        ndim,
+        ndim,
         figsize=(ndim * (3.5 if y is not None else 2), ndim * 1.8),
         squeeze=False,
     )
@@ -143,7 +144,8 @@ def plot_nd(
                 ax.set_ylabel(rf"${labels[i]}$", fontsize=22, labelpad=2)
             if i == j - 1:
                 ax.set_xlabel(rf"${labels[j]}$", fontsize=22, labelpad=2)
-            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_xticks([])
+            ax.set_yticks([])
             _force_aspect(ax, aspect=aspect * (2.1 if y is not None else 1.0))
 
     plt.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99, wspace=0, hspace=0)
@@ -167,7 +169,7 @@ def generate_val_plots(
     plots: dict[str, object] = {}
     time_str = f"T={float(ts[0]):.2f}, " if ts is not None and np.asarray(ts).size > 0 else ""
     field_configs = {
-        "df":  {"name": f"df ({time_str}{phase})",  "recombine": True,  "cmap": "RdBu_r"},
+        "df": {"name": f"df ({time_str}{phase})", "recombine": True, "cmap": "RdBu_r"},
         "phi": {"name": f"phi ({time_str}{phase})", "recombine": False, "cmap": "plasma"},
     }
     for key, cfg in field_configs.items():
@@ -199,12 +201,18 @@ def avg_flux_confidence(
     fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
     x_pos = np.arange(len(traj_ids))
     ax.errorbar(
-        x_pos, pred_means, yerr=pred_stds, fmt="o", capsize=6,
-        label="Predicted (Mean ± Std)", color="#1f77b4",
-        mfc="white", mew=2, alpha=0.8,
+        x_pos,
+        pred_means,
+        yerr=pred_stds,
+        fmt="o",
+        capsize=6,
+        label="Predicted (Mean ± Std)",
+        color="#1f77b4",
+        mfc="white",
+        mew=2,
+        alpha=0.8,
     )
-    ax.scatter(x_pos, tgt_vals, marker="x", s=80, color="#d62728",
-               label="Ground Truth", zorder=3)
+    ax.scatter(x_pos, tgt_vals, marker="x", s=80, color="#d62728", label="Ground Truth", zorder=3)
     ax.set_xticks(x_pos)
     ax.set_xticklabels(traj_ids, rotation=45, ha="right")
     ax.set_xlabel("Trajectory ID", fontsize=12)

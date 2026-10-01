@@ -88,7 +88,12 @@ def _flash_attention(q, k, v, scale, bias):
         b = jnp.asarray(b, dtype=q.dtype)
         bias = b[None]
     out = jax.nn.dot_product_attention(
-        q4, k4, v4, bias=bias, scale=scale, implementation="cudnn",
+        q4,
+        k4,
+        v4,
+        bias=bias,
+        scale=scale,
+        implementation="cudnn",
     )
     return out[0]  # drop the added batch dim, back to (n, H, D)
 
@@ -224,7 +229,7 @@ class MultiHeadCrossAttention(eqx.Module):
         assert q_dim % num_heads == 0, f"q_dim={q_dim} not divisible by num_heads={num_heads}"
         self.num_heads = num_heads
         self.head_dim = q_dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         kq, kkv, kp = jr.split(key, 3)
         out_dim = out_dim or q_dim
         self.q = Linear(q_dim, q_dim, key=kq, use_bias=qkv_bias)
@@ -234,8 +239,9 @@ class MultiHeadCrossAttention(eqx.Module):
         self.attn_drop = attn_drop
         self.proj_drop = proj_drop
 
-    def __call__(self, left: jnp.ndarray, right: jnp.ndarray, *, key=None,
-                 inference: bool = True) -> jnp.ndarray:
+    def __call__(
+        self, left: jnp.ndarray, right: jnp.ndarray, *, key=None, inference: bool = True
+    ) -> jnp.ndarray:
         n_q, _ = left.shape
         n_kv, _ = right.shape
         q = self.q(left).reshape(n_q, self.num_heads, self.head_dim)

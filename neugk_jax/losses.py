@@ -19,7 +19,7 @@ def relative_norm_mse(pred: jnp.ndarray, target: jnp.ndarray, eps: float = 1e-4)
         pred = pred.reshape(pred.shape[0], -1)
         target = target.reshape(target.shape[0], -1)
     diff_sq = jnp.sum((pred - target) ** 2, axis=-1)
-    tgt_sq = jnp.sum(target ** 2, axis=-1)
+    tgt_sq = jnp.sum(target**2, axis=-1)
     return jnp.mean(diff_sq / (tgt_sq + eps))
 
 

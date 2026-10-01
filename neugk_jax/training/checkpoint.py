@@ -26,7 +26,9 @@ def _to_numpy_tree(tree):
 
 
 def _to_jax_tree(tree):
-    return jax.tree_util.tree_map(lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x, tree)
+    return jax.tree_util.tree_map(
+        lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x, tree
+    )
 
 
 @dataclass
@@ -42,7 +44,9 @@ class CheckpointState:
 
 def host_bundle(state: CheckpointState) -> dict:
     """Host (numpy) copy of a snapshot, ready to pickle."""
-    model_leaves, opt_state = jax.device_get((eqx.filter(state.model, eqx.is_array), state.opt_state))
+    model_leaves, opt_state = jax.device_get(
+        (eqx.filter(state.model, eqx.is_array), state.opt_state)
+    )
     return {
         "model_leaves": _to_numpy_tree(model_leaves),
         "opt_state": _to_numpy_tree(opt_state),
@@ -71,10 +75,14 @@ def _graft(saved_leaves, template):
     leaves = jax.tree_util.tree_leaves(saved_leaves)
     ref = jax.tree_util.tree_leaves(params)
     if len(leaves) != len(ref) or any(np.shape(a) != np.shape(b) for a, b in zip(leaves, ref)):
-        raise ValueError(f"checkpoint has {len(leaves)} array leaves that do not match the "
-                         f"model's {len(ref)}")
+        raise ValueError(
+            f"checkpoint has {len(leaves)} array leaves that do not match the "
+            f"model's {len(ref)}"
+        )
     leaves = [jnp.asarray(a, dtype=b.dtype) for a, b in zip(leaves, ref)]
-    return eqx.combine(jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(params), leaves), static)
+    return eqx.combine(
+        jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(params), leaves), static
+    )
 
 
 def load_checkpoint(path: str | os.PathLike, model_template) -> CheckpointState:
@@ -119,7 +127,9 @@ class AsyncCheckpointer:
 
 
 def save_model_only(path: str | os.PathLike, model) -> None:
-    write_bundle(path, {"model_leaves": _to_numpy_tree(jax.device_get(eqx.filter(model, eqx.is_array)))})
+    write_bundle(
+        path, {"model_leaves": _to_numpy_tree(jax.device_get(eqx.filter(model, eqx.is_array)))}
+    )
 
 
 def load_model_only(path: str | os.PathLike, model_template):

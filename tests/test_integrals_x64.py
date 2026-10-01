@@ -7,8 +7,9 @@ import importlib.util
 import jax
 import pytest
 
-pytestmark = pytest.mark.skipif(importlib.util.find_spec("gyaradax") is None,
-                                reason="gyaradax not installed")
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("gyaradax") is None, reason="gyaradax not installed"
+)
 
 
 def test_gyaradax_import_keeps_x64_off():

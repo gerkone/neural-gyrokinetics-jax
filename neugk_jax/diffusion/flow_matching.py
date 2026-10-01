@@ -48,12 +48,13 @@ def minibatch_ot(x0: jnp.ndarray, x1: jnp.ndarray) -> jnp.ndarray:
     x0_flat = x0.reshape(bs, -1)
     x1_flat = x1.reshape(bs, -1)
     # ||a-b||^2 = |a|^2 + |b|^2 - 2a.b: one gemm, no (B, B, D) intermediate
-    sq0 = jnp.sum(x0_flat ** 2, axis=-1)
-    sq1 = jnp.sum(x1_flat ** 2, axis=-1)
+    sq0 = jnp.sum(x0_flat**2, axis=-1)
+    sq1 = jnp.sum(x1_flat**2, axis=-1)
     cost = jnp.sqrt(jnp.maximum(sq0[:, None] + sq1[None, :] - 2.0 * (x0_flat @ x1_flat.T), 0.0))
 
     def _assign(cost_np):
         import scipy.optimize
+
         _, col = scipy.optimize.linear_sum_assignment(np.asarray(cost_np))
         return np.argsort(col).astype(np.int32)
 
@@ -161,9 +162,11 @@ def euler_sample(
     ts = t_grid[:-1]
 
     if cond is not None:
+
         def velocity(x, ti):
             return jax.vmap(model_fn)(x, jnp.full((bs,), ti, dtype=dtype), cond)
     else:
+
         def velocity(x, ti):
             return jax.vmap(model_fn)(x, jnp.full((bs,), ti, dtype=dtype))
 
@@ -175,4 +178,3 @@ def euler_sample(
 
     x, _ = jax.lax.scan(step, x0, (ts, dts))
     return x / latent_scale
-

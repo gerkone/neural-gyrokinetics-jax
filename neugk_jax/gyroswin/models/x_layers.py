@@ -60,18 +60,31 @@ class MixingBlock(eqx.Module):
         k1, k2 = jr.split(key, 2)
         self.norm1 = LayerNorm(left_dim, elementwise_affine=True)
         self.attn = MultiHeadCrossAttention(
-            q_dim=left_dim, kv_dim=right_dim, num_heads=num_heads,
-            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, key=k1,
+            q_dim=left_dim,
+            kv_dim=right_dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            key=k1,
         )
         self.drop_path = _DropPath(drop_path)
         self.norm2 = LayerNorm(left_dim, elementwise_affine=True)
         self.mlp = MLP(
             [left_dim, int(left_dim * mlp_ratio), left_dim],
-            act_fn=act_fn, drop=drop, key=k2,
+            act_fn=act_fn,
+            drop=drop,
+            key=k2,
         )
 
-    def __call__(self, left: jnp.ndarray, right: Optional[jnp.ndarray] = None,
-                 *, key=None, inference: bool = True) -> jnp.ndarray:
+    def __call__(
+        self,
+        left: jnp.ndarray,
+        right: Optional[jnp.ndarray] = None,
+        *,
+        key=None,
+        inference: bool = True,
+    ) -> jnp.ndarray:
         right = right if right is not None else left
         l_shape = left.shape
         l_tok = left.reshape(-1, l_shape[-1])
@@ -119,7 +132,7 @@ class VSpaceReduce(eqx.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.out_dim = out_dim
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.decouple_mu = decouple_mu
         self.attn_drop = attn_drop
         kkv, kp, ktoken = jr.split(key, 3)
@@ -139,8 +152,9 @@ class VSpaceReduce(eqx.Module):
         kv = self.kv(df_t).reshape(n_groups, n_tok, 2, self.num_heads, self.head_dim)
         q = self.integral_token.reshape(1, self.num_heads, self.head_dim)
         q = jnp.broadcast_to(q, (n_groups, self.num_heads, self.head_dim))
-        out = _pool_attention(q, kv[:, :, 0], kv[:, :, 1], self.scale, self.attn_drop,
-                              key, inference)
+        out = _pool_attention(
+            q, kv[:, :, 0], kv[:, :, 1], self.scale, self.attn_drop, key, inference
+        )
         out = self.proj(out.reshape(n_groups, self.num_heads * self.head_dim))
         return out.reshape(ns, nx, ny, self.out_dim)
 
@@ -156,25 +170,45 @@ class LatentMixingTransformer(eqx.Module):
     cond_embed: Optional[ContinuousConditionEmbed]
     conditioning: Optional[list]
 
-    def __init__(self, left_dim: int, right_dim: int, num_heads: int, depth: int, *, key,
-                 attn_drop: float = 0.0, drop: float = 0.0, n_cond: int = 0,
-                 cond_embed_dim: int = 128):
+    def __init__(
+        self,
+        left_dim: int,
+        right_dim: int,
+        num_heads: int,
+        depth: int,
+        *,
+        key,
+        attn_drop: float = 0.0,
+        drop: float = 0.0,
+        n_cond: int = 0,
+        cond_embed_dim: int = 128,
+    ):
         kb, kc, kf = jr.split(key, 3)
         self.blocks = [
-            MixingBlock(left_dim, right_dim, num_heads, key=k, mlp_ratio=2.0, qkv_bias=True,
-                        attn_drop=attn_drop, drop=drop)
+            MixingBlock(
+                left_dim,
+                right_dim,
+                num_heads,
+                key=k,
+                mlp_ratio=2.0,
+                qkv_bias=True,
+                attn_drop=attn_drop,
+                drop=drop,
+            )
             for k in jr.split(kb, depth)
         ]
         if n_cond > 0:
             self.cond_embed = ContinuousConditionEmbed(cond_embed_dim, n_cond, key=kc)
-            self.conditioning = [Film(self.cond_embed.cond_dim, left_dim, key=k)
-                                 for k in jr.split(kf, depth)]
+            self.conditioning = [
+                Film(self.cond_embed.cond_dim, left_dim, key=k) for k in jr.split(kf, depth)
+            ]
         else:
             self.cond_embed = None
             self.conditioning = None
 
-    def __call__(self, left: jnp.ndarray, right: jnp.ndarray, cond=None, *, key=None,
-                 inference: bool = True) -> jnp.ndarray:
+    def __call__(
+        self, left: jnp.ndarray, right: jnp.ndarray, cond=None, *, key=None, inference: bool = True
+    ) -> jnp.ndarray:
         c = self.cond_embed(cond) if self.cond_embed is not None else None
         x = left
         for i, (blk, k) in enumerate(zip(self.blocks, split_key(key, len(self.blocks)))):
@@ -201,16 +235,36 @@ class FluxDecoder(eqx.Module):
     detach_latents: bool = eqx.field(static=True)
     use_cond: bool = eqx.field(static=True)
 
-    def __init__(self, left_dims, right_dims, num_heads: int, depth: int, *, key,
-                 reduction: str = "max", attn_drop: float = 0.1, drop: float = 0.0,
-                 detach_latents: bool = False, n_cond: int = 0, cond_embed_dim: int = 128):
+    def __init__(
+        self,
+        left_dims,
+        right_dims,
+        num_heads: int,
+        depth: int,
+        *,
+        key,
+        reduction: str = "max",
+        attn_drop: float = 0.1,
+        drop: float = 0.0,
+        detach_latents: bool = False,
+        n_cond: int = 0,
+        cond_embed_dim: int = 128,
+    ):
         if reduction not in ("max", "mean", "integral"):
             raise ValueError(f"unknown flux reduction {reduction!r}")
         ks = jr.split(key, 2 * len(left_dims) + 1)
         self.blocks = [
-            LatentMixingTransformer(left_dims[i], right_dims[i], num_heads, depth, key=ks[i],
-                                    attn_drop=attn_drop, drop=drop, n_cond=n_cond,
-                                    cond_embed_dim=cond_embed_dim)
+            LatentMixingTransformer(
+                left_dims[i],
+                right_dims[i],
+                num_heads,
+                depth,
+                key=ks[i],
+                attn_drop=attn_drop,
+                drop=drop,
+                n_cond=n_cond,
+                cond_embed_dim=cond_embed_dim,
+            )
             for i in range(len(left_dims))
         ]
         if reduction == "integral":
@@ -221,19 +275,27 @@ class FluxDecoder(eqx.Module):
         else:
             self.reductions = None
         flux_latent = int(sum(left_dims))
-        self.flux_mlp = MLP([flux_latent, flux_latent // 2, 1], act_fn=gelu, drop=drop,
-                            key=ks[-1])
+        self.flux_mlp = MLP([flux_latent, flux_latent // 2, 1], act_fn=gelu, drop=drop, key=ks[-1])
         self.reduction = reduction
         self.detach_latents = detach_latents
         self.use_cond = n_cond > 0
 
-    def mix(self, i: int, left: jnp.ndarray, right: jnp.ndarray, cond=None, *, key=None,
-            inference: bool = True) -> jnp.ndarray:
+    def mix(
+        self,
+        i: int,
+        left: jnp.ndarray,
+        right: jnp.ndarray,
+        cond=None,
+        *,
+        key=None,
+        inference: bool = True,
+    ) -> jnp.ndarray:
         if self.detach_latents:
             left, right = jax.lax.stop_gradient(left), jax.lax.stop_gradient(right)
         k_mix, k_red = split_key(key, 2)
-        x = self.blocks[i](left, right, cond if self.use_cond else None, key=k_mix,
-                           inference=inference)
+        x = self.blocks[i](
+            left, right, cond if self.use_cond else None, key=k_mix, inference=inference
+        )
         if self.reduction == "integral":
             return self.reductions[i](x, key=k_red, inference=inference)
         x = x.reshape(-1, x.shape[-1])
@@ -256,14 +318,22 @@ class RSpaceReduce(eqx.Module):
     scale: float = eqx.field(static=True)
     attn_drop: float = eqx.field(static=True)
 
-    def __init__(self, dim: int, out_dim: int, num_heads: int, *, key, gain: float = 1e-2,
-                 attn_drop: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        out_dim: int,
+        num_heads: int,
+        *,
+        key,
+        gain: float = 1e-2,
+        attn_drop: float = 0.0,
+    ):
         assert dim % num_heads == 0
         self.attn_drop = attn_drop
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.out_dim = out_dim
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         kkv, kp, kt = jr.split(key, 3)
         self.kv = Linear(dim, 2 * dim, key=kkv, use_bias=False)
         self.proj = Linear(dim, out_dim, key=kp, use_bias=True)
@@ -274,7 +344,8 @@ class RSpaceReduce(eqx.Module):
         x_t = x.reshape(1, -1, x.shape[-1])
         kv = self.kv(x_t).reshape(1, x_t.shape[1], 2, self.num_heads, self.head_dim)
         q = self.integral_token.reshape(1, self.num_heads, self.head_dim)
-        out = _pool_attention(q, kv[:, :, 0], kv[:, :, 1], self.scale, self.attn_drop,
-                              key, inference)
+        out = _pool_attention(
+            q, kv[:, :, 0], kv[:, :, 1], self.scale, self.attn_drop, key, inference
+        )
         out = out.reshape(1, self.num_heads * self.head_dim)
         return self.proj(out).reshape(self.out_dim)

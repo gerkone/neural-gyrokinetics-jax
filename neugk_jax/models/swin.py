@@ -102,7 +102,7 @@ def _build_shift_mask(
         for i, (lo, hi) in enumerate(slices):
             idx = [slice(None)] * len(padded)
             idx[axis] = slice(lo, hi)
-            region[tuple(idx)] += i * (10 ** axis)
+            region[tuple(idx)] += i * (10**axis)
     region = jnp.asarray(region)[..., None]  # (*padded, 1)
     win = window_partition(region, window_size)  # (n_win, W, 1)
     win = win[..., 0]
@@ -178,9 +178,13 @@ class SwinBlock(eqx.Module):
         self.norm2 = make_norm(dim, rms=rms_norm, affine=norm_affine)
         katt, kmlp = jr.split(key, 2)
         self.attn = MultiHeadSelfAttention(
-            dim, num_heads, key=katt,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention,
+            dim,
+            num_heads,
+            key=katt,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            use_rpb=use_rpb,
+            gated_attention=gated_attention,
             window_size=eff_w,
         )
         hidden = max(int(dim * mlp_ratio), dim)
@@ -206,17 +210,19 @@ class SwinBlock(eqx.Module):
         h, pads = pad_to_blocks(x, self.window_size)
         padded_spatial = h.shape[:-1]
         if any(s > 0 for s in self.shift_size):
-            h = jnp.roll(h, shift=[-s for s in self.shift_size],
-                         axis=list(range(len(padded_spatial))))
+            h = jnp.roll(
+                h, shift=[-s for s in self.shift_size], axis=list(range(len(padded_spatial)))
+            )
         windows = window_partition(h, self.window_size)  # (n_win, W, dim) per block
         if self.attn_mask is not None:
-            windows = jax.vmap(lambda w, m: self.attn(w, attn_bias=m[None]))(windows, self.attn_mask)
+            windows = jax.vmap(lambda w, m: self.attn(w, attn_bias=m[None]))(
+                windows, self.attn_mask
+            )
         else:
             windows = jax.vmap(lambda w: self.attn(w))(windows)
         h = window_reverse(windows, self.window_size, padded_spatial)
         if any(s > 0 for s in self.shift_size):
-            h = jnp.roll(h, shift=list(self.shift_size),
-                         axis=list(range(len(padded_spatial))))
+            h = jnp.roll(h, shift=list(self.shift_size), axis=list(range(len(padded_spatial))))
         h = unpad(h, pads, spatial)
         h = self.norm1(h)  # post-norm per SwinV2 convention
 
@@ -281,8 +287,14 @@ class DiTSwinBlock(eqx.Module):
         self.norm2 = make_norm(dim, rms=rms_norm, affine=False)
         katt, kmlp, kmod = jr.split(key, 3)
         self.attn = MultiHeadSelfAttention(
-            dim, num_heads, key=katt, qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention, window_size=eff_w,
+            dim,
+            num_heads,
+            key=katt,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            use_rpb=use_rpb,
+            gated_attention=gated_attention,
+            window_size=eff_w,
         )
         hidden = max(int(dim * mlp_ratio), dim)
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
@@ -291,10 +303,13 @@ class DiTSwinBlock(eqx.Module):
         self.attn_mask = _build_shift_mask(self.grid_size, eff_w, shift_size)
         self.legacy_double_shortcut = legacy_double_shortcut
 
-    def __call__(self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=True) -> jnp.ndarray:
+    def __call__(
+        self, x: jnp.ndarray, cond: jnp.ndarray, *, key=None, inference=True
+    ) -> jnp.ndarray:
         spatial = x.shape[:-1]
         # order: (scale1, shift1, gate1, scale2, shift2, gate2) from DiTModulation
         scale_msa, shift_msa, gate_msa, scale_mlp, shift_mlp, gate_mlp = self.mod(cond)
+
         def _bc(t):
             for _ in range(len(spatial)):
                 t = t[None, ...]
@@ -310,17 +325,19 @@ class DiTSwinBlock(eqx.Module):
         padded_spatial = h.shape[:-1]
 
         if any(s > 0 for s in self.shift_size):
-            h = jnp.roll(h, shift=[-s for s in self.shift_size],
-                         axis=list(range(len(padded_spatial))))
+            h = jnp.roll(
+                h, shift=[-s for s in self.shift_size], axis=list(range(len(padded_spatial)))
+            )
         windows = window_partition(h, self.window_size)
         if self.attn_mask is not None:
-            windows = jax.vmap(lambda w, m: self.attn(w, attn_bias=m[None]))(windows, self.attn_mask)
+            windows = jax.vmap(lambda w, m: self.attn(w, attn_bias=m[None]))(
+                windows, self.attn_mask
+            )
         else:
             windows = jax.vmap(lambda w: self.attn(w))(windows)
         h = window_reverse(windows, self.window_size, padded_spatial)
         if any(s > 0 for s in self.shift_size):
-            h = jnp.roll(h, shift=list(self.shift_size),
-                         axis=list(range(len(padded_spatial))))
+            h = jnp.roll(h, shift=list(self.shift_size), axis=list(range(len(padded_spatial))))
         h = unpad(h, pads, spatial)
 
         key1, key2 = (None, None) if key is None else jr.split(key, 2)
@@ -537,11 +554,21 @@ class FilmSwinLayer(eqx.Module):
         fkeys = jr.split(jr.fold_in(key, 1), depth)
         self.blocks = [
             SwinBlock(
-                dim, num_heads, grid_size, window_size, key=bkeys[i],
-                shift=bool(i % 2), mlp_ratio=mlp_ratio, drop_path=drop_path,
-                act_fn=act_fn, qkv_bias=qkv_bias, qk_norm=qk_norm,
-                use_rpb=use_rpb, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                dim,
+                num_heads,
+                grid_size,
+                window_size,
+                key=bkeys[i],
+                shift=bool(i % 2),
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                use_rpb=use_rpb,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)

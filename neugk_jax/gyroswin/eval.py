@@ -31,15 +31,19 @@ def _rel_norm_mse(p, y, eps: float = 1e-4):
 
 
 @eqx.filter_jit
-def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, denorm, geom, fields,
-                       real_potens: bool):
+def gyroswin_eval_step(
+    model, x, cond, tgt, fids, live, t, acc, denorm, geom, fields, real_potens: bool
+):
     """One rollout step; adds the ``live``-masked metric sums at row ``t`` of ``acc``."""
     count_trace("gyroswin_eval_step")
     preds = jax.vmap(lambda xi, ci: model(xi, ci, inference=True))(x, cond)
     pred_d = {k: denorm(k, preds[k], fids) for k in fields}
     tgt_d = {k: denorm(k, tgt[k].reshape(preds[k].shape), fids) for k in fields}
     if "df" in fields:
-        pred_d["df"], tgt_d["df"] = recombine_zf(pred_d["df"], axis=1), recombine_zf(tgt_d["df"], axis=1)
+        pred_d["df"], tgt_d["df"] = (
+            recombine_zf(pred_d["df"], axis=1),
+            recombine_zf(tgt_d["df"], axis=1),
+        )
     values = {}
     for k in fields:
         if k in ("df", "phi"):
@@ -48,8 +52,9 @@ def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, denorm, geom, fi
         else:
             values[k] = per_sample_mse(pred_d[k], tgt_d[k])
     if geom is not None:
-        phi_i, (_, eflux, _) = integrate(geom, fids, pred_d["df"], pred_d["phi"],
-                                         real_potens=real_potens)
+        phi_i, (_, eflux, _) = integrate(
+            geom, fids, pred_d["df"], pred_d["phi"], real_potens=real_potens
+        )
         flux = tgt_d["flux"].reshape(-1)
         values["phi_int"] = per_sample_mse(phi_i, tgt_d["phi"].reshape(phi_i.shape))
         values["flux_int_rel_err"] = jnp.abs(eflux - flux) / (jnp.abs(flux) + 1e-12)
@@ -69,8 +74,11 @@ class GyroSwinEvaluator(BaseEvaluator):
         self.n_eval = int(self.vcfg.get("n_eval_steps", 1))
         outputs = tuple(outputs or ("df", "phi"))
         self.fields = tuple(k for k in TARGETS if k in outputs)
-        self.eval_integrals = (bool(self.vcfg.get("eval_integrals", False))
-                               and set(outputs) == {"df", "phi", "flux"})
+        self.eval_integrals = bool(self.vcfg.get("eval_integrals", False)) and set(outputs) == {
+            "df",
+            "phi",
+            "flux",
+        }
         self.real_potens = bool(ds.real_potens)
         self.t_slot = ds.conditions.index("timestep") if "timestep" in ds.conditions else None
         names = []
@@ -79,8 +87,10 @@ class GyroSwinEvaluator(BaseEvaluator):
         self.names = tuple(names + (["phi_int", "flux_int_rel_err"] if self.eval_integrals else []))
 
     def load(self, ds, indices, read):
-        return stack_fields(read(ds, indices), ("df", "conditioning", "file_index", "timestep",
-                                                *(f"y_{k}" for k in TARGETS)))
+        return stack_fields(
+            read(ds, indices),
+            ("df", "conditioning", "file_index", "timestep", *(f"y_{k}" for k in TARGETS)),
+        )
 
     def _targets(self, fids, t0, t, steps) -> dict:
         tt = t0 + np.minimum(t, np.maximum(steps - 1, 0))
@@ -91,8 +101,9 @@ class GyroSwinEvaluator(BaseEvaluator):
         ds, n_eval = self.ds, self.n_eval
         model = self.local_model(model)
         geom = self.geometry if self.eval_integrals else None
-        acc = replicate_local(self.dist, {k: jnp.zeros((n_eval,), jnp.float32)
-                                          for k in (*self.names, "_n")})
+        acc = replicate_local(
+            self.dist, {k: jnp.zeros((n_eval,), jnp.float32) for k in (*self.names, "_n")}
+        )
         plots: dict[str, Any] = {}
         for plan, batch, _ in self.loader.iterate(ds, self.plans, self.load, self.place):
             ft = [ds.flat_index_to_file_and_tstep[int(i)] for i in plan.indices]
@@ -109,20 +120,34 @@ class GyroSwinEvaluator(BaseEvaluator):
                     cond = cond.at[:, self.t_slot].set(self.place({"ts": ts})["ts"])
                 live = self.place({"m": (plan.mask * (steps > t)).astype(np.float32)})["m"]
                 x, acc, pred_d, tgt_d = gyroswin_eval_step(
-                    model, x, cond, tgt, batch["file_index"], live, jnp.int32(t), acc,
-                    self.denorm, geom, self.fields, self.real_potens)
+                    model,
+                    x,
+                    cond,
+                    tgt,
+                    batch["file_index"],
+                    live,
+                    jnp.int32(t),
+                    acc,
+                    self.denorm,
+                    geom,
+                    self.fields,
+                    self.real_potens,
+                )
                 if plan.number == 0 and t == 0 and self.is_rank0:
                     plots = self._plots(pred_d, tgt_d, batch)
         host = jax.device_get(acc)
-        sums = self.sum_processes({f"{k}_x{t + 1}": float(host[k][t])
-                                   for k in host for t in range(n_eval)})
+        sums = self.sum_processes(
+            {f"{k}_x{t + 1}": float(host[k][t]) for k in host for t in range(n_eval)}
+        )
         metrics = {}
         for t in range(1, n_eval + 1):
             cnt = sums[f"_n_x{t}"]
             if cnt > 0:
                 metrics.update({f"{k}_x{t}": sums[f"{k}_x{t}"] / cnt for k in self.names})
         for k in self.names:
-            per_step = [metrics[f"{k}_x{t}"] for t in range(1, n_eval + 1) if f"{k}_x{t}" in metrics]
+            per_step = [
+                metrics[f"{k}_x{t}"] for t in range(1, n_eval + 1) if f"{k}_x{t}" in metrics
+            ]
             if per_step:
                 metrics[k] = float(np.mean(per_step))
         return metrics, plots
@@ -130,6 +155,7 @@ class GyroSwinEvaluator(BaseEvaluator):
     @staticmethod
     def _plots(pred_d, tgt_d, batch) -> dict[str, Any]:
         from neugk_jax.evaluate.plots import generate_val_plots
+
         roll = {k: pred_d[k][0] for k in ("df", "phi") if k in pred_d}
         gt = {k: tgt_d[k][0] for k in ("df", "phi") if k in tgt_d}
         ts = np.asarray(jax.device_get(batch["timestep"][:1])).reshape(-1)

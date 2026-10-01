@@ -193,9 +193,7 @@ class RMSNorm(eqx.Module):
     dim: int = eqx.field(static=True)
     elementwise_affine: bool = eqx.field(static=True)
 
-    def __init__(
-        self, dim: int, *, eps: float = 1e-8, elementwise_affine: bool = True
-    ):
+    def __init__(self, dim: int, *, eps: float = 1e-8, elementwise_affine: bool = True):
         self.weight = jnp.ones((dim,)) if elementwise_affine else None
         self.eps = eps
         self.dim = dim
@@ -212,7 +210,11 @@ class RMSNorm(eqx.Module):
 
 
 def make_norm(dim: int, *, rms: bool, affine: bool = True):
-    return RMSNorm(dim, elementwise_affine=affine) if rms else LayerNorm(dim, elementwise_affine=affine)
+    return (
+        RMSNorm(dim, elementwise_affine=affine)
+        if rms
+        else LayerNorm(dim, elementwise_affine=affine)
+    )
 
 
 class Gate(eqx.Module):

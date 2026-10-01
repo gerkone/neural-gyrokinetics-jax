@@ -11,8 +11,9 @@ import pytest
 
 from neugk_jax.dataset import preprocess as P
 
-needs_gyaradax = pytest.mark.skipif(importlib.util.find_spec("gyaradax") is None,
-                                    reason="gyaradax not installed")
+needs_gyaradax = pytest.mark.skipif(
+    importlib.util.find_spec("gyaradax") is None, reason="gyaradax not installed"
+)
 
 NVP, NMU, NS, NKX, NKY = 4, 2, 4, 7, 4
 
@@ -21,16 +22,29 @@ def _geometry():
     rng = np.random.default_rng(0)
     krho = np.linspace(0.0, 0.6, NKY)
     return {
-        "krho": krho, "kxrh": np.fft.fftshift(np.fft.fftfreq(NKX)) * 2.0,
-        "ints": np.full(NS, 1.0 / NS), "intmu": np.full(NMU, 0.5), "intvp": np.full(NVP, 0.25),
-        "vpgr": np.linspace(-2, 2, NVP), "mugr": np.linspace(0.1, 1.0, NMU),
-        "bn": 1.0 + 0.1 * rng.random(NS), "efun": 0.5 + 0.1 * rng.random(NS),
-        "rfun": np.ones(NS), "bt_frac": np.ones(NS),
+        "krho": krho,
+        "kxrh": np.fft.fftshift(np.fft.fftfreq(NKX)) * 2.0,
+        "ints": np.full(NS, 1.0 / NS),
+        "intmu": np.full(NMU, 0.5),
+        "intvp": np.full(NVP, 0.25),
+        "vpgr": np.linspace(-2, 2, NVP),
+        "mugr": np.linspace(0.1, 1.0, NMU),
+        "bn": 1.0 + 0.1 * rng.random(NS),
+        "efun": 0.5 + 0.1 * rng.random(NS),
+        "rfun": np.ones(NS),
+        "bt_frac": np.ones(NS),
         "little_g": np.stack([np.ones(NS), 0.1 * np.ones(NS), np.ones(NS)], -1),
         "parseval": np.array([1.0] + [float(NKY)] * (NKY - 1)),
-        "signz": np.ones(1), "vthrat": np.ones(1), "tmp": np.ones(1), "mas": np.ones(1),
-        "de": np.ones(1), "d2X": np.array(1.0), "signB": np.array(1.0),
-        "adiabatic": np.array(1.0), "beta": np.array(0.0), "nlapar": np.array(0.0),
+        "signz": np.ones(1),
+        "vthrat": np.ones(1),
+        "tmp": np.ones(1),
+        "mas": np.ones(1),
+        "de": np.ones(1),
+        "d2X": np.array(1.0),
+        "signB": np.array(1.0),
+        "adiabatic": np.array(1.0),
+        "beta": np.array(0.0),
+        "nlapar": np.array(0.0),
         "nlbpar": np.array(0.0),
     }
 
@@ -43,7 +57,7 @@ def _centred_one_sided(g, nky):
     # kx-centred (fftshift over x) one-sided ky spectrum of a real (x, s, y) field
     spec = np.fft.fftshift(np.fft.rfftn(g, axes=(0, 2), norm="forward"), axes=(0,))
     out = np.zeros((*spec.shape[:2], nky), dtype=spec.dtype)
-    out[..., :spec.shape[-1]] = spec[..., :nky]
+    out[..., : spec.shape[-1]] = spec[..., :nky]
     return out
 
 
@@ -52,8 +66,9 @@ def test_phi_fft_to_real_inverts_kx_centring(nkx):
     g = np.random.default_rng(1).standard_normal((nkx, 3, 32))
     spec = _centred_one_sided(g, 32)
     np.testing.assert_allclose(P.phi_fft_to_real(spec, out_shape=spec.shape), g, atol=1e-10)
-    wrong = np.fft.irfftn(np.fft.fftshift(spec, axes=(0,)), axes=(0, 2), norm="forward",
-                          s=[nkx, 32])
+    wrong = np.fft.irfftn(
+        np.fft.fftshift(spec, axes=(0,)), axes=(0, 2), norm="forward", s=[nkx, 32]
+    )
     assert np.allclose(wrong, g) == (nkx % 2 == 0)
 
 
@@ -63,7 +78,7 @@ def test_phi_to_spc_extracts_centred_window_odd_nkx():
     spec = _centred_one_sided(rng.standard_normal((nkx, ns, 2 * nky)), nky)
     full = np.zeros((nx, ns, ny), dtype=complex)
     x0, y0, c = (nx - nkx) // 2, ny // 2, nkx // 2
-    full[x0:x0 + nkx, :, y0:y0 + nky] = spec
+    full[x0 : x0 + nkx, :, y0 : y0 + nky] = spec
     for ky in range(1, nky):
         for kx in range(-c, c + 1):
             full[x0 + c - kx, :, y0 - ky] = np.conj(spec[c + kx, :, ky])
@@ -72,8 +87,11 @@ def test_phi_to_spc_extracts_centred_window_odd_nkx():
     got = P.phi_to_spc(phi.real, np.abs(spec), out_shape=(nkx, ns, nky))
     np.testing.assert_allclose(got, spec, atol=1e-10)
     real = P.phi_fft_to_real(got, out_shape=got.shape)
-    np.testing.assert_allclose(P.phi_to_spc(real, None, out_shape=got.shape)[..., :nky // 2],
-                               spec[..., :nky // 2], atol=1e-10)
+    np.testing.assert_allclose(
+        P.phi_to_spc(real, None, out_shape=got.shape)[..., : nky // 2],
+        spec[..., : nky // 2],
+        atol=1e-10,
+    )
 
 
 def test_solver_df_roundtrip_and_gkw_convention():
@@ -92,8 +110,9 @@ def test_split_modes_recombine_and_check():
     for bands in (None, 2):
         parts = np.concatenate(P._split_modes(k, bands), axis=0)
         assert parts.shape[0] == 2 * (2 if bands is None else 1 + bands)
-        np.testing.assert_allclose(parts.reshape(-1, 2, *parts.shape[1:]).sum(0), P.do_ifft(k),
-                                   atol=1e-5)
+        np.testing.assert_allclose(
+            parts.reshape(-1, 2, *parts.shape[1:]).sum(0), P.do_ifft(k), atol=1e-5
+        )
         raw = np.fft.ifftshift(k, axes=(3,))
         assert P.check_ifft(parts, np.stack([raw.real, raw.imag]), zf_separated=True)
 
@@ -119,13 +138,16 @@ def test_expand_spec_and_resolve(tmp_path):
     for n in ("b_ifft_realpotens", "a_ifft_realpotens", "c_other"):
         (tmp_path / n).mkdir()
     assert [os.path.basename(p) for p in P.resolve_traj_dirs(str(tmp_path))] == [
-        "a_ifft_realpotens", "b_ifft_realpotens"]
+        "a_ifft_realpotens",
+        "b_ifft_realpotens",
+    ]
 
 
 def test_gkw_text_readers(tmp_path):
     (tmp_path / "input.dat").write_text(
         "&control\n nlapar = .true.\n/\n&species\n mass = 1.0, z = 1.0, rlt = 6.9\n/\n"
-        "&species\n mass = 2.7e-4, z = -1\n/\n")
+        "&species\n mass = 2.7e-4, z = -1\n/\n"
+    )
     cfg = P.parse_input_dat(str(tmp_path / "input.dat"))
     assert cfg["control"]["nlapar"] == ".true." and cfg["species"]["rlt"] == 6.9
     assert cfg["species0"]["z"] == -1 and P._gkw_bool(cfg["control"]["nlapar"]) == 1.0
@@ -176,12 +198,19 @@ def _synthetic_traj(root, n=3):
     rng = np.random.default_rng(8)
     for i in range(n):
         P.solver_df_to_realspace(_spectral_df(rng)).tofile(
-            os.path.join(traj, "data", f"timestep_{i:05d}.bin"))
-        np.zeros((NKX, NS, NKY), np.float32).tofile(os.path.join(traj, "data", f"poten_{i:05d}.bin"))
-    meta = {"resolution": (NVP, NMU, NS, NKX, NKY), "geometry": _geometry(),
-            "timesteps": np.arange(n, dtype=float), "extra": "kept",
-            **{k: np.zeros((NKX, NS, NKY), np.float32) for k in P.PHI_STAT_KEYS},
-            "df_mean": np.zeros(1, np.float32)}
+            os.path.join(traj, "data", f"timestep_{i:05d}.bin")
+        )
+        np.zeros((NKX, NS, NKY), np.float32).tofile(
+            os.path.join(traj, "data", f"poten_{i:05d}.bin")
+        )
+    meta = {
+        "resolution": (NVP, NMU, NS, NKX, NKY),
+        "geometry": _geometry(),
+        "timesteps": np.arange(n, dtype=float),
+        "extra": "kept",
+        **{k: np.zeros((NKX, NS, NKY), np.float32) for k in P.PHI_STAT_KEYS},
+        "df_mean": np.zeros(1, np.float32),
+    }
     P.write_metadata(traj, meta)
     return traj
 
@@ -192,8 +221,14 @@ def test_rewrite_poten_backs_up_and_resolves(tmp_path):
     msg = P.rewrite_poten(traj, backup)
     assert "rewrote 3" in msg and "skip" in P.rewrite_poten(traj, backup)
     bdir = os.path.join(backup, os.path.basename(traj))
-    assert sorted(os.listdir(bdir)) == ["DONE", "metadata.pkl", "metadata_light.pkl",
-                                        "poten_00000.bin", "poten_00001.bin", "poten_00002.bin"]
+    assert sorted(os.listdir(bdir)) == [
+        "DONE",
+        "metadata.pkl",
+        "metadata_light.pkl",
+        "poten_00000.bin",
+        "poten_00001.bin",
+        "poten_00002.bin",
+    ]
     assert not np.fromfile(os.path.join(bdir, "poten_00001.bin"), np.float32).any()
     solver = P.FieldSolver(_geometry())
     phis = []
@@ -201,7 +236,8 @@ def test_rewrite_poten_backs_up_and_resolves(tmp_path):
         df = np.fromfile(os.path.join(traj, "data", f"timestep_{i:05d}.bin"), np.float32)
         phi = solver(df.reshape(2, NVP, NMU, NS, NKX, NKY))[0]
         np.testing.assert_array_equal(
-            np.fromfile(os.path.join(traj, "data", f"poten_{i:05d}.bin"), np.float32), phi.ravel())
+            np.fromfile(os.path.join(traj, "data", f"poten_{i:05d}.bin"), np.float32), phi.ravel()
+        )
         phis.append(phi)
     with open(os.path.join(traj, "metadata.pkl"), "rb") as f:
         meta = pickle.load(f)

@@ -23,18 +23,24 @@ class BatchPlan:
     number: int
 
 
-def train_plans(dist: DistributedInfo, n: int, per_device: int, perm: np.ndarray) -> list[BatchPlan]:
+def train_plans(
+    dist: DistributedInfo, n: int, per_device: int, perm: np.ndarray
+) -> list[BatchPlan]:
     """This process's share of each full global batch of a shuffled epoch (the partial tail is dropped)."""
     gbs = per_device * dist.device_count
     plans = []
     for b, start in enumerate(range(0, n - gbs + 1, gbs)):
-        local = process_batch_indices(dist, perm[start:start + gbs])
+        local = process_batch_indices(dist, perm[start : start + gbs])
         plans.append(BatchPlan(local, np.ones(len(local), np.float32), b))
     return plans
 
 
-def eval_plans(dist: Optional[DistributedInfo], indices: Sequence[int], batch_size: int,
-               max_batches: Optional[int] = None) -> list[BatchPlan]:
+def eval_plans(
+    dist: Optional[DistributedInfo],
+    indices: Sequence[int],
+    batch_size: int,
+    max_batches: Optional[int] = None,
+) -> list[BatchPlan]:
     """Fixed-size batches over ``indices`` owned by this process; the last one is padded and masked."""
     indices = np.asarray(indices, dtype=np.int64)
     n_batches = -(-len(indices) // batch_size)
@@ -44,9 +50,9 @@ def eval_plans(dist: Optional[DistributedInfo], indices: Sequence[int], batch_si
     for b in range(n_batches):
         if dist is not None and not eval_batch_owner(dist, b):
             continue
-        sel = indices[b * batch_size:(b + 1) * batch_size]
+        sel = indices[b * batch_size : (b + 1) * batch_size]
         mask = np.zeros(batch_size, np.float32)
-        mask[:len(sel)] = 1.0
+        mask[: len(sel)] = 1.0
         sel = np.concatenate([sel, np.full(batch_size - len(sel), sel[-1])])
         plans.append(BatchPlan(sel, mask, b))
     return plans
@@ -85,8 +91,9 @@ class BatchLoader:
     def map(self, fn: Callable, items) -> list:
         return list(self._readers.map(fn, items))
 
-    def iterate(self, ds, plans: Sequence[BatchPlan], load: Callable, place: Callable
-                ) -> Iterator[tuple[BatchPlan, Any, float]]:
+    def iterate(
+        self, ds, plans: Sequence[BatchPlan], load: Callable, place: Callable
+    ) -> Iterator[tuple[BatchPlan, Any, float]]:
         def job(plan):
             batch = load(ds, plan.indices, self.read)
             batch["mask"] = plan.mask

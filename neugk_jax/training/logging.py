@@ -38,8 +38,11 @@ class Logger:
         if self.run is not None:
             self.run.log(data, step=step, commit=commit)
         else:
-            kv = " ".join(f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v}"
-                          for k, v in data.items() if isinstance(v, int | float | str))
+            kv = " ".join(
+                f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in data.items()
+                if isinstance(v, int | float | str)
+            )
             if kv:
                 print(f"[step={step}] {kv}")
 

@@ -35,7 +35,7 @@ def _unflatten_meta(z):
     for k in z.files:
         v = z[k]
         if k.startswith("geometry/"):
-            geom[k[len("geometry/"):]] = v
+            geom[k[len("geometry/") :]] = v
         elif k == "resolution":
             meta["resolution"] = tuple(int(x) for x in np.atleast_1d(v))
         else:
@@ -84,8 +84,8 @@ def read_bin(file: str, shape: tuple, dtype=np.float32) -> np.ndarray:
 _DTYPE_SUFFIX = {
     "fp16": ".fp16.bin",
     "bf16": ".bf16.bin",
-    "i8":   ".i8.bin",
-    "i4":   ".i4.bin",
+    "i8": ".i8.bin",
+    "i4": ".i4.bin",
 }
 
 
@@ -96,6 +96,7 @@ def _quantized_sibling(fp32_path: str, dtype: str) -> str:
 
 def _quantize_roundtrip(arr_f32: np.ndarray, dtype: str) -> np.ndarray:
     from neugk_jax.dataset.preprocess import dequantize_array, quantize_array
+
     payload, scale = quantize_array(arr_f32, dtype)
     return dequantize_array(payload, scale, dtype, arr_f32.size).astype(np.float32, copy=False)
 
@@ -126,14 +127,18 @@ class DataBackend(ABC):
 
     @abstractmethod
     def format_path(
-        self, path: str, spatial_ifft: bool,
+        self,
+        path: str,
+        spatial_ifft: bool,
         split_into_bands: Optional[int] = None,
         real_potens: bool = True,
     ) -> str: ...
 
     @abstractmethod
     def read_metadata(
-        self, path: str, input_fields: Sequence[str] = ("df",),
+        self,
+        path: str,
+        input_fields: Sequence[str] = ("df",),
         lightweight: bool = False,
     ) -> dict: ...
 
@@ -143,7 +148,10 @@ class DataBackend(ABC):
 
     @abstractmethod
     def read_df(
-        self, f: Any, timestamp: str, shape: Sequence[int],
+        self,
+        f: Any,
+        timestamp: str,
+        shape: Sequence[int],
         active_keys: Optional[Sequence[int]] = None,
     ) -> np.ndarray: ...
 
@@ -189,11 +197,14 @@ class NumpyBackend(DataBackend):
     def exists(self, path: str) -> bool:
         path = self._strip_h5(path)
         # a trajectory is present if it has full or lightweight metadata, in either npz or pkl
-        return any(_meta_ext(os.path.join(path, n)) is not None
-                   for n in ("metadata", "metadata_light"))
+        return any(
+            _meta_ext(os.path.join(path, n)) is not None for n in ("metadata", "metadata_light")
+        )
 
     def format_path(
-        self, path: str, spatial_ifft: bool,
+        self,
+        path: str,
+        spatial_ifft: bool,
         split_into_bands: Optional[int] = None,
         real_potens: bool = True,
     ) -> str:
@@ -208,7 +219,9 @@ class NumpyBackend(DataBackend):
         return path
 
     def read_metadata(
-        self, path: str, input_fields: Sequence[str] = ("df",),
+        self,
+        path: str,
+        input_fields: Sequence[str] = ("df",),
         lightweight: bool = False,
     ) -> dict:
         path = self._strip_h5(path)
@@ -220,14 +233,28 @@ class NumpyBackend(DataBackend):
         else:
             meta = load_meta(full_base)
             if lightweight:
-                drop = {"df_min", "df_max", "df_var", "df_mean", "df_std",
-                        "phi_min", "phi_max", "phi_var"}
+                drop = {
+                    "df_min",
+                    "df_max",
+                    "df_var",
+                    "df_mean",
+                    "df_std",
+                    "phi_min",
+                    "phi_max",
+                    "phi_var",
+                }
                 meta = {k: v for k, v in meta.items() if k not in drop}
         # fill in missing geometry scalars with safe defaults
         if "geometry" in meta:
             g = meta["geometry"]
             # missing species/field flags default to electrostatic with adiabatic electrons
-            for k, v in (("adiabatic", 1.0), ("de", 1.0), ("beta", 0.0), ("nlapar", 0.0), ("nlbpar", 0.0)):
+            for k, v in (
+                ("adiabatic", 1.0),
+                ("de", 1.0),
+                ("beta", 0.0),
+                ("nlapar", 0.0),
+                ("nlbpar", 0.0),
+            ):
                 if k not in g:
                     g[k] = np.array(v, dtype=np.float64)
             # gyaradax needs ffun (flux-surface function); stub with ones for cyclone s-α at ε→0
@@ -260,6 +287,7 @@ class NumpyBackend(DataBackend):
         if mode == "fp32":
             return read_bin(path, tuple(shape))
         from neugk_jax.dataset.preprocess import read_quantized
+
         expected = int(np.prod(shape))
         arr = read_quantized(path, mode, expected)
         if arr.size != expected:
@@ -267,7 +295,10 @@ class NumpyBackend(DataBackend):
         return arr.reshape(shape).astype(np.float32, copy=False)
 
     def read_df(
-        self, f_dir: str, timestamp: str, shape: Sequence[int],
+        self,
+        f_dir: str,
+        timestamp: str,
+        shape: Sequence[int],
         active_keys: Optional[Sequence[int]] = None,
     ) -> np.ndarray:
         fp = os.path.join(f_dir, "data", f"timestep_{timestamp}.bin")
@@ -327,6 +358,7 @@ class KvikIOBackend(NumpyBackend):
         size and let the caller reinterpret/dequantize."""
         import cupy as cp
         import kvikio
+
         n_elems = int(np.prod(shape))
         if dtype == "fp32":
             buf_dtype, buf_size = cp.float32, n_elems
@@ -355,6 +387,7 @@ class KvikIOBackend(NumpyBackend):
         import jax.dlpack as jdlp
         import jax.lax as lax
         import jax.numpy as jnp
+
         n_elems = int(np.prod(shape))
         if mode == "fp32":
             if self.return_jax:
@@ -372,6 +405,7 @@ class KvikIOBackend(NumpyBackend):
                 return lax.bitcast_convert_type(a, jnp.bfloat16).astype(jnp.float32)
             # host fallback
             from ml_dtypes import bfloat16
+
             return cp.asnumpy(u16).view(bfloat16).astype(np.float32)
         if mode == "i8":
             # split header / payload on device
@@ -386,6 +420,7 @@ class KvikIOBackend(NumpyBackend):
             scale = float(cp.asnumpy(gpu[:4]).view(np.float32)[0])
             packed = cp.asnumpy(gpu[4:].view(cp.uint8))
             from neugk_jax.dataset.preprocess import dequantize_array
+
             arr = dequantize_array(packed, np.float32(scale), "i4", n_elems).reshape(shape)
             if self.return_jax:
                 return jnp.asarray(arr)
@@ -402,23 +437,29 @@ class KvikIOBackend(NumpyBackend):
                 gpu = self._cp_read(path, tuple(shape), dtype="fp32")
                 # round-trip through host to apply the quantization
                 import cupy as cp
+
                 arr = cp.asnumpy(gpu).reshape(shape)
             quantized = _quantize_roundtrip(arr.ravel(), self.prefer_dtype).reshape(shape)
             if self.return_jax and self.use_kvikio:
                 import jax.numpy as jnp
+
                 return jnp.asarray(quantized)
             return quantized
         if not self.use_kvikio:
             if mode == "fp32":
                 return read_bin(path, shape)
             from neugk_jax.dataset.preprocess import read_quantized
+
             n_elems = int(np.prod(shape))
             return read_quantized(path, mode, n_elems).reshape(shape).astype(np.float32, copy=False)
         gpu = self._cp_read(path, tuple(shape), dtype=mode)
         return self._dequantize_gpu(gpu, mode, tuple(shape))
 
     def read_df(
-        self, f_dir: str, timestamp: str, shape: Sequence[int],
+        self,
+        f_dir: str,
+        timestamp: str,
+        shape: Sequence[int],
         active_keys: Optional[Sequence[int]] = None,
     ):
         fp = os.path.join(f_dir, "data", f"timestep_{timestamp}.bin")
@@ -436,7 +477,13 @@ class KvikIOBackend(NumpyBackend):
         return self._read(fp, tuple(shape))
 
 
-_GEOMETRY_DEFAULTS = (("adiabatic", 1.0), ("de", 1.0), ("beta", 0.0), ("nlapar", 0.0), ("nlbpar", 0.0))
+_GEOMETRY_DEFAULTS = (
+    ("adiabatic", 1.0),
+    ("de", 1.0),
+    ("beta", 0.0),
+    ("nlapar", 0.0),
+    ("nlbpar", 0.0),
+)
 
 
 class H5Backend(DataBackend):
@@ -461,20 +508,29 @@ class H5Backend(DataBackend):
         return self.is_valid(path)
 
     def format_path(
-        self, path: str, spatial_ifft: bool,
+        self,
+        path: str,
+        spatial_ifft: bool,
         split_into_bands: Optional[int] = None,
         real_potens: bool = True,
     ) -> str:
         return path if path.endswith(".h5") else path + ".h5"
 
     def read_metadata(
-        self, path: str, input_fields: Sequence[str] = ("df",),
+        self,
+        path: str,
+        input_fields: Sequence[str] = ("df",),
         lightweight: bool = False,
     ) -> dict:
         import h5py
+
         with h5py.File(self.format_path(path, True), "r") as f:
             meta = {k: np.asarray(v[()]) for k, v in f["metadata"].items()}
-            geom = {k: np.asarray(v[()]) for k, v in f["geometry"].items()} if "geometry" in f else None
+            geom = (
+                {k: np.asarray(v[()]) for k, v in f["geometry"].items()}
+                if "geometry" in f
+                else None
+            )
         if "flux" not in meta and "fluxes" in meta:
             meta["flux"] = meta.pop("fluxes")
         meta["resolution"] = tuple(int(r) for r in np.atleast_1d(meta["resolution"]))
@@ -493,6 +549,7 @@ class H5Backend(DataBackend):
     @contextlib.contextmanager
     def open(self, path: str):
         import h5py
+
         f = h5py.File(self.format_path(path, True), "r")
         try:
             yield f
@@ -505,12 +562,16 @@ class H5Backend(DataBackend):
             raise FileNotFoundError(f"{f.filename} has no {name}")
         arr = np.asarray(f[name][()], dtype=np.float32)
         if arr.size != int(np.prod(shape)):
-            raise IOError(f"{f.filename}:{name}: expected {int(np.prod(shape))} elements, "
-                          f"got {arr.size}")
+            raise IOError(
+                f"{f.filename}:{name}: expected {int(np.prod(shape))} elements, " f"got {arr.size}"
+            )
         return arr.reshape(tuple(shape))
 
     def read_df(
-        self, f, timestamp: str, shape: Sequence[int],
+        self,
+        f,
+        timestamp: str,
+        shape: Sequence[int],
         active_keys: Optional[Sequence[int]] = None,
     ) -> np.ndarray:
         k = self._read(f, f"data/timestep_{timestamp}", shape)

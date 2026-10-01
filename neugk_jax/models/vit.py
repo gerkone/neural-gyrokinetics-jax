@@ -50,9 +50,13 @@ class ViTBlock(eqx.Module):
         self.norm1 = make_norm(dim, rms=rms_norm, affine=norm_affine)
         self.norm2 = make_norm(dim, rms=rms_norm, affine=norm_affine)
         self.attn = MultiHeadSelfAttention(
-            dim, num_heads, key=katt,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            gated_attention=gated_attention, use_rpb=False,  # vit has no windowing, so no rpb
+            dim,
+            num_heads,
+            key=katt,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            gated_attention=gated_attention,
+            use_rpb=False,  # vit has no windowing, so no rpb
         )
         hidden = max(int(dim * mlp_ratio), dim)
         self.mlp = MLP([dim, hidden, dim], key=kmlp, act_fn=act_fn)
@@ -154,11 +158,17 @@ class ViTLayer(eqx.Module):
         keys = jr.split(key, depth)
         self.blocks = [
             ViTBlock(
-                dim, num_heads, key=keys[i],
-                mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
-                qkv_bias=qkv_bias, qk_norm=qk_norm,
+                dim,
+                num_heads,
+                key=keys[i],
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
                 gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
@@ -213,9 +223,15 @@ class DiTLayer(eqx.Module):
         keys = jr.split(key, depth)
         self.blocks = [
             DiTViTBlock(
-                dim, num_heads, cond_dim, key=keys[i],
-                mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
-                qkv_bias=qkv_bias, norm_affine=norm_affine,
+                dim,
+                num_heads,
+                cond_dim,
+                key=keys[i],
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                norm_affine=norm_affine,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)
@@ -274,10 +290,17 @@ class FilmViTLayer(eqx.Module):
         fkeys = jr.split(jr.fold_in(key, 1), depth)
         self.blocks = [
             ViTBlock(
-                dim, num_heads, key=bkeys[i],
-                mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn,
-                qkv_bias=qkv_bias, qk_norm=qk_norm, gated_attention=gated_attention,
-                norm_affine=norm_affine, rms_norm=rms_norm,
+                dim,
+                num_heads,
+                key=bkeys[i],
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path,
+                act_fn=act_fn,
+                qkv_bias=qkv_bias,
+                qk_norm=qk_norm,
+                gated_attention=gated_attention,
+                norm_affine=norm_affine,
+                rms_norm=rms_norm,
                 legacy_double_shortcut=legacy_double_shortcut,
             )
             for i in range(depth)

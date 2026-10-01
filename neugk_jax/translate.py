@@ -52,14 +52,17 @@ def force_f32(model):
     """
     return jax.tree_util.tree_map(
         lambda x: x.astype(jnp.float32)
-        if isinstance(x, jax.Array) and x.dtype == jnp.float64 else x,
+        if isinstance(x, jax.Array) and x.dtype == jnp.float64
+        else x,
         model,
     )
 
 
 def _unimportable(e: Exception) -> bool:
     # a pickled class whose module is missing or fails at import (deepspeed without cuda)
-    return isinstance(e, (ImportError, AttributeError)) or type(e).__name__ == "MissingCUDAException"
+    return (
+        isinstance(e, (ImportError, AttributeError)) or type(e).__name__ == "MissingCUDAException"
+    )
 
 
 def _stub_pickle_module():
@@ -84,10 +87,14 @@ def _stub_pickle_module():
                 if not _unimportable(e):
                     raise
                 # permissive ctor: enums/scalers are rebuilt as ``Cls(value)``
-                return type(name, (), {
-                    "__init__": lambda self, *a, **k: None,
-                    "__setstate__": lambda self, state: None,
-                })
+                return type(
+                    name,
+                    (),
+                    {
+                        "__init__": lambda self, *a, **k: None,
+                        "__setstate__": lambda self, state: None,
+                    },
+                )
 
     mod.Unpickler = _StubUnpickler
     return mod
@@ -96,14 +103,16 @@ def _stub_pickle_module():
 def load_torch_state(path: str) -> dict[str, np.ndarray]:
     """Open a torch ``.pth`` on CPU and return a flat numpy dict."""
     import torch
+
     try:
         blob = torch.load(path, map_location="cpu", weights_only=False)
     except Exception as e:
         if not _unimportable(e):
             raise
         # trainer-side objects (e.g. deepspeed loss scalers) whose modules do not import here
-        blob = torch.load(path, map_location="cpu", weights_only=False,
-                          pickle_module=_stub_pickle_module())
+        blob = torch.load(
+            path, map_location="cpu", weights_only=False, pickle_module=_stub_pickle_module()
+        )
     sd = blob["model_state_dict"] if isinstance(blob, dict) and "model_state_dict" in blob else blob
     if any(k.startswith("module.") for k in sd):
         sd = {k.removeprefix("module."): v for k, v in sd.items()}
@@ -147,7 +156,7 @@ def _ae_name_map(jax_name: str) -> list[str]:
     base = jax_name
     base = base.replace(".inner.", ".")
     if base.startswith("backbone."):
-        base = base[len("backbone."):]
+        base = base[len("backbone.") :]
     base = base.replace(".swin.", ".swin_att.")
     base = base.replace(".downsample.proj.", ".downsample.reduction.")
     base = base.replace(".gate.proj.", ".gate.gate.1.")
@@ -193,8 +202,11 @@ def _apply_replacements(model, replacements):
         parts = dotted.split(".")
         node = new_model
         for p_ in parts[:-1]:
-            node = (node[int(p_)] if isinstance(node, list)
-                    else (node[p_] if isinstance(node, dict) else getattr(node, p_)))
+            node = (
+                node[int(p_)]
+                if isinstance(node, list)
+                else (node[p_] if isinstance(node, dict) else getattr(node, p_))
+            )
         leaf = getattr(node, parts[-1])
         object.__setattr__(node, parts[-1], jnp.asarray(value, dtype=leaf.dtype))
     return new_model
@@ -211,12 +223,20 @@ def _translate(model, torch_state, name_map, *, strict: bool = False):
             if cand in torch_state:
                 tw = torch_state[cand]
                 if tuple(tw.shape) == tuple(leaf.shape):
-                    replacements[name] = tw; used.add(cand); matched = True; break
+                    replacements[name] = tw
+                    used.add(cand)
+                    matched = True
+                    break
                 # torch ape has a leading singleton batch axis — squeeze it
-                if (tw.ndim == leaf.ndim + 1 and tw.shape[0] == 1
-                        and tuple(tw.shape[1:]) == tuple(leaf.shape)):
+                if (
+                    tw.ndim == leaf.ndim + 1
+                    and tw.shape[0] == 1
+                    and tuple(tw.shape[1:]) == tuple(leaf.shape)
+                ):
                     replacements[name] = np.asarray(tw).squeeze(0)
-                    used.add(cand); matched = True; break
+                    used.add(cand)
+                    matched = True
+                    break
         if not matched and not _is_non_persistent(name):
             missing.append((name, tuple(leaf.shape)))
     unused = sorted(set(torch_state) - used)
@@ -238,7 +258,10 @@ def translate_gyroswin(model, torch_state, *, strict: bool = False):
 
 
 def build_ae_from_config(
-    cfg_path, *, key, resolution: Optional[Sequence[int]] = None,
+    cfg_path,
+    *,
+    key,
+    resolution: Optional[Sequence[int]] = None,
     legacy_double_shortcut: Optional[bool] = None,
 ):
     """Construct a ``Swin5DAE`` from a config (YAML path or mapping, upstream or local).
@@ -248,6 +271,7 @@ def build_ae_from_config(
     trained with the doubled swin-shortcut residual.
     """
     from neugk_jax.autoencoders import Swin5DAE
+
     cfg = load_config(cfg_path)
     mcfg = cfg["model"]
     vit, patch, bn = mcfg.get("vit", {}), mcfg.get("patch", {}), mcfg.get("bottleneck", {})
@@ -258,58 +282,63 @@ def build_ae_from_config(
     sep_zf = dataset.get("separate_zf", False)
     if legacy_double_shortcut is None:
         legacy_double_shortcut = bool(mcfg.get("legacy_swin_shortcut", True))
-    return force_f32(Swin5DAE(
-        space=5,
-        decouple_mu=mcfg.get("decouple_mu", True),
-        dim=mcfg["latent_dim"],
-        base_resolution=list(base_resolution),
-        in_channels=dataset.get("in_channels", 2 * (2 if sep_zf else 1)),
-        out_channels=dataset.get("out_channels", 2 * (2 if sep_zf else 1)),
-        patch_size=patch["patch_size"],
-        window_size=patch["window_size"],
-        depth=depth,
-        num_heads=vit["num_heads"],
-        num_layers=n_layers,
-        bottleneck_dim=bn.get("dim"),
-        bottleneck_depth=bn.get("depth", 2),
-        bottleneck_num_heads=bn.get("num_heads", 2),
-        hidden_mlp_ratio=mcfg.get("hidden_mlp_ratio", 2.0),
-        merging_hidden_ratio=patch.get("merging_hidden_ratio", 8.0),
-        unmerging_hidden_ratio=patch.get("unmerging_hidden_ratio", 8.0),
-        merging_depth=patch.get("merging_depth", 2),
-        unmerging_depth=patch.get("unmerging_depth", 2),
-        c_multiplier=int(patch.get("c_multiplier", 2)),
-        drop_path=float(vit.get("drop_path", 0.1)),
-        normalized_latent=bn.get("normalized_latent", False),
-        qkv_bias=vit.get("qkv_bias", False),
-        qk_norm=vit.get("qk_norm", False),
-        use_rpb=vit.get("use_rpb", True),
-        gated_attention=vit.get("gated_attention", False),
-        norm_affine=False,
-        legacy_double_shortcut=legacy_double_shortcut,
-        key=key,
-    ))
+    return force_f32(
+        Swin5DAE(
+            space=5,
+            decouple_mu=mcfg.get("decouple_mu", True),
+            dim=mcfg["latent_dim"],
+            base_resolution=list(base_resolution),
+            in_channels=dataset.get("in_channels", 2 * (2 if sep_zf else 1)),
+            out_channels=dataset.get("out_channels", 2 * (2 if sep_zf else 1)),
+            patch_size=patch["patch_size"],
+            window_size=patch["window_size"],
+            depth=depth,
+            num_heads=vit["num_heads"],
+            num_layers=n_layers,
+            bottleneck_dim=bn.get("dim"),
+            bottleneck_depth=bn.get("depth", 2),
+            bottleneck_num_heads=bn.get("num_heads", 2),
+            hidden_mlp_ratio=mcfg.get("hidden_mlp_ratio", 2.0),
+            merging_hidden_ratio=patch.get("merging_hidden_ratio", 8.0),
+            unmerging_hidden_ratio=patch.get("unmerging_hidden_ratio", 8.0),
+            merging_depth=patch.get("merging_depth", 2),
+            unmerging_depth=patch.get("unmerging_depth", 2),
+            c_multiplier=int(patch.get("c_multiplier", 2)),
+            drop_path=float(vit.get("drop_path", 0.1)),
+            normalized_latent=bn.get("normalized_latent", False),
+            qkv_bias=vit.get("qkv_bias", False),
+            qk_norm=vit.get("qk_norm", False),
+            use_rpb=vit.get("use_rpb", True),
+            gated_attention=vit.get("gated_attention", False),
+            norm_affine=False,
+            legacy_double_shortcut=legacy_double_shortcut,
+            key=key,
+        )
+    )
 
 
 def build_dit_from_config(cfg_path, ae, *, key):
     """Construct a ``DiT`` whose dims match an existing AE's bottleneck (config path or mapping)."""
     from neugk_jax.diffusion.dit import DiT
+
     cfg = load_config(cfg_path)
     mcfg = cfg["model"]
     vit = mcfg["vit"]
     grid = tuple(ae.bottleneck_grid_size)
-    return force_f32(DiT(
-        space=len(grid),
-        z_dim=int(ae.bottleneck_dim),
-        dim=mcfg["latent_dim"],
-        grid_size=grid,
-        depth=vit["depth"],
-        num_heads=vit["num_heads"],
-        n_cond=len(mcfg.get("conditioning", []) or []),
-        key=key,
-        mlp_ratio=float(vit.get("mlp_ratio", 2.0)),
-        drop_path=float(vit.get("drop_path", 0.1)),
-    ))
+    return force_f32(
+        DiT(
+            space=len(grid),
+            z_dim=int(ae.bottleneck_dim),
+            dim=mcfg["latent_dim"],
+            grid_size=grid,
+            depth=vit["depth"],
+            num_heads=vit["num_heads"],
+            n_cond=len(mcfg.get("conditioning", []) or []),
+            key=key,
+            mlp_ratio=float(vit.get("mlp_ratio", 2.0)),
+            drop_path=float(vit.get("drop_path", 0.1)),
+        )
+    )
 
 
 def load_or_translate(template, ckpt_path: str):

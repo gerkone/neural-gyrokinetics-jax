@@ -9,15 +9,21 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-needs_gyaradax = pytest.mark.skipif(importlib.util.find_spec("gyaradax") is None,
-                                    reason="gyaradax not installed")
+needs_gyaradax = pytest.mark.skipif(
+    importlib.util.find_spec("gyaradax") is None, reason="gyaradax not installed"
+)
 
 
 @pytest.fixture(scope="module")
 def sample(hf_sample):
     from neugk_jax.dataset import CycloneDataset, H5Backend
+
     ds = CycloneDataset(path=hf_sample.root, trajectories=[hf_sample.name], backend=H5Backend())
-    return np.asarray(ds._get_ae_sample(0, 0).df, np.float32), ds.metadata[0]["geometry"], ds.get_ds(0)
+    return (
+        np.asarray(ds._get_ae_sample(0, 0).df, np.float32),
+        ds.metadata[0]["geometry"],
+        ds.get_ds(0),
+    )
 
 
 def test_flux_integral_matches_torch(sample):
@@ -63,14 +69,16 @@ def test_spectral_metrics_match_torch(sample):
     geom_t = {k: torch.as_tensor(v) for k, v in geom64.items()}
 
     def torch_diags(dfs):
-        return [tmetrics.spectral_diagnostics(torch.as_tensor(d)[None], geom_t, ds=ds_val)
-                for d in dfs]
+        return [
+            tmetrics.spectral_diagnostics(torch.as_tensor(d)[None], geom_t, ds=ds_val) for d in dfs
+        ]
 
     t_gt = torch_diags(gt)
     j_gt = jmetrics.spectral_diagnostics(gt, geom64, ds_val)
     tam = tmetrics.time_averaged_spectral_metrics(torch_diags(pred), t_gt)
-    jam = jmetrics.time_averaged_spectral_metrics(jmetrics.spectral_diagnostics(pred, geom64, ds_val),
-                                                  j_gt)
+    jam = jmetrics.time_averaged_spectral_metrics(
+        jmetrics.spectral_diagnostics(pred, geom64, ds_val), j_gt
+    )
     keys = [f"{s}_{m}" for s in ("kyspec", "qspec") for m in ("pc", "sc", "rl2", "rl1", "wd")]
     keys += ["zfphi_rl2", "zfflow_rl2", "zfshear_rl2", "zf_energy_err"]
     for k in keys:

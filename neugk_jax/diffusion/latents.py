@@ -25,13 +25,15 @@ from neugk_jax.utils import RunningMeanStd
 def _tqdm(*args, **kwargs):
     try:
         from tqdm import tqdm
+
         return tqdm(*args, **kwargs)
     except ImportError:
         return args[0] if args else iter(())
 
 
-def latent_cache_path(dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False,
-                      timestep_std_filter=None) -> Path:
+def latent_cache_path(
+    dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False, timestep_std_filter=None
+) -> Path:
     """Cache file for a split's latents.
 
     ``<path>/diff_<split>_latents_offset<o>[_mu][_std<f>]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
@@ -44,10 +46,14 @@ def latent_cache_path(dataset, split: str, ae_checkpoint: str, *, decouple_mu: b
     if os.path.isfile(run_dir):
         run_dir = os.path.dirname(run_dir)
     segments = [
-        "diff", f"{split}_latents", f"offset{dataset.offset}",
+        "diff",
+        f"{split}_latents",
+        f"offset{dataset.offset}",
         "mu" if decouple_mu else "",
         f"std{timestep_std_filter}" if timestep_std_filter else "",
-        file_hash, "latents", "ae" + run_dir.split("_")[-1],
+        file_hash,
+        "latents",
+        "ae" + run_dir.split("_")[-1],
     ]
     return Path(dataset.path) / ("_".join(filter(None, segments)) + ".pkl")
 
@@ -57,8 +63,9 @@ def cache_meta_path(cache_file: str | Path) -> Path:
     return cache_file.with_name(cache_file.name + ".meta.json")
 
 
-def latent_cache_meta(dataset, ae_checkpoint: str | os.PathLike, *,
-                      normalization_stats=None) -> dict:
+def latent_cache_meta(
+    dataset, ae_checkpoint: str | os.PathLike, *, normalization_stats=None
+) -> dict:
     """Provenance of a latent cache: AE checkpoint file identity and the dataset preprocessing."""
     ae = Path(ae_checkpoint).resolve()
     st = ae.stat()
@@ -86,22 +93,28 @@ def check_cache_meta(cache_file: str | Path, meta: Optional[dict]) -> None:
         return
     path = cache_meta_path(cache_file)
     if not path.exists():
-        warnings.warn(f"{cache_file} has no {path.name}; its AE and preprocessing cannot be "
-                      "checked, only its index and latent shape")
+        warnings.warn(
+            f"{cache_file} has no {path.name}; its AE and preprocessing cannot be "
+            "checked, only its index and latent shape"
+        )
         return
     saved = json.loads(path.read_text())
     diff = {k: (saved.get(k), v) for k, v in meta.items() if saved.get(k) != v}
     if diff:
         lines = "\n".join(f"  {k}: cache={a!r} run={b!r}" for k, (a, b) in sorted(diff.items()))
-        raise ValueError(f"latent cache {cache_file} was built for a different AE or "
-                         f"preprocessing:\n{lines}\ndelete it to re-encode, or point "
-                         "dataset.latents_cache_* at a matching cache")
+        raise ValueError(
+            f"latent cache {cache_file} was built for a different AE or "
+            f"preprocessing:\n{lines}\ndelete it to re-encode, or point "
+            "dataset.latents_cache_* at a matching cache"
+        )
 
 
 def _barrier(name: str) -> None:
     import jax
+
     if jax.process_count() > 1:
         from jax.experimental import multihost_utils
+
         multihost_utils.sync_global_devices(name)
 
 
@@ -179,7 +192,11 @@ def latent_arrays(dataset) -> tuple[np.ndarray, np.ndarray | None]:
 
 
 def load_precomputed_latents(
-    dataset, pickle_path: str | Path, *, remap: bool = True, latent_shape=None,
+    dataset,
+    pickle_path: str | Path,
+    *,
+    remap: bool = True,
+    latent_shape=None,
     meta: Optional[dict] = None,
 ) -> None:
     """Populate ``dataset.precomputed_latents`` from a cache pickle and switch to ``mode="diff"``.
@@ -221,6 +238,7 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     unique on both sides; the per-entry ``timestep`` is then checked against the
     trajectory metadata so a wrong pairing cannot slip through.
     """
+
     def _tuple_of(get):
         return np.array([float(np.squeeze(get(k))) for k in ("itg", "dg", "s_hat", "q")])
 
@@ -228,8 +246,10 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     for fid, meta in dataset.metadata.items():
         key = tuple(np.round(_tuple_of(lambda k: meta[_COND_ALIASES[k]]), 6))
         if key in ours:
-            raise ValueError(f"trajectories {ours[key]} and {fid} share conditions {key}; "
-                             "cannot remap the cache by conditions")
+            raise ValueError(
+                f"trajectories {ours[key]} and {fid} share conditions {key}; "
+                "cannot remap the cache by conditions"
+            )
         ours[key] = fid
     keys = np.array(list(ours))
     fids = list(ours.values())
@@ -244,8 +264,10 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
         d = np.abs(keys - _tuple_of(lambda k: entry[k])).max(axis=1)
         j = int(np.argmin(d))
         if d[j] > tol:
-            raise ValueError(f"cache trajectory {cfid} matches no dataset trajectory "
-                             f"(closest distance {d[j]:.3g})")
+            raise ValueError(
+                f"cache trajectory {cfid} matches no dataset trajectory "
+                f"(closest distance {d[j]:.3g})"
+            )
         mapping[cfid] = fids[j]
     if len(set(mapping.values())) != len(mapping):
         raise ValueError("cache -> dataset trajectory matching is not bijective")
@@ -278,7 +300,9 @@ def verify_latent_cache(dataset, cache: dict, *, latent_shape=None) -> None:
     any_key = next(iter(wanted))
     x = cache[any_key]["x"]
     if latent_shape is not None and tuple(x.shape) != tuple(latent_shape):
-        raise ValueError(f"latent cache shape {tuple(x.shape)} != model latent {tuple(latent_shape)}")
+        raise ValueError(
+            f"latent cache shape {tuple(x.shape)} != model latent {tuple(latent_shape)}"
+        )
     # the scalar conditions pin the fid -> trajectory mapping
     aliases = _COND_ALIASES
     bad = []

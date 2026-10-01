@@ -27,9 +27,7 @@ def _wasserstein_1d(u: np.ndarray, v: np.ndarray) -> float:
     return float(np.abs(np.sort(u) - np.sort(v)).mean())
 
 
-def _zonal_profiles(
-    phi_spec: np.ndarray, geom: Dict[str, np.ndarray]
-) -> Dict[str, np.ndarray]:
+def _zonal_profiles(phi_spec: np.ndarray, geom: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """GKW diagnos_zfshear trio from the spectral potential (s, kx, ky).
 
     zfphi is the flux-surface average (ints weights) of the zonal (ky=0) mode;
@@ -62,7 +60,7 @@ def diagnostics(
     """
     diag: Dict[str, np.ndarray] = {}
     nx = phi_fft_.shape[-3]
-    power = phi_fft_.real ** 2 + phi_fft_.imag ** 2
+    power = phi_fft_.real**2 + phi_fft_.imag**2
 
     kxspec = power.sum(axis=-1) * ds  # reduce y -> (..., nx, mid)
     kyspec = power.sum(axis=-2) * ds  # reduce mid -> (..., nx, ny)
@@ -90,6 +88,7 @@ def spectral_diagnostics(
     df_batch: np.ndarray, geom: Dict[str, np.ndarray], ds: float
 ) -> List[Dict[str, np.ndarray]]:
     from neugk_jax.evaluate.integrals import gyaradax_spectral_fields
+
     phi_spec, eflux = gyaradax_spectral_fields(df_batch, geom)
     return _diagnostics_from_fields(phi_spec, eflux, geom, ds)
 
@@ -110,8 +109,9 @@ def _rl2(p, g) -> float:
     return float(np.linalg.norm(p - g) / (np.linalg.norm(g) + 1e-12))
 
 
-def spectral_sums(pred_diags: List[Dict[str, np.ndarray]],
-                  gt_diags: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+def spectral_sums(
+    pred_diags: List[Dict[str, np.ndarray]], gt_diags: List[Dict[str, np.ndarray]]
+) -> Dict[str, np.ndarray]:
     """Additive per-trajectory statistics of paired snapshot diagnostics."""
     out: Dict[str, np.ndarray] = {"n": np.asarray(float(len(pred_diags)))}
     for key in ("kyspec", "qspec"):
@@ -119,11 +119,15 @@ def spectral_sums(pred_diags: List[Dict[str, np.ndarray]],
         out[f"{key}_g"] = np.stack([np.asarray(d[key], np.float64) for d in gt_diags]).sum(0)
     if "zfphi" in pred_diags[0]:
         for key in _ZF_KEYS:
-            out[f"{key}_rl2"] = np.asarray(sum(_rl2(p[key], g[key])
-                                               for p, g in zip(pred_diags, gt_diags)))
-        out["zf_er"] = np.asarray(sum(
-            float((p["zfphi"] ** 2).sum() / ((g["zfphi"] ** 2).sum() + 1e-12))
-            for p, g in zip(pred_diags, gt_diags)))
+            out[f"{key}_rl2"] = np.asarray(
+                sum(_rl2(p[key], g[key]) for p, g in zip(pred_diags, gt_diags))
+            )
+        out["zf_er"] = np.asarray(
+            sum(
+                float((p["zfphi"] ** 2).sum() / ((g["zfphi"] ** 2).sum() + 1e-12))
+                for p, g in zip(pred_diags, gt_diags)
+            )
+        )
     return out
 
 
@@ -163,12 +167,20 @@ def time_averaged_spectral_metrics(
 
 def spectral_sums_layout(n_ky: int) -> Dict[str, tuple]:
     """Shapes of the :func:`spectral_sums` entries for ``n_ky`` binormal modes."""
-    return {"n": (), "kyspec_p": (n_ky,), "kyspec_g": (n_ky,), "qspec_p": (n_ky,),
-            "qspec_g": (n_ky,), **{f"{k}_rl2": () for k in _ZF_KEYS}, "zf_er": ()}
+    return {
+        "n": (),
+        "kyspec_p": (n_ky,),
+        "kyspec_g": (n_ky,),
+        "qspec_p": (n_ky,),
+        "qspec_g": (n_ky,),
+        **{f"{k}_rl2": () for k in _ZF_KEYS},
+        "zf_er": (),
+    }
 
 
-def pack_spectral_store(store: Dict[int, Dict[str, np.ndarray]], n_files: int,
-                        n_ky: int) -> np.ndarray:
+def pack_spectral_store(
+    store: Dict[int, Dict[str, np.ndarray]], n_files: int, n_ky: int
+) -> np.ndarray:
     """Fixed-shape ``(n_files, D)`` array of per-trajectory sums (zeros where absent)."""
     layout = spectral_sums_layout(n_ky)
     out = np.zeros((n_files, sum(int(np.prod(s)) for s in layout.values())), np.float64)
@@ -184,7 +196,7 @@ def unpack_spectral_store(packed: np.ndarray, n_ky: int) -> Dict[int, Dict[str, 
         parts, i = {}, 0
         for k, shape in layout.items():
             size = int(np.prod(shape))
-            parts[k] = row[i:i + size].reshape(shape)
+            parts[k] = row[i : i + size].reshape(shape)
             i += size
         if parts["n"] > 0:
             store[fid] = parts
@@ -209,6 +221,7 @@ def accumulate_spectral_diagnostics(
     carries no ``ds`` so the caller can warn once.
     """
     from neugk_jax.evaluate.integrals import gyaradax_spectral_fields
+
     file_idx = np.asarray(file_idx)
     valid = np.ones(len(file_idx), bool) if valid is None else np.asarray(valid, bool)
     fids = np.unique(file_idx[valid])
@@ -217,8 +230,10 @@ def accumulate_spectral_diagnostics(
         return False
     if not len(fids):
         return True
-    geoms = {int(f): {k: np.asarray(v) for k, v in val_ds.metadata[int(f)]["geometry"].items()}
-             for f in fids}
+    geoms = {
+        int(f): {k: np.asarray(v) for k, v in val_ds.metadata[int(f)]["geometry"].items()}
+        for f in fids
+    }
     rows = [geoms[int(f) if int(f) in geoms else int(fids[0])] for f in file_idx]
     batched = {k: np.stack([g[k] for g in rows]) for k in rows[0]}
     fields = [gyaradax_spectral_fields(src, batched, per_sample=True) for src in (df_pred, df_tgt)]
@@ -226,8 +241,10 @@ def accumulate_spectral_diagnostics(
         idx = np.where((file_idx == fid) & valid)[0]
         geom, ds_val = geoms[int(fid)], ds_vals[int(fid)]
         (pp, pe), (gp, ge) = fields
-        sums = spectral_sums(_diagnostics_from_fields(pp[idx], pe[idx], geom, ds_val),
-                             _diagnostics_from_fields(gp[idx], ge[idx], geom, ds_val))
+        sums = spectral_sums(
+            _diagnostics_from_fields(pp[idx], pe[idx], geom, ds_val),
+            _diagnostics_from_fields(gp[idx], ge[idx], geom, ds_val),
+        )
         store[int(fid)] = add_spectral_sums(store.get(int(fid)), sums)
     return True
 

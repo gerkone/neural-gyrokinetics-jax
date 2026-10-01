@@ -16,12 +16,25 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-REQUIRED_GEOMETRY = ("krho", "kxrh", "ints", "intmu", "intvp", "vpgr", "mugr", "bn",
-                     "efun", "rfun", "bt_frac", "little_g")
+REQUIRED_GEOMETRY = (
+    "krho",
+    "kxrh",
+    "ints",
+    "intmu",
+    "intvp",
+    "vpgr",
+    "mugr",
+    "bn",
+    "efun",
+    "rfun",
+    "bt_frac",
+    "little_g",
+)
 
 
 def require_integrals(geometry: Optional[dict]) -> None:
     import importlib.util
+
     if importlib.util.find_spec("gyaradax") is None:
         raise ImportError("eval_integrals needs gyaradax (pip install -e '.[gyro]')")
     require_geometry(geometry)
@@ -38,10 +51,12 @@ def require_geometry(geometry: Optional[dict]) -> None:
 
 def _import_gyaradax():
     import importlib.util
+
     if importlib.util.find_spec("gyaradax") is None:
         raise ImportError("flux integrals need gyaradax (pip install -e '.[gyro]')")
     prev = jax.config.jax_enable_x64
     import gyaradax.integrals  # noqa: F401
+
     jax.config.update("jax_enable_x64", prev)
 
 
@@ -51,6 +66,7 @@ def _x64(fn):
         _import_gyaradax()
         with jax.enable_x64(True):
             return fn(*args, **kwargs)
+
     return wrapped
 
 
@@ -59,6 +75,7 @@ def _f64(fn):
     def wrapped(*args, **kwargs):
         with jax.enable_x64(True):
             return fn(*args, **kwargs)
+
     return wrapped
 
 
@@ -87,6 +104,7 @@ def gyaradax_spectral_fields(df_batch, geometry: dict, *, per_sample: bool = Fal
 def _gyaradax_spectral_one(df_one, geom):
     """Per-sample (spatial complex df, geom) → (phi_spec, per-(kx, ky) eflux field)."""
     from gyaradax.integrals import _phi_adiabatic, calculate_fluxes, geom_tensors
+
     spec = jnp.fft.fftn(df_one, axes=(-2, -1), norm="forward")
     spec = jnp.fft.ifftshift(spec, axes=-2)
     gt = geom_tensors(geom)
@@ -122,8 +140,17 @@ _gyaradax_spectral_per_sample = jax.jit(jax.vmap(_gyaradax_spectral_one, in_axes
 
 
 _SCALAR_DEFAULTS = {
-    "mas": 1.0, "tmp": 1.0, "d2X": 1.0, "signz": 1.0, "signB": 1.0, "adiabatic": 1.0,
-    "de": 1.0, "vthrat": 1.0, "beta": 0.0, "nlapar": 0.0, "nlbpar": 0.0,
+    "mas": 1.0,
+    "tmp": 1.0,
+    "d2X": 1.0,
+    "signz": 1.0,
+    "signB": 1.0,
+    "adiabatic": 1.0,
+    "de": 1.0,
+    "vthrat": 1.0,
+    "beta": 0.0,
+    "nlapar": 0.0,
+    "nlbpar": 0.0,
 }
 
 
@@ -152,7 +179,9 @@ def precompute_geometry(geometry: dict, dtype=np.float32) -> dict[str, np.ndarra
     for k, default in _SCALAR_DEFAULTS.items():
         v = g.get(k, np.asarray(default))
         if v.size != 1:
-            raise ValueError(f"flux_integral is single-species; geometry[{k!r}] has shape {v.shape}")
+            raise ValueError(
+                f"flux_integral is single-species; geometry[{k!r}] has shape {v.shape}"
+            )
         out[k] = v.reshape(())
     kxrh = g["kxrh"].reshape(1, 1, 1, -1, 1)
     little_g = g["little_g"].T.reshape(3, 1, 1, -1, 1, 1)
@@ -162,7 +191,9 @@ def precompute_geometry(geometry: dict, dtype=np.float32) -> dict[str, np.ndarra
     z = out["mas"] * out["vthrat"] * krloc * np.sqrt(2.0 * out["mugr"] / out["bn"]) / out["signz"]
     j = np.asarray(bessel_jn(jnp.asarray(np.where(np.abs(z) < 1e-8, 1.0, z)), v=1))
     out["bessel"] = np.where(np.abs(z) < 1e-8, 1.0, j[0])
-    out["bessel_bpar"] = np.where(np.abs(z) < 1e-8, 1.0, 2.0 * j[1] / np.where(np.abs(z) < 1e-8, 1.0, z))
+    out["bessel_bpar"] = np.where(
+        np.abs(z) < 1e-8, 1.0, 2.0 * j[1] / np.where(np.abs(z) < 1e-8, 1.0, z)
+    )
     gam = 0.5 * (out["mas"] * out["vthrat"] * krloc / (out["signz"] * out["bn"])) ** 2
     out["gamma"] = np.asarray(i0e(jnp.asarray(gam)))
     return {k: np.ascontiguousarray(v, dtype=dtype) for k, v in out.items()}
@@ -179,9 +210,9 @@ def _phi_to_spc(phi: jnp.ndarray, out_shape: tuple, real_potens: bool) -> jnp.nd
     phi = jnp.fft.fftshift(jnp.fft.fftn(phi, axes=(0, 2), norm="forward"), axes=0)
     if phi.shape != out_shape:
         nx, _, ny = out_shape
-        phi = phi[..., phi.shape[-1] // 2:]
+        phi = phi[..., phi.shape[-1] // 2 :]
         xpad = (phi.shape[0] - nx) // 2 + (1 if phi.shape[0] % 2 == 0 else 0)
-        phi = phi[xpad:nx + xpad, :, :ny]
+        phi = phi[xpad : nx + xpad, :, :ny]
     return jnp.transpose(phi, (1, 0, 2))
 
 
@@ -199,7 +230,7 @@ def _solve_fields(g: dict, spec: jnp.ndarray):
     adiabatic = g["adiabatic"]
     phi = jnp.sum(signz * de * intmu * intvp * g["bessel"] * bn * spec, axis=(0, 1), keepdims=True)
 
-    diag = (signz**2 * de * (gamma - 1.0) / tmp)
+    diag = signz**2 * de * (gamma - 1.0) / tmp
     diag = diag.at[..., 0, 0].set(0.0) - adiabatic
     diag = -1.0 / jnp.where(diag == 0.0, 1.0, diag)
 
@@ -224,20 +255,40 @@ def _solve_fields(g: dict, spec: jnp.ndarray):
 
 
 def _pev_fluxes(g: dict, spec, phi, apar, bpar):
-    vpgr, mugr, bn, ints, intmu, intvp = g["vpgr"], g["mugr"], g["bn"], g["ints"], g["intmu"], g["intvp"]
-    chi = (g["bessel"] * phi - 2.0 * g["vthrat"] * vpgr * g["bessel"] * apar
-           + 2.0 * mugr * g["tmp"] / g["signz"] * g["bessel_bpar"] * bpar)
+    vpgr, mugr, bn, ints, intmu, intvp = (
+        g["vpgr"],
+        g["mugr"],
+        g["bn"],
+        g["ints"],
+        g["intmu"],
+        g["intvp"],
+    )
+    chi = (
+        g["bessel"] * phi
+        - 2.0 * g["vthrat"] * vpgr * g["bessel"] * apar
+        + 2.0 * mugr * g["tmp"] / g["signz"] * g["bessel_bpar"] * bpar
+    )
     dum1 = jnp.imag(g["parseval"] * ints * g["efun"] * g["krho"] * spec * jnp.conj(chi))
     d3v = ints * g["d2X"] * intmu * bn * intvp
     pflux = jnp.sum(d3v * dum1 * g["de"])
     eflux = jnp.sum(d3v * (vpgr**2 * dum1 + 2.0 * mugr * bn * dum1) * g["de"] * g["tmp"])
-    vflux = jnp.sum(d3v * dum1 * vpgr * g["rfun"] * g["bt_frac"] * g["signB"]
-                    * g["de"] * g["mas"] * g["vthrat"] ** 2)
+    vflux = jnp.sum(
+        d3v
+        * dum1
+        * vpgr
+        * g["rfun"]
+        * g["bt_frac"]
+        * g["signB"]
+        * g["de"]
+        * g["mas"]
+        * g["vthrat"] ** 2
+    )
     return pflux, eflux, vflux
 
 
-def flux_integral(geom_t: dict, df: jnp.ndarray, phi: Optional[jnp.ndarray] = None,
-                  *, real_potens: bool = True):
+def flux_integral(
+    geom_t: dict, df: jnp.ndarray, phi: Optional[jnp.ndarray] = None, *, real_potens: bool = True
+):
     """Jittable single-sample fields and fluxes from a spatial df (real-space phi out).
 
     ``geom_t`` comes from :func:`precompute_geometry`; ``df`` is ``(2, vp, mu, s, x, y)``

@@ -36,8 +36,6 @@ def _normalize_patch(patch_size: Sequence[int]) -> tuple[int, ...]:
     return tuple(p if p and p > 0 else 1 for p in patch_size)
 
 
-
-
 def fold_patches(x: jnp.ndarray, patch_size: Sequence[int]) -> jnp.ndarray:
     """``(*spatial, c) → (*grid, prod(patch)*c)`` where ``grid_i = spatial_i // patch_i``.
 
@@ -83,11 +81,7 @@ def unfold_patches(
     return x.reshape(*[g * e for g, e in zip(grid, eb)], out_channels)
 
 
-
-
-def pad_to_blocks(
-    x: jnp.ndarray, block_size: Sequence[int]
-) -> tuple[jnp.ndarray, tuple[int, ...]]:
+def pad_to_blocks(x: jnp.ndarray, block_size: Sequence[int]) -> tuple[jnp.ndarray, tuple[int, ...]]:
     """Right-pad each spatial axis with zeros to a multiple of block_size."""
     bs = _normalize_patch(block_size)
     spatial = x.shape[: len(bs)]
@@ -106,8 +100,6 @@ def unpad(
     slices = [slice(0, s) for s in base_resolution]
     slices += [slice(None)] * (x.ndim - len(base_resolution))
     return x[tuple(slices)]
-
-
 
 
 class PatchEmbed(eqx.Module):
@@ -159,8 +151,6 @@ class PatchEmbed(eqx.Module):
         return x
 
 
-
-
 class PatchMerge(eqx.Module):
     """Fold with patch=2 + norm + linear up-project.
 
@@ -191,9 +181,7 @@ class PatchMerge(eqx.Module):
         self.merge_mask = merge_mask
         self.patch_size = tuple(2 if m else 1 for m in merge_mask)
         # ceil so odd-length axes round up; forward pads them to the next multiple
-        self.target_grid_size = tuple(
-            (g + p - 1) // p for g, p in zip(gs, self.patch_size)
-        )
+        self.target_grid_size = tuple((g + p - 1) // p for g, p in zip(gs, self.patch_size))
         n_merged = sum(merge_mask)
         in_features = dim * (2**n_merged)
         out_features = dim * c_multiplier
@@ -210,8 +198,6 @@ class PatchMerge(eqx.Module):
         return self.proj(x)
 
 
-
-
 class StridedConvTranspose(eqx.Module):
     """ConvTranspose with stride == kernel (non-overlapping) == the patch-expand op.
 
@@ -221,7 +207,7 @@ class StridedConvTranspose(eqx.Module):
     """
 
     weight: jax.Array  # (in, out, *kernel)
-    bias: jax.Array    # (out,)
+    bias: jax.Array  # (out,)
     expand_by: tuple[int, ...] = eqx.field(static=True)
 
     def __init__(self, in_ch: int, out_ch: int, expand_by: Sequence[int], *, key):
@@ -289,10 +275,7 @@ class PatchExpand(eqx.Module):
         if isinstance(expand_by, int):
             if target_grid_size is not None:
                 # ceil so we never undershoot the target (crop after unfold)
-                expand_by = [
-                    max(1, -(-t // max(1, g)))
-                    for g, t in zip(gs, target_grid_size)
-                ]
+                expand_by = [max(1, -(-t // max(1, g))) for g, t in zip(gs, target_grid_size)]
             else:
                 expand_by = [expand_by if g > 1 else 1 for g in gs]
         eb = _normalize_patch(expand_by)
@@ -328,6 +311,7 @@ class PatchExpand(eqx.Module):
         self.proj_concat = Linear(2 * dim, dim, key=kpc) if patch_skip else None
         if cond_dim:
             from neugk_jax.models.swin import Film
+
             self.modulation = Film(cond_dim, dim, key=kmod)
         else:
             self.modulation = None
@@ -341,7 +325,7 @@ class PatchExpand(eqx.Module):
         if self.modulation is not None:
             x = self.modulation(x, cond)
         if self.use_conv:
-            x = self.expansion(x)           # (*grid, c) -> (*expanded, out)
+            x = self.expansion(x)  # (*grid, c) -> (*expanded, out)
         else:
             x = self.expansion(x)
             x = unfold_patches(x, self.expand_by, out_channels=self.out_dim)

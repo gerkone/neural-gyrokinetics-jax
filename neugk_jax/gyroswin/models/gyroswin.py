@@ -124,14 +124,27 @@ class GyroSwinMultitask(eqx.Module):
         phi_window_size = tuple(df_window_size[2:])
 
         keys = jr.split(key, 18)
-        unet_kw = dict(dim=dim, depth=depth, num_heads=num_heads, num_layers=num_layers,
-                       hidden_mlp_ratio=8.0, merging_hidden_ratio=merging_hidden_ratio,
-                       unmerging_hidden_ratio=unmerging_hidden_ratio, qk_norm=qk_norm,
-                       use_rpb=use_rpb, gated_attention=gated_attention,
-                       use_checkpoint=use_checkpoint, n_cond=n_cond,
-                       cond_embed_dim=cond_embed_dim, cond_mode=cond_mode, middle_swin=True,
-                       unpatch_patch_skip=patch_skip, rms_norm=rms_norm,
-                       legacy_double_shortcut=legacy_double_shortcut, drop_path=drop_path)
+        unet_kw = dict(
+            dim=dim,
+            depth=depth,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            hidden_mlp_ratio=8.0,
+            merging_hidden_ratio=merging_hidden_ratio,
+            unmerging_hidden_ratio=unmerging_hidden_ratio,
+            qk_norm=qk_norm,
+            use_rpb=use_rpb,
+            gated_attention=gated_attention,
+            use_checkpoint=use_checkpoint,
+            n_cond=n_cond,
+            cond_embed_dim=cond_embed_dim,
+            cond_mode=cond_mode,
+            middle_swin=True,
+            unpatch_patch_skip=patch_skip,
+            rms_norm=rms_norm,
+            legacy_double_shortcut=legacy_double_shortcut,
+            drop_path=drop_path,
+        )
         self.df_unet = Swin5DUnet(
             space=5,
             decouple_mu=decouple_mu,
@@ -148,7 +161,8 @@ class GyroSwinMultitask(eqx.Module):
         self.phi_unet = SwinNDUnet(
             space=3,
             base_resolution=list(phi_base_resolution),
-            in_channels=1, out_channels=1,
+            in_channels=1,
+            out_channels=1,
             patch_size=list(phi_patch_size),
             window_size=list(phi_window_size),
             c_multiplier=2,
@@ -158,7 +172,8 @@ class GyroSwinMultitask(eqx.Module):
         )
         self.phi_unet = eqx.tree_at(
             lambda u: (u.patch_embed, u.down_blocks),
-            self.phi_unet, (None, []),
+            self.phi_unet,
+            (None, []),
             is_leaf=lambda x: x is None,
         )
 
@@ -172,13 +187,17 @@ class GyroSwinMultitask(eqx.Module):
             VSpaceReduce(
                 dim=df_in_dims[i],
                 out_dim=phi_up_blk_dims[i] if i < len(phi_up_blk_dims) else df_in_dims[i],
-                key=keys[2 + i], **vs_kw,
+                key=keys[2 + i],
+                **vs_kw,
             )
             for i in range(len(df_in_dims))
         ]
         bottleneck_dim = df_down_dims[-1] if df_down_dims else dim
         self.vspace_attn_middle = VSpaceReduce(
-            dim=bottleneck_dim, out_dim=bottleneck_dim, key=keys[8], **vs_kw,
+            dim=bottleneck_dim,
+            out_dim=bottleneck_dim,
+            key=keys[8],
+            **vs_kw,
         )
         if patch_skip:
             self.vspace_attn_patch_skip = VSpaceReduce(dim=dim, out_dim=dim, key=keys[9], **vs_kw)
@@ -193,14 +212,21 @@ class GyroSwinMultitask(eqx.Module):
         phi_up_dims = phi_down_dims[::-1][1:]
         n_up = len(df_up_dims)
         self.df_mix_up = [
-            MixingBlock(df_up_dims[i],
-                        phi_up_dims[i] if i < len(phi_up_dims) else df_up_dims[i],
-                        key=k, **mix_kw)
+            MixingBlock(
+                df_up_dims[i],
+                phi_up_dims[i] if i < len(phi_up_dims) else df_up_dims[i],
+                key=k,
+                **mix_kw,
+            )
             for i, k in enumerate(jr.split(keys[12], n_up))
         ]
         self.phi_mix_up = [
-            MixingBlock(phi_up_dims[i] if i < len(phi_up_dims) else df_up_dims[i],
-                        df_up_dims[i], key=k, **mix_kw)
+            MixingBlock(
+                phi_up_dims[i] if i < len(phi_up_dims) else df_up_dims[i],
+                df_up_dims[i],
+                key=k,
+                **mix_kw,
+            )
             for i, k in enumerate(jr.split(keys[13], n_up))
         ]
         # patch-space mixing runs after the patch-skip concat, so the dim doubles with patch_skip
@@ -211,11 +237,17 @@ class GyroSwinMultitask(eqx.Module):
         # flux head stages run deepest first (phi=query, df=kv)
         if self.flux_key is not None:
             self.flux_head = FluxDecoder(
-                left_dims=phi_down_dims[::-1], right_dims=df_down_dims[::-1],
-                num_heads=flux_num_heads, depth=flux_depth, key=keys[16],
-                reduction=flux_reduce, attn_drop=attn_drop, drop=flux_drop,
+                left_dims=phi_down_dims[::-1],
+                right_dims=df_down_dims[::-1],
+                num_heads=flux_num_heads,
+                depth=flux_depth,
+                key=keys[16],
+                reduction=flux_reduce,
+                attn_drop=attn_drop,
+                drop=flux_drop,
                 detach_latents=detach_flux_latents,
-                n_cond=n_cond if flux_conditioning else 0, cond_embed_dim=cond_embed_dim,
+                n_cond=n_cond if flux_conditioning else 0,
+                cond_embed_dim=cond_embed_dim,
             )
         else:
             self.flux_head = None
@@ -223,8 +255,14 @@ class GyroSwinMultitask(eqx.Module):
     def _phi_for_df(self, zphi):
         return jax.lax.stop_gradient(zphi) if self.detach_phi_cross_latents else zphi
 
-    def __call__(self, df: jnp.ndarray, cond: Optional[jnp.ndarray] = None,
-                 *, key=None, inference: bool = True) -> dict:
+    def __call__(
+        self,
+        df: jnp.ndarray,
+        cond: Optional[jnp.ndarray] = None,
+        *,
+        key=None,
+        inference: bool = True,
+    ) -> dict:
         """Forward: df → ``{"df", "phi"?, flux_key?}``.
 
         df: ``(C, vp, mu, s, x, y)``; cond: ``(n_cond,)`` raw scalars. ``key``
@@ -238,8 +276,11 @@ class GyroSwinMultitask(eqx.Module):
         zdf, df_pad_axes = self.df_unet.patch_encode(df)
         # patch-skip residuals: df0 (full patch grid) and its velocity-reduced phi0
         df0 = zdf
-        phi0 = (self.vspace_attn_patch_skip(df0, key=nk(), **kw)
-                if self.vspace_attn_patch_skip is not None else None)
+        phi0 = (
+            self.vspace_attn_patch_skip(df0, key=nk(), **kw)
+            if self.vspace_attn_patch_skip is not None
+            else None
+        )
         # down path: df skips feed the df up blocks, their velocity reductions the phi up blocks
         df_skips, phi_skips = [], []
         for i, blk in enumerate(self.df_unet.down_blocks):
@@ -253,8 +294,10 @@ class GyroSwinMultitask(eqx.Module):
         zphi = self.vspace_attn_middle(zdf, key=nk(), **kw)
         if self.phi_unet.middle_pe is not None:
             zphi = self.phi_unet.middle_pe(zphi)
-        zdf, zphi = (self.df_mix_middle(zdf, self._phi_for_df(zphi), key=nk(), **kw),
-                     self.phi_mix_middle(zphi, zdf, key=nk(), **kw))
+        zdf, zphi = (
+            self.df_mix_middle(zdf, self._phi_for_df(zphi), key=nk(), **kw),
+            self.phi_mix_middle(zphi, zdf, key=nk(), **kw),
+        )
         zdf = self.df_unet.middle(zdf, c_df, key=nk(), **kw)
         zphi = self.phi_unet.middle(zphi, c_phi, key=nk(), **kw)
         flux_lats = []
@@ -289,21 +332,47 @@ class GyroSwinMultitask(eqx.Module):
 
 
 _ACCEPTED_SWIN_KEYS = {
-    "patch_size", "window_size", "num_heads", "depth", "gradient_checkpoint",
-    "merging_hidden_ratio", "unmerging_hidden_ratio", "c_multiplier", "patch_skip",
-    "modulation", "use_rpb", "qk_norm", "gated_attention", "norm_fn", "flux_reduce",
-    "flux_num_heads", "flux_depth", "flux_conditioning", "detach_flux_latents",
-    "detach_phi_cross_latents", "attn_drop", "flux_drop",
+    "patch_size",
+    "window_size",
+    "num_heads",
+    "depth",
+    "gradient_checkpoint",
+    "merging_hidden_ratio",
+    "unmerging_hidden_ratio",
+    "c_multiplier",
+    "patch_skip",
+    "modulation",
+    "use_rpb",
+    "qk_norm",
+    "gated_attention",
+    "norm_fn",
+    "flux_reduce",
+    "flux_num_heads",
+    "flux_depth",
+    "flux_conditioning",
+    "detach_flux_latents",
+    "detach_phi_cross_latents",
+    "attn_drop",
+    "flux_drop",
     # phi grids are derived from the df grids
-    "phi_patch_size", "phi_window_size",
+    "phi_patch_size",
+    "phi_window_size",
     # no effect on the model: unused by the multitask model, or init-only
-    "norm_output", "drop_path", "init_weights", "patching_init_weights", "cond_init_weights",
+    "norm_output",
+    "drop_path",
+    "init_weights",
+    "patching_init_weights",
+    "cond_init_weights",
 }
 
 # key -> the only supported value
 _FIXED_SWIN_KEYS = {
-    "swin_bottleneck": True, "latent_cross_attn": True, "use_abs_pe": False,
-    "use_rope": False, "cosine_attn": False, "act_fn": "GELU",
+    "swin_bottleneck": True,
+    "latent_cross_attn": True,
+    "use_abs_pe": False,
+    "use_rope": False,
+    "cosine_attn": False,
+    "act_fn": "GELU",
 }
 
 
@@ -329,15 +398,20 @@ def _check_config(mcfg: dict, dataset: dict, training: dict) -> None:
         raise NotImplementedError("training.pushforward unrolls")
 
 
-def build_gyroswin_from_config(cfg_path, *, key,
-                               resolution: Optional[Sequence[int]] = None,
-                               legacy_double_shortcut: Optional[bool] = None) -> GyroSwinMultitask:
+def build_gyroswin_from_config(
+    cfg_path,
+    *,
+    key,
+    resolution: Optional[Sequence[int]] = None,
+    legacy_double_shortcut: Optional[bool] = None,
+) -> GyroSwinMultitask:
     """Build a ``GyroSwinMultitask`` from a YAML path or a ``{"model", "dataset"}`` mapping.
 
     ``legacy_double_shortcut`` defaults to ``model.legacy_swin_shortcut``, or
     to True when absent. Config keys the port does not implement raise.
     """
     from neugk_jax.translate import force_f32, load_config
+
     cfg = load_config(cfg_path)
     mcfg = cfg["model"] if "model" in cfg else cfg
     swin = mcfg["swin"]
@@ -349,8 +423,9 @@ def build_gyroswin_from_config(cfg_path, *, key,
     separate_zf = dataset.get("separate_zf", True)
     in_ch = 2 + (2 if separate_zf else 0)
     sched = mcfg.get("loss_scheduler") or {}
-    outputs = [k for k, w in (mcfg.get("loss_weights") or {}).items()
-               if (w and w > 0) or sched.get(k)]
+    outputs = [
+        k for k, w in (mcfg.get("loss_weights") or {}).items() if (w and w > 0) or sched.get(k)
+    ]
     if int(mcfg.get("num_layers", 1)) != 1:
         raise NotImplementedError("model.num_layers != 1")
     if int(swin.get("flux_depth", 1)) != 1:
@@ -364,7 +439,8 @@ def build_gyroswin_from_config(cfg_path, *, key,
         df_window_size=swin["window_size"],
         depth=swin["depth"],
         num_heads=swin["num_heads"],
-        in_channels=in_ch, out_channels=in_ch,
+        in_channels=in_ch,
+        out_channels=in_ch,
         num_layers=int(mcfg.get("num_layers", 1)),
         c_multiplier=swin.get("c_multiplier", 2),
         merging_hidden_ratio=swin.get("merging_hidden_ratio", 4.0),
@@ -411,15 +487,18 @@ def release_config(cfg_path, *, resolution: Optional[Sequence[int]] = None) -> d
     import copy
 
     from neugk_jax.translate import load_config
+
     cfg = copy.deepcopy(load_config(cfg_path))
     mcfg = cfg["model"]
     for k in _RELEASE_DEAD_SWIN_KEYS:
         mcfg["swin"].pop(k, None)
     mcfg["legacy_swin_shortcut"] = False
     ds = cfg.get("dataset") or {}
-    dataset = {"separate_zf": bool(ds.get("separate_zf", True)),
-               "real_potens": bool(ds.get("real_potens", True)),
-               "resolution": [int(r) for r in (resolution or RELEASE_RESOLUTION)]}
+    dataset = {
+        "separate_zf": bool(ds.get("separate_zf", True)),
+        "real_potens": bool(ds.get("real_potens", True)),
+        "resolution": [int(r) for r in (resolution or RELEASE_RESOLUTION)],
+    }
     return {"model": mcfg, "dataset": dataset}
 
 

@@ -45,7 +45,7 @@ def _torchrun_env() -> dict | None:
         return None
     return dict(
         coordinator_address=f"{os.environ.get('MASTER_ADDR', 'localhost')}:"
-                            f"{os.environ.get('MASTER_PORT', '29500')}",
+        f"{os.environ.get('MASTER_PORT', '29500')}",
         num_processes=int(os.environ["WORLD_SIZE"]),
         process_id=int(os.environ["RANK"]),
         # torchrun starts one process per gpu
@@ -83,7 +83,7 @@ def global_batch_size(dist: DistributedInfo, per_device: int) -> int:
 def process_batch_indices(dist: DistributedInfo, window: np.ndarray) -> np.ndarray:
     # contiguous per-process slice of one global batch window
     per_proc = len(window) // dist.num_processes
-    return window[dist.process_id * per_proc:(dist.process_id + 1) * per_proc]
+    return window[dist.process_id * per_proc : (dist.process_id + 1) * per_proc]
 
 
 def eval_batch_owner(dist: DistributedInfo, batch_idx: int) -> bool:
@@ -112,7 +112,8 @@ def _put_rows(tree, mesh: Mesh, n_procs: int):
         return jax.tree_util.tree_map(lambda x: jax.device_put(x, dev) if _is_array(x) else x, tree)
     sharding = NamedSharding(mesh, P(mesh.axis_names[0]))
     return jax.tree_util.tree_map(
-        lambda x: _assemble(x, sharding, x.shape[0] * n_procs) if _is_array(x) else x, tree)
+        lambda x: _assemble(x, sharding, x.shape[0] * n_procs) if _is_array(x) else x, tree
+    )
 
 
 def shard_batch(dist: DistributedInfo, tree):

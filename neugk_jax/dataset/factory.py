@@ -46,8 +46,11 @@ def build_dataset(
         split=split,
         trajectories=trajectories if isinstance(trajectories, str) else list(trajectories),
         fields_to_load=tuple(fields or dcfg.get("input_fields", ("df",))),
-        conditions=tuple(conditions if conditions is not None
-                         else dcfg.get("conditions", ("itg", "dg", "s_hat", "q"))),
+        conditions=tuple(
+            conditions
+            if conditions is not None
+            else dcfg.get("conditions", ("itg", "dg", "s_hat", "q"))
+        ),
         mode=mode,
         separate_zf=bool(dcfg.get("separate_zf", False)),
         real_potens=bool(dcfg.get("real_potens", True)),
@@ -55,22 +58,27 @@ def build_dataset(
         normalization_scope=dcfg.get("normalization_scope", "dataset"),
         normalization_stats=stats if stats is not None else norm_stats,
         offset=int(dcfg.get("offset", 0)),
-        subsample=int(dcfg.get("subsample", 1) if split == "train" else dcfg.get("val_subsample", 1)),
+        subsample=int(
+            dcfg.get("subsample", 1) if split == "train" else dcfg.get("val_subsample", 1)
+        ),
         cond_filters=config_dict(filters) or None,
         lightweight_metadata=bool(dcfg.get("lightweight_metadata", norm_stats is not None)),
-        backend=make_backend(dcfg, local_rank=dist.local_rank if dist else 0,
-                             prefer_dtype=prefer_dtype),
+        backend=make_backend(
+            dcfg, local_rank=dist.local_rank if dist else 0, prefer_dtype=prefer_dtype
+        ),
         rank=dist.process_id if dist else 0,
     )
     kwargs.update(overrides)
     return CycloneDataset(**kwargs)
 
 
-def build_splits(dcfg, *, dist=None, train_dtype: Optional[str] = None, val_overrides=None,
-                 **kwargs) -> tuple[CycloneDataset, CycloneDataset]:
+def build_splits(
+    dcfg, *, dist=None, train_dtype: Optional[str] = None, val_overrides=None, **kwargs
+) -> tuple[CycloneDataset, CycloneDataset]:
     """Train and val datasets sharing one normalization-stats load."""
     train = build_dataset(dcfg, split="train", dist=dist, prefer_dtype=train_dtype, **kwargs)
     stats = train.stats if dcfg.get("normalization_stats") is not None else None
-    val = build_dataset(dcfg, split="val", dist=dist, stats=stats,
-                        **{**kwargs, **(val_overrides or {})})
+    val = build_dataset(
+        dcfg, split="val", dist=dist, stats=stats, **{**kwargs, **(val_overrides or {})}
+    )
     return train, val

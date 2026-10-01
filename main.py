@@ -68,12 +68,15 @@ def resume_config(cfg: DictConfig) -> DictConfig:
 def run_id() -> str:
     """``YYYYmmdd_HHMMSS_<rand>`` of process 0, identical on every process."""
     from neugk_jax.training.ddp import init_distributed
+
     dist = init_distributed()
     now = datetime.today()
-    stamp = np.asarray([int(now.strftime("%Y%m%d")), int(now.strftime("%H%M%S")),
-                        random.randint(0, 999)], np.int32)
+    stamp = np.asarray(
+        [int(now.strftime("%Y%m%d")), int(now.strftime("%H%M%S")), random.randint(0, 999)], np.int32
+    )
     if dist.num_processes > 1:
         from jax.experimental import multihost_utils
+
         stamp = np.asarray(multihost_utils.broadcast_one_to_all(stamp))
     day, time, rand = (int(v) for v in stamp)
     return f"{day:08d}_{time:06d}_{rand:03d}"
@@ -95,6 +98,7 @@ def main(cfg: DictConfig) -> None:
     print("#" * 88)
     dispatch_runner(cfg)
     import jax
+
     if jax.distributed.is_initialized():
         jax.distributed.shutdown()
 

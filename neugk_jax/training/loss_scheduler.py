@@ -13,8 +13,11 @@ import jax.numpy as jnp
 from neugk_jax.losses import df_loss, l1, relative_norm_mse
 
 
-def linear_burn_in(start: float, end: float, start_fraction: float, end_fraction: float) -> Callable[[float], float]:
+def linear_burn_in(
+    start: float, end: float, start_fraction: float, end_fraction: float
+) -> Callable[[float], float]:
     """Linear ramp from ``start`` to ``end`` over [start_fraction, end_fraction]."""
+
     def fn(progress_remaining: float) -> float:
         progress = 1.0 - progress_remaining
         if progress > end_fraction:
@@ -22,14 +25,20 @@ def linear_burn_in(start: float, end: float, start_fraction: float, end_fraction
         if progress < start_fraction:
             return start
         return start + (progress - start_fraction) * (end - start) / (end_fraction - start_fraction)
+
     return fn
 
 
 def cyclical_annealing(
-    start: float, end: float, start_fraction: float, end_fraction: float,
-    n_cycles: int = 4, ratio: float = 0.5,
+    start: float,
+    end: float,
+    start_fraction: float,
+    end_fraction: float,
+    n_cycles: int = 4,
+    ratio: float = 0.5,
 ) -> Callable[[float], float]:
     """Cyclical annealing — ``n_cycles`` ramps within [start_fraction, end_fraction]."""
+
     def fn(progress_remaining: float) -> float:
         progress = 1.0 - progress_remaining
         if progress < start_fraction:
@@ -41,6 +50,7 @@ def cyclical_annealing(
         if cycle < ratio:
             return start + (end - start) * (cycle / ratio)
         return end
+
     return fn
 
 
@@ -62,7 +72,9 @@ class LossConfig:
     scheduled weight is replaced by ``sched(progress_remaining)`` each step.
     """
 
-    def __init__(self, loss_weights: Any, extra_loss_weights: Any = None, loss_scheduler: Any = None):
+    def __init__(
+        self, loss_weights: Any, extra_loss_weights: Any = None, loss_scheduler: Any = None
+    ):
         lw = {k: float(v or 0.0) for k, v in dict(loss_weights or {}).items()}
         elw = {k: float(v or 0.0) for k, v in dict(extra_loss_weights or {}).items()}
         known = set(DATA_LOSSES) | set(INTEGRAL_LOSSES) | set(REMOVED_LOSSES)
@@ -71,10 +83,12 @@ class LossConfig:
         if unknown:
             raise ValueError(f"unknown loss keys {unknown}; supported: {sorted(known)}")
         self.weights = {**lw, **elw}
-        self.schedulers = {k: fn for k, fn in build_scheduler_dict(loss_scheduler).items()
-                           if k in self.weights}
-        self.active = tuple(k for k in self.weights
-                            if self.weights[k] > 0.0 or k in self.schedulers)
+        self.schedulers = {
+            k: fn for k, fn in build_scheduler_dict(loss_scheduler).items() if k in self.weights
+        }
+        self.active = tuple(
+            k for k in self.weights if self.weights[k] > 0.0 or k in self.schedulers
+        )
         removed = [k for k in self.active if k in REMOVED_LOSSES]
         if removed:
             raise ValueError(f"cross losses {removed} are not supported; set their weight to 0")
@@ -135,10 +149,15 @@ def build_scheduler_dict(loss_scheduler_cfg: Any) -> dict[str, Callable[[float],
         if not sp:
             continue
         kind = sp.get("type", "linear") if hasattr(sp, "get") else getattr(sp, "type", "linear")
-        get = (lambda obj, k, d=None: obj.get(k, d)) if hasattr(sp, "get") else (lambda obj, k, d=None: getattr(obj, k, d))
+        get = (
+            (lambda obj, k, d=None: obj.get(k, d))
+            if hasattr(sp, "get")
+            else (lambda obj, k, d=None: getattr(obj, k, d))
+        )
         if kind == "cyclical":
             out[key] = cyclical_annealing(
-                start=get(sp, "start"), end=get(sp, "end"),
+                start=get(sp, "start"),
+                end=get(sp, "end"),
                 start_fraction=get(sp, "start_fraction"),
                 end_fraction=get(sp, "end_fraction"),
                 n_cycles=get(sp, "n_cycles", 4),
@@ -146,7 +165,8 @@ def build_scheduler_dict(loss_scheduler_cfg: Any) -> dict[str, Callable[[float],
             )
         else:
             out[key] = linear_burn_in(
-                start=get(sp, "start"), end=get(sp, "end"),
+                start=get(sp, "start"),
+                end=get(sp, "end"),
                 start_fraction=get(sp, "start_fraction"),
                 end_fraction=get(sp, "end_fraction"),
             )

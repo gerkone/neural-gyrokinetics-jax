@@ -26,6 +26,7 @@ def hf_sample():
     """Public CBC snapshot ``iteration_8.h5``: ``root`` dir, ``name``, ``h5`` and ``stats`` paths."""
     import os
     from types import SimpleNamespace
+
     pytest.importorskip("h5py")
     h5 = hf_file(DATA_REPO, f"preprocessed/{SAMPLE}.h5", repo_type="dataset")
     stats = hf_file(DATA_REPO, "normalization_stats.pkl", repo_type="dataset")

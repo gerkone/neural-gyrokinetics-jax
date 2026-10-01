@@ -39,8 +39,9 @@ class Denorm(eqx.Module):
     def from_dataset(cls, ds, fields: Sequence[str]) -> "Denorm":
         shared = ds.normalization is None or ds.normalization_scope in ("dataset", "sample")
         fids = [0] if shared else list(range(len(ds.files)))
-        params = {k: tuple(jnp.asarray(a) for a in ds.scale_shift(fids, k, FIELD_NDIM[k]))
-                  for k in fields}
+        params = {
+            k: tuple(jnp.asarray(a) for a in ds.scale_shift(fids, k, FIELD_NDIM[k])) for k in fields
+        }
         return cls(params, shared)
 
     def scale_shift(self, field: str, fids):
@@ -101,9 +102,17 @@ class BaseEvaluator:
 
     denorm_fields: tuple[str, ...] = ("df",)
 
-    def __init__(self, cfg: Any, *, val_ds: Any, dist: Optional[DistributedInfo] = None,
-                 batch_size: int = 1, loader: Optional[BatchLoader] = None,
-                 indices: Optional[Sequence[int]] = None, max_batches: Optional[int] = None):
+    def __init__(
+        self,
+        cfg: Any,
+        *,
+        val_ds: Any,
+        dist: Optional[DistributedInfo] = None,
+        batch_size: int = 1,
+        loader: Optional[BatchLoader] = None,
+        indices: Optional[Sequence[int]] = None,
+        max_batches: Optional[int] = None,
+    ):
         self.cfg = cfg
         self.vcfg = config_dict(cfg.get("validation")) if hasattr(cfg, "get") else {}
         self.ds = val_ds
@@ -141,14 +150,17 @@ class BaseEvaluator:
         """``requested`` unless a validation trajectory's metadata lacks the ``ds`` spacing."""
         if requested and any(self.ds.get_ds(f) is None for f in range(len(self.ds.files))):
             if self.is_rank0:
-                print("[evaluate] eval_spectra requested but metadata has no 'ds'; "
-                      "skipping spectral metrics")
+                print(
+                    "[evaluate] eval_spectra requested but metadata has no 'ds'; "
+                    "skipping spectral metrics"
+                )
             return False
         return requested
 
     def spectral_metrics(self, store: dict) -> dict[str, float]:
         """Spectral metrics of the per-trajectory sums of every process (collective)."""
         from neugk_jax.evaluate import metrics as m
+
         if self.dist.num_processes > 1:
             n_ky = int(self.ds.resolution[-1])
             packed = self.sum_process_arrays(m.pack_spectral_store(store, len(self.ds.files), n_ky))
@@ -159,6 +171,7 @@ class BaseEvaluator:
         if self.dist.num_processes <= 1:
             return arr
         from jax.experimental import multihost_utils
+
         return np.asarray(multihost_utils.process_allgather(arr)).sum(axis=0)
 
     def sum_processes(self, host: dict[str, float]) -> dict[str, float]:

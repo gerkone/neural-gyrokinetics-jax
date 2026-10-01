@@ -16,14 +16,17 @@ def run_config(cfg, ds=None) -> dict:
 
 def build_ae(cfg, ds, *, key):
     from neugk_jax.translate import build_ae_from_config
+
     return build_ae_from_config(run_config(cfg, ds), key=key)
 
 
 def build_dit(cfg, ae, *, key):
     from neugk_jax.translate import build_dit_from_config
+
     return build_dit_from_config(run_config(cfg), ae, key=key)
 
 
 def build_gyroswin(cfg, ds, *, key):
     from neugk_jax.gyroswin.models import build_gyroswin_from_config
+
     return build_gyroswin_from_config(run_config(cfg, ds), key=key)

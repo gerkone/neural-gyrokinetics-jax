@@ -56,22 +56,30 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
     wd = tcfg.get("weight_decay", 0.0)
     params = eqx.filter(model, trainable_mask(model))
     mask = weight_decay_mask(params, tcfg.get("exclude_from_wd", []))
-    clip = (optax.clip_by_global_norm(tcfg.get("clip_to", 1.0))
-            if tcfg.get("clip_grad", True) else optax.identity())
+    clip = (
+        optax.clip_by_global_norm(tcfg.get("clip_to", 1.0))
+        if tcfg.get("clip_grad", True)
+        else optax.identity()
+    )
     if wd <= 0:
         return optax.chain(clip, optax.adam(schedule, b2=b2))
     if decoupled:
         return optax.chain(clip, optax.adamw(schedule, b2=b2, weight_decay=wd, mask=mask))
     # coupled l2: wd * p is added to the gradient before the moment estimates
-    return optax.chain(clip, optax.add_decayed_weights(wd, mask=mask),
-                       optax.scale_by_adam(b2=b2), optax.scale_by_learning_rate(schedule))
+    return optax.chain(
+        clip,
+        optax.add_decayed_weights(wd, mask=mask),
+        optax.scale_by_adam(b2=b2),
+        optax.scale_by_learning_rate(schedule),
+    )
 
 
 def train_update(model, opt_state, loss_fn, optimizer, mask, *, has_aux: bool = False):
     """One optimizer step on the leaves ``mask`` marks trainable; buffers stay fixed."""
     params, static = eqx.partition(model, mask)
     out, grads = eqx.filter_value_and_grad(
-        lambda p: loss_fn(eqx.combine(p, static)), has_aux=has_aux)(params)
+        lambda p: loss_fn(eqx.combine(p, static)), has_aux=has_aux
+    )(params)
     updates, opt_state = optimizer.update(grads, opt_state, params)
     return eqx.combine(eqx.apply_updates(params, updates), static), opt_state, out
 
@@ -95,8 +103,9 @@ def train_step(inputs, model, opt_state, spec: StepSpec):
     def loss(m):
         return spec.loss_fn(m, {**ctx, **batch}, key)
 
-    model, opt_state, (value, aux) = train_update(model, opt_state, loss, spec.optimizer,
-                                                  spec.mask, has_aux=True)
+    model, opt_state, (value, aux) = train_update(
+        model, opt_state, loss, spec.optimizer, spec.mask, has_aux=True
+    )
     return model, opt_state, {"total": value, **aux}
 
 
@@ -138,15 +147,19 @@ class BaseRunner:
                 cfg.model.legacy_swin_shortcut = False
         configure_compilation_cache(cfg)
         self.dist = init_distributed()
-        self.logger = Logger(is_rank0=self.dist.is_rank0, config=config_dict(cfg),
-                             logging=config_dict(cfg.get("logging")))
+        self.logger = Logger(
+            is_rank0=self.dist.is_rank0,
+            config=config_dict(cfg),
+            logging=config_dict(cfg.get("logging")),
+        )
         self.output_path = Path(output_path or cfg.get("output_path") or "outputs/run")
         self.tcfg = cfg.training
         self.start_epoch = 0
         self.best_val = math.inf
         self.checkpointer = AsyncCheckpointer()
-        self.loader = BatchLoader(workers=self.tcfg.get("num_workers", 4),
-                                  prefetch=self.tcfg.get("prefetch", 2))
+        self.loader = BatchLoader(
+            workers=self.tcfg.get("num_workers", 4), prefetch=self.tcfg.get("prefetch", 2)
+        )
         self.setup_data()
         self.model = self.build_model(jr.PRNGKey(cfg.get("seed", 0)))
         self.setup_optimizer()
@@ -194,12 +207,15 @@ class BaseRunner:
         self.steps_per_epoch = max(1, len(self.train_ds) // self.global_batch_size)
         self.total_steps = tcfg.n_epochs * self.steps_per_epoch
         self.schedule = warmup_cosine(
-            peak_lr=tcfg.learning_rate, total_steps=self.total_steps,
-            steps_per_epoch=self.steps_per_epoch, n_epochs=tcfg.n_epochs,
+            peak_lr=tcfg.learning_rate,
+            total_steps=self.total_steps,
+            steps_per_epoch=self.steps_per_epoch,
+            n_epochs=tcfg.n_epochs,
             min_lr=tcfg.get("final_learning_rate", 1e-6),
         )
-        self.optimizer = build_optimizer(self.schedule, tcfg, self.model,
-                                         decoupled=self.decoupled_wd, b2=self.adam_b2)
+        self.optimizer = build_optimizer(
+            self.schedule, tcfg, self.model, decoupled=self.decoupled_wd, b2=self.adam_b2
+        )
         self.trainable = trainable_mask(self.model)
         self.opt_state = self.optimizer.init(eqx.filter(self.model, self.trainable))
         self.model = replicate(self.dist, self.model)
@@ -220,21 +236,26 @@ class BaseRunner:
     def save_checkpoint(self, epoch: int, val: float, name: str = "ckp.eqx") -> None:
         if not self.dist.is_rank0:
             return
-        state = CheckpointState(model=local_view(self.dist, self.model),
-                                opt_state=local_view(self.dist, self.opt_state),
-                                epoch=epoch, loss=val,
-                                meta={"best_val": self.best_val, **self.checkpoint_meta()})
+        state = CheckpointState(
+            model=local_view(self.dist, self.model),
+            opt_state=local_view(self.dist, self.opt_state),
+            epoch=epoch,
+            loss=val,
+            meta={"best_val": self.best_val, **self.checkpoint_meta()},
+        )
         self.checkpointer.save(self.output_path / name, state)
 
     def train_epoch(self, epoch: int, key) -> tuple[dict, dict]:
         perm_key, step_key = jr.split(key)
         perm = np.asarray(jr.permutation(perm_key, len(self.train_ds)))
         plans = train_plans(self.dist, len(self.train_ds), self.tcfg.batch_size, perm)
-        batches = self.loader.iterate(self.train_ds, plans, self.load_batch,
-                                      lambda b: shard_batch(self.dist, b))
+        batches = self.loader.iterate(
+            self.train_ds, plans, self.load_batch, lambda b: shard_batch(self.dist, b)
+        )
         show = self.dist.is_rank0 and (self.cfg.get("logging") or {}).get("tqdm", False)
         if show:
             from tqdm import tqdm
+
             batches = tqdm(batches, total=len(plans), desc=f"epoch {epoch}")
         acc, waits = None, []
         t_start = t_first = time.perf_counter()
@@ -244,7 +265,8 @@ class BaseRunner:
             batch.pop("mask")
             batch.update(self.step_extras(step0 + i))
             self.model, self.opt_state, logs = train_step(
-                (batch, self.ctx, jr.fold_in(step_key, i)), self.model, self.opt_state, self.spec)
+                (batch, self.ctx, jr.fold_in(step_key, i)), self.model, self.opt_state, self.spec
+            )
             acc = logs if acc is None else _add_logs(acc, logs)
             if i == 0:
                 jax.block_until_ready(acc)
@@ -296,8 +318,9 @@ class BaseRunner:
                 logs.update({"epoch": epoch, "epoch_time_s": t_train})
                 self.logger.log(logs, step=epoch, commit=not val_plots)
                 if val_plots:
-                    self.logger.log({f"val_plots/{k}": v for k, v in val_plots.items()},
-                                    step=epoch, commit=True)
+                    self.logger.log(
+                        {f"val_plots/{k}": v for k, v in val_plots.items()}, step=epoch, commit=True
+                    )
                 if self.dist.is_rank0:
                     core = " ".join(f"{k}={v:.4e}" for k, v in loss_logs.items())
                     print(f"epoch {epoch:04d}  {core}  ({t_train:.1f}s)")
@@ -318,4 +341,6 @@ def conditioning_slots(dataset_conditions, model_conditions) -> Optional[np.ndar
     # sorted condition names, as the models consume them
     if not model_conditions:
         return None
-    return np.asarray([list(dataset_conditions).index(c) for c in sorted(model_conditions)], np.int32)
+    return np.asarray(
+        [list(dataset_conditions).index(c) for c in sorted(model_conditions)], np.int32
+    )

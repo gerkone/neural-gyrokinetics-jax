@@ -18,12 +18,15 @@ from neugk_jax.models.patching import (
 )
 
 
-@pytest.mark.parametrize("spatial,patch", [
-    ((8, 8), (4, 4)),
-    ((16, 24), (4, 8)),
-    ((8, 12, 4), (2, 4, 2)),
-    ((8, 4, 16, 4), (2, 1, 4, 2)),  # axis with patch=1 is passthrough
-])
+@pytest.mark.parametrize(
+    "spatial,patch",
+    [
+        ((8, 8), (4, 4)),
+        ((16, 24), (4, 8)),
+        ((8, 12, 4), (2, 4, 2)),
+        ((8, 4, 16, 4), (2, 1, 4, 2)),  # axis with patch=1 is passthrough
+    ],
+)
 def test_fold_unfold_inverse(spatial, patch):
     x = jr.normal(jr.PRNGKey(0), (*spatial, 6))
     folded = fold_patches(x, patch)

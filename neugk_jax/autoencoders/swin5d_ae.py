@@ -93,8 +93,10 @@ class Swin5DAE(eqx.Module):
             unmerging_depth=unmerging_depth,
             use_abs_pe=use_abs_pe,
             act_fn=act_fn,
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
-            use_rpb=use_rpb, gated_attention=gated_attention,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            use_rpb=use_rpb,
+            gated_attention=gated_attention,
             norm_affine=norm_affine,
             legacy_double_shortcut=legacy_double_shortcut,
             rms_norm=True,
@@ -115,30 +117,47 @@ class Swin5DAE(eqx.Module):
 
         # bottleneck vit blocks use RMSNorm(elementwise_affine=True) regardless of encoder setting
         vit_kwargs = dict(
-            qkv_bias=qkv_bias, qk_norm=qk_norm,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
             gated_attention=gated_attention,
             norm_affine=True,
             rms_norm=True,
         )
         self.middle_pre = ViTLayer(
-            space=self.backbone.space, dim=mid_dim, depth=bottleneck_depth,
-            num_heads=bottleneck_num_heads, grid_size=mid_grid,
-            key=k1, mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
-            act_fn=act_fn, **vit_kwargs,
+            space=self.backbone.space,
+            dim=mid_dim,
+            depth=bottleneck_depth,
+            num_heads=bottleneck_num_heads,
+            grid_size=mid_grid,
+            key=k1,
+            mlp_ratio=hidden_mlp_ratio,
+            drop_path=drop_path,
+            act_fn=act_fn,
+            **vit_kwargs,
         )
         self.middle_post = ViTLayer(
-            space=self.backbone.space, dim=mid_dim, depth=bottleneck_depth,
-            num_heads=bottleneck_num_heads, grid_size=mid_grid,
-            key=k2, mlp_ratio=hidden_mlp_ratio, drop_path=drop_path,
-            act_fn=act_fn, **vit_kwargs,
+            space=self.backbone.space,
+            dim=mid_dim,
+            depth=bottleneck_depth,
+            num_heads=bottleneck_num_heads,
+            grid_size=mid_grid,
+            key=k2,
+            mlp_ratio=hidden_mlp_ratio,
+            drop_path=drop_path,
+            act_fn=act_fn,
+            **vit_kwargs,
         )
         self.middle_downproj = Linear(mid_dim, bd, key=k3)
         self.middle_upproj = Linear(bd, mid_dim, key=k4)
         # ae middle_upscale uses LayerNorm (with weight + bias)
         self.middle_upscale = PatchExpand(
-            mid_dim, mid_grid, key=k5,
+            mid_dim,
+            mid_grid,
+            key=k5,
             target_grid_size=self.backbone.grid_sizes[-2],
-            c_multiplier=c_multiplier, mlp_depth=1, rms_norm=False,
+            c_multiplier=c_multiplier,
+            mlp_depth=1,
+            rms_norm=False,
         )
 
         if normalized_latent:
@@ -148,7 +167,6 @@ class Swin5DAE(eqx.Module):
             self.pre_z_norm = None
             self.post_z_norm = None
         self.normalized_latent = normalized_latent
-
 
     def encode(self, df: jnp.ndarray, *, key=None, inference: bool = True):
         keys = split_key(key, len(self.backbone.down_blocks) + 1)
@@ -160,7 +178,6 @@ class Swin5DAE(eqx.Module):
         if self.normalized_latent:
             z = self.pre_z_norm(z)
         return z, pad_axes
-
 
     def decode(self, z: jnp.ndarray, pad_axes=None, *, key=None, inference: bool = True):
         keys = split_key(key, len(self.backbone.up_blocks) + 1)
@@ -179,9 +196,9 @@ class Swin5DAE(eqx.Module):
         df = self.backbone.patch_decode(z, pad_axes)
         return {"df": df}
 
-
-    def __call__(self, df: jnp.ndarray, return_latent: bool = False, *, key=None,
-                 inference: bool = True):
+    def __call__(
+        self, df: jnp.ndarray, return_latent: bool = False, *, key=None, inference: bool = True
+    ):
         k_enc, k_dec = split_key(key, 2)
         z, pad_axes = self.encode(df, key=k_enc, inference=inference)
         out = self.decode(z, pad_axes, key=k_dec, inference=inference)

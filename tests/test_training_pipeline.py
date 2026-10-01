@@ -73,10 +73,16 @@ def test_async_checkpoint_roundtrip(tmp_path):
     model = {"w": jnp.arange(4.0), "b": jnp.ones((2, 2))}
     opt = {"mu": jnp.zeros(4)}
     ck = AsyncCheckpointer()
-    ck.save(tmp_path / "ckp.eqx", CheckpointState(model, opt, epoch=3, loss=0.5, meta={"best_val": 0.25}))
+    ck.save(
+        tmp_path / "ckp.eqx",
+        CheckpointState(model, opt, epoch=3, loss=0.5, meta={"best_val": 0.25}),
+    )
     # a second save waits for the first write and replaces the file atomically
     model2 = jax.tree_util.tree_map(lambda a: a + 1, model)
-    ck.save(tmp_path / "ckp.eqx", CheckpointState(model2, opt, epoch=4, loss=0.4, meta={"best_val": 0.2}))
+    ck.save(
+        tmp_path / "ckp.eqx",
+        CheckpointState(model2, opt, epoch=4, loss=0.4, meta={"best_val": 0.2}),
+    )
     ck.join()
     state = load_checkpoint(tmp_path / "ckp.eqx", model)
     assert state.epoch == 4 and state.meta["best_val"] == 0.2
@@ -118,8 +124,11 @@ def test_local_view_places_unreplicated_arrays_on_the_local_mesh():
     from neugk_jax.training.ddp import local_view, replicate_local
 
     dist = init_distributed()
-    tree = {"single": jax.device_put(jnp.arange(4.0), jax.local_devices()[0]),
-            "replicated": replicate_local(dist, jnp.ones(3)), "static": 3}
+    tree = {
+        "single": jax.device_put(jnp.arange(4.0), jax.local_devices()[0]),
+        "replicated": replicate_local(dist, jnp.ones(3)),
+        "static": 3,
+    }
     out = local_view(dist, tree)
     local = set(jax.local_devices())
     assert out["single"].sharding.device_set == local
