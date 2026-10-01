@@ -1,5 +1,5 @@
 # model and dataset sections of the release config of ml-jku/gyroswin_large
-# (huggingface pytorch_model.bin); build with neugk_jax.gyroswin.models.build_release_gyroswin
+# (huggingface pytorch_model.bin); build with neugk_jax.models.build.build_release_gyroswin
 model:
   name: gyroswin_multi
   bundle_seq_length: 1
