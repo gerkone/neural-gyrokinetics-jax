@@ -11,6 +11,8 @@ Usage (one experiment preset per workflow, see ``configs/experiment``)::
     python main.py                                   # ae (default preset)
     python main.py experiment=diffusion ae_checkpoint=/path/to/ae_run_dir
     python main.py experiment=gyroswin
+    python main.py experiment=pinc_revival ae_checkpoint=/path/to/pretrained_ae_run
+    python main.py experiment=vqvae model.vq.quantizer=fsq
     python main.py experiment=ae training.n_epochs=1 logging=wandb
     python main.py load_ckpt=true output_path=/path/to/run_dir   # resume in place
     torchrun --nproc_per_node=2 main.py experiment=ae   # batch_size is per device
@@ -33,8 +35,13 @@ def dispatch_runner(cfg: DictConfig) -> None:
     """Workflow → runner dispatch."""
     workflow = cfg.get("workflow", "ae")
     base = workflow.split("_")[0]
-    if base == "ae":
-        from neugk_jax.autoencoders.runner import AERunner as Runner
+    vq = (cfg.get("model") or {}).get("model_type") == "vqvae"
+    if base == "pinc" and cfg.get("stage") == "peft":
+        from neugk_jax.pinc.peft import PINCPEFTRunner as Runner
+    elif base == "vqvae" or (base in ("ae", "pinc") and vq):
+        from neugk_jax.pinc.runner import VQVAERunner as Runner
+    elif base in ("ae", "pinc"):
+        from neugk_jax.pinc.runner import AERunner as Runner
     elif base == "diffusion":
         from neugk_jax.diffusion.runner import FlowMatchingRunner as Runner
     elif base == "gyroswin":
