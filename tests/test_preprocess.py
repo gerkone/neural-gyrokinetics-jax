@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from neugk_jax.dataset import preprocess as P
+from neugk_jax.evaluate import fourier as F
 
 needs_gyaradax = pytest.mark.skipif(
     importlib.util.find_spec("gyaradax") is None, reason="gyaradax not installed"
@@ -65,7 +66,7 @@ def _centred_one_sided(g, nky):
 def test_phi_fft_to_real_inverts_kx_centring(nkx):
     g = np.random.default_rng(1).standard_normal((nkx, 3, 32))
     spec = _centred_one_sided(g, 32)
-    np.testing.assert_allclose(P.phi_fft_to_real(spec, out_shape=spec.shape), g, atol=1e-10)
+    np.testing.assert_allclose(F.spec_to_phi(spec), g, atol=1e-10)
     wrong = np.fft.irfftn(
         np.fft.fftshift(spec, axes=(0,)), axes=(0, 2), norm="forward", s=[nkx, 32]
     )
@@ -84,57 +85,67 @@ def test_phi_to_spc_extracts_centred_window_odd_nkx():
             full[x0 + c - kx, :, y0 - ky] = np.conj(spec[c + kx, :, ky])
     phi = np.fft.ifftn(np.fft.ifftshift(full, axes=(0, 2)), axes=(0, 2), norm="forward")
     assert np.max(np.abs(phi.imag)) < 1e-10
-    got = P.phi_to_spc(phi.real, np.abs(spec), out_shape=(nkx, ns, nky))
+    got = F.phi_to_spec(phi.real, (nkx, ns, nky))
     np.testing.assert_allclose(got, spec, atol=1e-10)
-    real = P.phi_fft_to_real(got, out_shape=got.shape)
+    real = F.spec_to_phi(got)
     np.testing.assert_allclose(
-        P.phi_to_spc(real, None, out_shape=got.shape)[..., : nky // 2],
-        spec[..., : nky // 2],
-        atol=1e-10,
+        F.phi_to_spec(real, got.shape)[..., : nky // 2], spec[..., : nky // 2], atol=1e-10
     )
 
 
-def test_solver_df_roundtrip_and_gkw_convention():
+def test_df_spectrum_roundtrip_and_gkw_convention():
     k = _spectral_df(np.random.default_rng(3))
-    real = P.solver_df_to_realspace(k)
+    real = F.spec_to_df(k)
     assert real.shape == (2, NVP, NMU, NS, NKX, NKY) and real.dtype == np.float32
-    np.testing.assert_allclose(P.realspace_to_solver_df(real), k, atol=1e-5)
-    np.testing.assert_array_equal(real, P.do_ifft(np.fft.fftshift(k, axes=(3,))))
+    np.testing.assert_allclose(F.df_to_spec(real), k, atol=1e-5)
+    shifted = np.fft.ifftn(np.fft.fftshift(k, axes=(3,)), axes=(3, 4), norm="forward")
+    np.testing.assert_array_equal(real, np.stack([shifted.real, shifted.imag]).astype(np.float32))
+    import jax.numpy as jnp
+
+    np.testing.assert_allclose(np.asarray(F.spec_to_df(jnp.asarray(k))), real, atol=1e-5)
     raw = np.stack([k.real, k.imag]).astype(np.float32)
     assert P.check_ifft(real, raw)
     assert not P.check_ifft(real, raw + 1e-3)
 
 
 def test_split_modes_recombine_and_check():
-    k = np.fft.fftshift(_spectral_df(np.random.default_rng(4)), axes=(3,))
+    from neugk_jax.utils import recombine_zf
+
+    k = _spectral_df(np.random.default_rng(4))
     for bands in (None, 2):
         parts = np.concatenate(P._split_modes(k, bands), axis=0)
         assert parts.shape[0] == 2 * (2 if bands is None else 1 + bands)
-        np.testing.assert_allclose(
-            parts.reshape(-1, 2, *parts.shape[1:]).sum(0), P.do_ifft(k), atol=1e-5
-        )
-        raw = np.fft.ifftshift(k, axes=(3,))
-        assert P.check_ifft(parts, np.stack([raw.real, raw.imag]), zf_separated=True)
+        np.testing.assert_allclose(recombine_zf(parts, axis=0), F.spec_to_df(k), atol=1e-5)
+        assert P.check_ifft(parts, np.stack([k.real, k.imag]), zf_separated=True)
 
 
-def test_stream_stats_matches_seeded_running_mean_std():
-    from neugk_jax.utils import RunningMeanStd
+def test_running_stats_push_matches_merge():
+    from neugk_jax.utils import RunningStats
 
     xs = np.random.default_rng(5).standard_normal((6, 3, 4)) * 1e-3 + 0.2
-    ref = RunningMeanStd()
-    ref.count = 1e-4
-    got = P.StreamStats()
+    ref, got = RunningStats(prior_count=1e-4), RunningStats(prior_count=1e-4)
     for x in xs:
-        ref.update(x, np.zeros_like(x), x, x)
-        got.update(x)
+        ref.merge(x, np.zeros_like(x), x, x)
+        got.push(x)
     for name in ("mean", "var", "min", "max"):
         np.testing.assert_allclose(getattr(got, name), getattr(ref, name), rtol=1e-12)
     np.testing.assert_allclose(got.mean, xs.sum(0) / (len(xs) + 1e-4), rtol=1e-12)
+    scalar = RunningStats(prior_count=1e-4)
+    for x in xs[:, 0, 0]:
+        scalar.push(x)
+    np.testing.assert_allclose(scalar.mean, got.mean[0, 0], rtol=1e-12)
+    pooled = got.moments(axes=(1,))
+    np.testing.assert_allclose(
+        pooled["var"], got.var.mean(1, keepdims=True) + got.mean.var(1, keepdims=True)
+    )
 
 
 def test_expand_spec_and_resolve(tmp_path):
-    assert P.expand_spec("it_{0-2,5}_x") == ["it_0_x", "it_1_x", "it_2_x", "it_5_x"]
-    assert P.expand_spec(["a", "b"]) == ["a", "b"]
+    from neugk_jax.dataset.backend import expand_spec
+
+    assert expand_spec("it_{0-2,5}_x") == ["it_0_x", "it_1_x", "it_2_x", "it_5_x"]
+    assert expand_spec(["a", "b"]) == ["a", "b"]
+    assert expand_spec(["b_{1-2}"]) == ["b_1", "b_2"]
     for n in ("b_ifft_realpotens", "a_ifft_realpotens", "c_other"):
         (tmp_path / n).mkdir()
     assert [os.path.basename(p) for p in P.resolve_traj_dirs(str(tmp_path))] == [
@@ -166,13 +177,18 @@ def test_gkw_text_readers(tmp_path):
 
 @pytest.mark.parametrize("bits", ["bf16", "fp16", "i8", "i4"])
 def test_quantize_roundtrip(tmp_path, bits):
+    from neugk_jax.dataset import quant
+
     x = np.random.default_rng(6).standard_normal(1001).astype(np.float32)
-    payload, scale = P.quantize_array(x, bits)
-    dst = str(tmp_path / "timestep_00000.bin")
-    P.write_quantized(P.quantized_sibling(dst, bits), payload, scale)
-    y = P.read_quantized(P.quantized_sibling(dst, bits), bits, x.size)
+    payload, scale = quant.quantize(x, bits)
+    dst = quant.sibling(str(tmp_path / "timestep_00000.bin"), bits)
+    quant.write(dst, payload, scale)
+    y = quant.read(dst, bits, x.size)
     tol = {"bf16": 1e-2, "fp16": 1e-3, "i8": 2e-2, "i4": 0.3}[bits]
     assert np.max(np.abs(y - x)) <= tol * np.max(np.abs(x))
+    np.testing.assert_array_equal(quant.roundtrip(x, bits), y)
+    with pytest.raises(IOError):
+        quant.read(dst, bits, x.size + 2)
 
 
 def test_field_solver_spectrum_sums_to_flux_and_matches_flux_integral():
@@ -182,7 +198,7 @@ def test_field_solver_spectrum_sums_to_flux_and_matches_flux_integral():
     from neugk_jax.evaluate.integrals import flux_integral, precompute_geometry
 
     geom = _geometry()
-    df = P.solver_df_to_realspace(_spectral_df(np.random.default_rng(7)))
+    df = F.spec_to_df(_spectral_df(np.random.default_rng(7)))
     solver = P.FieldSolver(geom)
     phi, eflux = solver(df)
     assert phi.shape == (NKX, NS, NKY) and phi.dtype == np.float32
@@ -197,9 +213,7 @@ def _synthetic_traj(root, n=3):
     os.makedirs(os.path.join(traj, "data"))
     rng = np.random.default_rng(8)
     for i in range(n):
-        P.solver_df_to_realspace(_spectral_df(rng)).tofile(
-            os.path.join(traj, "data", f"timestep_{i:05d}.bin")
-        )
+        F.spec_to_df(_spectral_df(rng)).tofile(os.path.join(traj, "data", f"timestep_{i:05d}.bin"))
         np.zeros((NKX, NS, NKY), np.float32).tofile(
             os.path.join(traj, "data", f"poten_{i:05d}.bin")
         )
@@ -208,7 +222,10 @@ def _synthetic_traj(root, n=3):
         "geometry": _geometry(),
         "timesteps": np.arange(n, dtype=float),
         "extra": "kept",
-        **{k: np.zeros((NKX, NS, NKY), np.float32) for k in P.PHI_STAT_KEYS},
+        **{
+            f"phi_{k}": np.zeros((NKX, NS, NKY), np.float32)
+            for k in ("mean", "var", "std", "min", "max")
+        },
         "df_mean": np.zeros(1, np.float32),
     }
     P.write_metadata(traj, meta)

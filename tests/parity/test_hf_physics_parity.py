@@ -19,11 +19,7 @@ def sample(hf_sample):
     from neugk_jax.dataset import CycloneDataset, H5Backend
 
     ds = CycloneDataset(path=hf_sample.root, trajectories=[hf_sample.name], backend=H5Backend())
-    return (
-        np.asarray(ds._get_ae_sample(0, 0).df, np.float32),
-        ds.metadata[0]["geometry"],
-        ds.get_ds(0),
-    )
+    return (np.asarray(ds.sample(0, 0).df, np.float32), ds.metadata[0]["geometry"], ds.get_ds(0))
 
 
 def test_flux_integral_matches_torch(sample):

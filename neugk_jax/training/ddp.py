@@ -76,6 +76,13 @@ def init_distributed(*, axis_name: str = "dp") -> DistributedInfo:
     )
 
 
+def barrier(name: str) -> None:
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+
+        multihost_utils.sync_global_devices(name)
+
+
 def global_batch_size(dist: DistributedInfo, per_device: int) -> int:
     return per_device * dist.device_count
 
@@ -108,8 +115,7 @@ def _assemble(x, sharding: NamedSharding, n_rows_global: int):
 
 def _put_rows(tree, mesh: Mesh, n_procs: int):
     if mesh.size == 1:
-        dev = mesh.devices.flat[0]
-        return jax.tree_util.tree_map(lambda x: jax.device_put(x, dev) if _is_array(x) else x, tree)
+        return _put(tree, mesh.devices.flat[0])
     sharding = NamedSharding(mesh, P(mesh.axis_names[0]))
     return jax.tree_util.tree_map(
         lambda x: _assemble(x, sharding, x.shape[0] * n_procs) if _is_array(x) else x, tree
@@ -130,16 +136,20 @@ def _replicated_sharding(mesh: Mesh):
     return NamedSharding(mesh, P())
 
 
+def _put(tree, sharding):
+    return jax.tree_util.tree_map(
+        lambda x: jax.device_put(x, sharding) if _is_array(x) else x, tree
+    )
+
+
 def replicate(dist: DistributedInfo, tree):
-    rep = _replicated_sharding(dist.mesh)
     if dist.num_processes > 1:
         tree = jax.device_get(tree)
-    return jax.tree_util.tree_map(lambda x: jax.device_put(x, rep) if _is_array(x) else x, tree)
+    return _put(tree, _replicated_sharding(dist.mesh))
 
 
 def replicate_local(dist: DistributedInfo, tree):
-    rep = _replicated_sharding(dist.local_mesh)
-    return jax.tree_util.tree_map(lambda x: jax.device_put(x, rep) if _is_array(x) else x, tree)
+    return _put(tree, _replicated_sharding(dist.local_mesh))
 
 
 def local_view(dist: DistributedInfo, tree):

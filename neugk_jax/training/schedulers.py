@@ -15,12 +15,7 @@ import optax
 
 
 def warmup_cosine(
-    *,
-    peak_lr: float,
-    total_steps: int,
-    steps_per_epoch: int,
-    n_epochs: int,
-    min_lr: float = 1e-6,
+    *, peak_lr: float, total_steps: int, steps_per_epoch: int, n_epochs: int, min_lr: float = 1e-6
 ) -> optax.Schedule:
     if n_epochs > 150:
         n_warmup = max(1, total_steps // 6)

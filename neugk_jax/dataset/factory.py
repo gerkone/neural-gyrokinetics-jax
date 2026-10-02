@@ -4,18 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
-from neugk_jax.dataset.backend import H5Backend, KvikIOBackend, NumpyBackend
-from neugk_jax.dataset.cyclone import CycloneDataset
-from neugk_jax.utils import config_dict
-
-
-def make_backend(dcfg, *, local_rank: int = 0, prefer_dtype: Optional[str] = None):
-    name = dcfg.get("backend", "kvikio")
-    if name == "kvikio":
-        return KvikIOBackend(rank=local_rank, prefer_dtype=prefer_dtype)
-    if name == "h5":
-        return H5Backend()
-    return NumpyBackend(prefer_dtype=prefer_dtype)
+from neugk_jax.dataset.backend import make_backend
+from neugk_jax.dataset.cyclone import DEFAULT_CONDITIONS, CycloneDataset
+from neugk_jax.utils import to_dict
 
 
 def build_dataset(
@@ -34,11 +25,19 @@ def build_dataset(
 
     ``stats`` (an already loaded ``CycloneDataset.stats``) replaces
     ``normalization_stats`` so the pickle is read once per run.
-    ``lightweight_metadata`` defaults on when normalization stats are given.
+    ``lightweight_metadata`` (read ``metadata_light``, without the per-trajectory df
+    moments) defaults on when normalization stats are given.
     """
     norm_stats = dcfg.get("normalization_stats")
     if norm_stats is not None and not isinstance(norm_stats, str):
-        norm_stats = config_dict(norm_stats)
+        norm_stats = to_dict(norm_stats)
+    normalization = to_dict(dcfg.get("normalization")) or None
+    lightweight = bool(dcfg.get("lightweight_metadata", norm_stats is not None))
+    if lightweight and normalization is not None and norm_stats is None:
+        raise ValueError(
+            "lightweight_metadata drops the per-trajectory df moments; set "
+            "normalization_stats or disable it"
+        )
     trajectories = dcfg.training_trajectories if split == "train" else dcfg.validation_trajectories
     filters = dcfg.get("training_cond_filters" if split == "train" else "eval_cond_filters")
     kwargs = dict(
@@ -47,24 +46,23 @@ def build_dataset(
         trajectories=trajectories if isinstance(trajectories, str) else list(trajectories),
         fields_to_load=tuple(fields or dcfg.get("input_fields", ("df",))),
         conditions=tuple(
-            conditions
-            if conditions is not None
-            else dcfg.get("conditions", ("itg", "dg", "s_hat", "q"))
+            conditions if conditions is not None else dcfg.get("conditions", DEFAULT_CONDITIONS)
         ),
         mode=mode,
         separate_zf=bool(dcfg.get("separate_zf", False)),
-        real_potens=bool(dcfg.get("real_potens", True)),
-        normalization=config_dict(dcfg.get("normalization")) or None,
+        normalization=normalization,
         normalization_scope=dcfg.get("normalization_scope", "dataset"),
         normalization_stats=stats if stats is not None else norm_stats,
         offset=int(dcfg.get("offset", 0)),
         subsample=int(
             dcfg.get("subsample", 1) if split == "train" else dcfg.get("val_subsample", 1)
         ),
-        cond_filters=config_dict(filters) or None,
-        lightweight_metadata=bool(dcfg.get("lightweight_metadata", norm_stats is not None)),
+        cond_filters=to_dict(filters) or None,
         backend=make_backend(
-            dcfg, local_rank=dist.local_rank if dist else 0, prefer_dtype=prefer_dtype
+            dcfg,
+            local_rank=dist.local_rank if dist else 0,
+            prefer_dtype=prefer_dtype,
+            lightweight_metadata=lightweight,
         ),
         rank=dist.process_id if dist else 0,
     )

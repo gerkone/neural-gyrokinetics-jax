@@ -13,22 +13,22 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-import equinox as eqx
 import jax
+import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
-from neugk_jax.diffusion.flow_matching import euler_sample
+from neugk_jax.diffusion.flow_matching import dit_flow_loss, euler_sample
 from neugk_jax.evaluate.base import (
     BaseEvaluator,
     accumulate,
     integrate,
-    per_sample_mse,
-    per_sample_rel_l2,
+    recon_metrics,
+    validation_cfg,
 )
 from neugk_jax.training.data import stack_fields
 from neugk_jax.training.ddp import replicate_local
-from neugk_jax.utils import count_trace, recombine_zf
+from neugk_jax.utils import traced_jit
 
 _TRAJ_RE = re.compile(r"iteration_\d+")
 
@@ -38,7 +38,7 @@ def _traj_id(path: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def _sample_decode(dit, ae, key, cond, n, steps, latent_scale, method):
+def _sample_decode(dit, ae, key, cond, n, steps, latent_scale):
     z = euler_sample(
         lambda x, t, c=None: dit(x, t, c),
         key=key,
@@ -46,35 +46,62 @@ def _sample_decode(dit, ae, key, cond, n, steps, latent_scale, method):
         cond=cond,
         steps=steps,
         latent_scale=latent_scale,
-        method=method,
     )
     return jax.vmap(lambda zi: ae.decode(zi)["df"])(z)
 
 
-@eqx.filter_jit
-def sample_and_decode(
-    dit, ae, key, cond, n: int, steps: int = 50, latent_scale: float = 1.0, method: str = "euler"
-):
-    count_trace("sample_and_decode")
-    return _sample_decode(dit, ae, key, cond, n, steps, latent_scale, method)
-
-
-@eqx.filter_jit
-def diffusion_eval_step(
-    dit, ae, key, batch, acc, denorm, geom, steps: int, latent_scale: float, method: str
-):
-    count_trace("diffusion_eval_step")
+@traced_jit("diffusion_eval_step")
+def diffusion_eval_step(dit, ae, key, batch, acc, norm, geom, steps: int, latent_scale: float):
     x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
-    pred = _sample_decode(dit, ae, key, batch.get("cond"), x.shape[0], steps, latent_scale, method)
-    pred_d, tgt_d = denorm("df", pred, fids), denorm("df", x, fids)
-    values = {
-        "df_mse": per_sample_mse(pred, x),
-        "df_rel_l2": per_sample_rel_l2(recombine_zf(pred_d, axis=1), recombine_zf(tgt_d, axis=1)),
-    }
+    pred = _sample_decode(dit, ae, key, batch.get("cond"), x.shape[0], steps, latent_scale)
+    pred_d, tgt_d = norm.denormalize("df", pred, fids), norm.denormalize("df", x, fids)
     eflux = None
     if geom is not None:
         _, (_, eflux, _) = integrate(geom, fids, pred_d)
-    return accumulate(acc, values, mask), eflux, pred_d, tgt_d
+    return accumulate(acc, recon_metrics(pred, x, pred_d, tgt_d), mask), eflux, pred_d, tgt_d
+
+
+@traced_jit("fm_val_step")
+def fm_val_step(model, tables, batch, acc, key, latent_scale: float, use_ot: bool):
+    idx, mask, cond = batch["idx"], batch["mask"], tables["cond"]
+    loss = dit_flow_loss(
+        model,
+        tables["latents"][idx],
+        None if cond is None else cond[idx],
+        key,
+        latent_scale=latent_scale,
+        use_ot=use_ot,
+        train=False,
+        mask=mask,
+    )
+    n = jnp.sum(mask)
+    return {"fm_loss": acc["fm_loss"] + loss * n, "_n": acc["_n"] + n}
+
+
+class FlowLossEvaluator(BaseEvaluator):
+    """Flow-matching loss over the latent validation set with a fixed noise key.
+
+    ``tables`` holds the device ``latents`` and ``cond`` of ``val_ds`` in flat-index order;
+    batches carry only their indices, so nothing is read from disk.
+    """
+
+    def __init__(
+        self, cfg: Any, *, tables: dict, latent_scale: float, use_ot: bool, seed: int, **kw
+    ):
+        super().__init__(cfg, **kw)
+        self.tables = replicate_local(self.dist, tables)
+        self.latent_scale = float(latent_scale)
+        self.use_ot = use_ot
+        self.key = jr.fold_in(jr.PRNGKey(seed), len(self.ds))
+
+    def __call__(self, model: Any, *, epoch: int) -> tuple[dict[str, float], dict[str, Any]]:
+        model = self.local_model(model)
+        acc = self.zeros(("fm_loss", "_n"))
+        for plan in self.plans:
+            batch = self.place({"idx": plan.indices.astype(np.int32), "mask": plan.mask})
+            key = jr.fold_in(self.key, plan.number)
+            acc = fm_val_step(model, self.tables, batch, acc, key, self.latent_scale, self.use_ot)
+        return self.finalize(self.reduce(acc), ("fm_loss",)), {}
 
 
 class DiffusionEvaluator(BaseEvaluator):
@@ -86,6 +113,8 @@ class DiffusionEvaluator(BaseEvaluator):
     ``validation.eval_sample_steps`` / ``eval_n_samples`` / ``eval_stride`` /
     ``eval_max_batches``.
     """
+
+    integrals_default = True
 
     def __init__(
         self,
@@ -99,17 +128,15 @@ class DiffusionEvaluator(BaseEvaluator):
         n_samples: Optional[int] = None,
         stride: Optional[int] = None,
         max_batches: Optional[int] = None,
-        method: str = "euler",
         **kwargs,
     ):
-        vcfg = (cfg.get("validation") if hasattr(cfg, "get") else None) or {}
+        vcfg = validation_cfg(cfg)
         stride = int(stride or vcfg.get("eval_stride", 1))
-        max_batches = max_batches if max_batches is not None else vcfg.get("eval_max_batches")
         super().__init__(
             cfg,
             val_ds=val_ds,
             indices=range(0, len(val_ds), stride),
-            max_batches=max_batches,
+            max_batches=max_batches if max_batches is not None else vcfg.get("eval_max_batches"),
             **kwargs,
         )
         self.ae = replicate_local(self.dist, autoencoder)
@@ -117,8 +144,6 @@ class DiffusionEvaluator(BaseEvaluator):
         self.cond_slots = cond_slots
         self.steps = int(steps or self.vcfg.get("eval_sample_steps", 50))
         self.n_samples = int(n_samples or self.vcfg.get("eval_n_samples", 1))
-        self.method = method
-        self.eval_integrals = bool(self.vcfg.get("eval_integrals", True))
         self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
         self.metric_keys = ("df_mse", "df_rel_l2")
         self.traj_ids = [_traj_id(f) for f in val_ds.files]
@@ -131,7 +156,7 @@ class DiffusionEvaluator(BaseEvaluator):
         return batch
 
     def __call__(self, model: Any, *, epoch: int) -> tuple[dict[str, float], dict[str, Any]]:
-        from neugk_jax.evaluate.plots import avg_flux_confidence, generate_val_plots
+        from neugk_jax.evaluate.plots import generate_val_plots
 
         model = self.local_model(model)
         geom = self.geometry if self.eval_integrals else None
@@ -139,68 +164,45 @@ class DiffusionEvaluator(BaseEvaluator):
         key = jr.PRNGKey(epoch)
         fluxes, plots, spectra = [], {}, {}
         for plan, batch, _ in self.loader.iterate(self.ds, self.plans, self.load, self.place):
-            fids = np.asarray(
-                [self.ds.flat_index_to_file_and_tstep[int(i)][0] for i in plan.indices]
-            )
             for s in range(self.n_samples):
                 k = jr.fold_in(jr.fold_in(key, plan.number), s)
                 acc, eflux, pred_d, tgt_d = diffusion_eval_step(
-                    model,
-                    self.ae,
-                    k,
-                    batch,
-                    acc,
-                    self.denorm,
-                    geom,
-                    self.steps,
-                    self.latent_scale,
-                    self.method,
+                    model, self.ae, k, batch, acc, self.norm, geom, self.steps, self.latent_scale
                 )
                 if eflux is not None:
-                    fluxes.append((fids, plan.mask, eflux))
+                    fluxes.append((plan, eflux))
                 if self.eval_spectra:
-                    self._spectra(spectra, pred_d, tgt_d, fids, plan.mask)
+                    self.spectra(spectra, pred_d, tgt_d, plan)
             if plan.number == 0 and self.is_rank0:
-                ts = np.asarray(jax.device_get(batch["timestep"][:1])).reshape(-1)
+                gt = {"df": tgt_d[0]}
                 plots.update(
                     generate_val_plots(
-                        rollout={"df": pred_d[0]}, gt={"df": tgt_d[0]}, phase="val sample", ts=ts
+                        {"df": pred_d[0]}, gt, "val sample", ts=self.plot_time(batch)
                     )
                 )
-        sums = self.reduce({**acc, **self._traj_sums(fluxes)})
-        metrics = {k: sums[k] / max(sums["_n"], 1.0) for k in self.metric_keys}
+        metrics = self.finalize(self.reduce(acc), self.metric_keys)
         if self.eval_spectra:
             metrics.update(self.spectral_metrics(spectra))
         if self.eval_integrals:
-            metrics.update(self._flux_metrics(sums, plots, avg_flux_confidence))
+            metrics.update(self._flux_metrics(fluxes, plots))
         return metrics, plots
 
-    def _traj_sums(self, fluxes) -> dict:
-        # per-trajectory sum, square sum and count of the sampled fluxes, one fixed key per val file
-        if not self.eval_integrals:
-            return {}
-        out = {}
-        host = jax.device_get([e for _, _, e in fluxes])
-        for f in range(len(self.ds.files)):
-            vals = np.concatenate(
-                [np.asarray(e)[(fids == f) & (m > 0)] for (fids, m, _), e in zip(fluxes, host)]
-                or [np.zeros(0)]
-            )
-            vals = vals.astype(np.float64)
-            out[f"_flux_sum/{f}"] = float(vals.sum())
-            out[f"_flux_sq/{f}"] = float((vals**2).sum())
-            out[f"_flux_n/{f}"] = float(len(vals))
-        return out
+    def _flux_metrics(self, fluxes: list, plots: dict) -> dict:
+        from neugk_jax.evaluate.plots import avg_flux_confidence
 
-    def _flux_metrics(self, sums, plots, confidence_plot) -> dict:
-        fids = [f for f in range(len(self.ds.files)) if sums.get(f"_flux_n/{f}", 0) > 0]
-        if not fids:
+        # per trajectory: sum, square sum and count of the sampled fluxes of every process
+        traj = np.zeros((len(self.ds.files), 3), np.float64)
+        for (plan, _), e in zip(fluxes, jax.device_get([e for _, e in fluxes])):
+            valid = plan.mask > 0
+            e = np.asarray(e, np.float64)[valid]
+            np.add.at(traj, plan.fids[valid], np.stack([e, e**2, np.ones_like(e)], -1))
+        traj = self.sum_process_arrays(traj)
+        fids = np.nonzero(traj[:, 2] > 0)[0]
+        if not len(fids):
             return {}
-        n = np.asarray([sums[f"_flux_n/{f}"] for f in fids])
-        mean = np.asarray([sums[f"_flux_sum/{f}"] for f in fids]) / n
-        std = np.sqrt(
-            np.maximum(np.asarray([sums[f"_flux_sq/{f}"] for f in fids]) / n - mean**2, 0)
-        )
+        flux_sum, flux_sq, n = traj[fids].T
+        mean = flux_sum / n
+        std = np.sqrt(np.maximum(flux_sq / n - mean**2, 0))
         tgt = np.asarray([self.ds.get_avg_flux(f) for f in fids])
         names = [self.traj_ids[f] or str(f) for f in fids]
         out = {
@@ -217,10 +219,5 @@ class DiffusionEvaluator(BaseEvaluator):
                 float(np.cov(mean, tgt)[0, 1] / var) if var > 0 else float("nan")
             )
         if self.is_rank0:
-            plots["avg_flux_UQ"] = confidence_plot(mean, std, tgt, names)
+            plots["avg_flux_UQ"] = avg_flux_confidence(mean, std, tgt, names)
         return out
-
-    def _spectra(self, store, pred_d, tgt_d, fids, mask) -> None:
-        from neugk_jax.evaluate.metrics import accumulate_spectral_diagnostics
-
-        accumulate_spectral_diagnostics(store, pred_d, tgt_d, fids, self.ds, valid=mask > 0)

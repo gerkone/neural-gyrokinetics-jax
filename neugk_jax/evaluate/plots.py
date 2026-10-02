@@ -16,14 +16,9 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 
-from neugk_jax.utils import recombine_zf as _recombine_zf
+from neugk_jax.utils import recombine_zf
 
-GK_LABELS = {
-    6: [r"t", r"v_{\parallel}", r"\mu", r"s", r"k_x", r"k_y"],
-    5: [r"v_{\parallel}", r"\mu", r"s", r"k_x", r"k_y"],
-    4: [r"v_{\parallel}", r"s", r"k_x", r"k_y"],
-    3: [r"k_x", r"s", r"k_y"],
-}
+GK_LABELS = {5: [r"v_{\parallel}", r"\mu", r"s", r"k_x", r"k_y"], 3: [r"k_x", r"s", r"k_y"]}
 
 
 def _force_aspect(ax, aspect: float = 1.0):
@@ -50,78 +45,28 @@ def _plt_to_wandb_image(fig):
     return wandb.Image(img)
 
 
-def plot_nd(
-    x: np.ndarray,
-    y: Optional[np.ndarray] = None,
-    *,
-    labels: Optional[list[str]] = None,
-    cmap: str = "RdBu_r",
-    aggregate: str = "mean",
-    aspect: float = 1.0,
-    mark_bad: bool = False,
-    to_wandb: bool = False,
-):
+def plot_nd(x: np.ndarray, y: Optional[np.ndarray] = None, *, cmap: str = "RdBu_r"):
     """Upper-triangular grid of 2D projections, one per axis pair.
 
     ``x`` (and optional ``y``) are arrays with shape ``(C?, *spatial)``, numpy or
-    device arrays. Each subplot in the upper triangle aggregates the non-displayed
-    spatial axes (default: mean) and shows the resulting 2D slice; only those
-    slices are brought to host. When ``y`` is provided each subplot becomes a
-    side-by-side (pred | gt).
+    device arrays; a 5- or 6-dimensional array carries a leading channel axis. Each
+    subplot in the upper triangle averages the non-displayed spatial axes and shows the
+    resulting 2D slice; only those slices are brought to host. When ``y`` is provided
+    each subplot becomes a side-by-side (pred | gt).
     """
-
-    # detect spatial dims + optional leading channel
-    if labels is not None:
-        ndim = len(labels)
-        has_channel = x.ndim > ndim
-    else:
-        if x.ndim in (5, 6):
-            ndim = x.ndim - 1
-            has_channel = True
-        else:
-            ndim = x.ndim
-            has_channel = False
-
-    if ndim < 2:
-        # 1D: just plot a line
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(np.asarray(x).ravel(), label="x")
-        if y is not None:
-            ax.plot(np.asarray(y).ravel(), label="y", linestyle="--")
-            ax.legend()
-        return _plt_to_wandb_image(fig) if to_wandb else fig
-
-    if labels is None:
-        labels = GK_LABELS.get(ndim, [f"d_{i}" for i in range(ndim)])
-
+    has_channel = x.ndim in (5, 6)
+    ndim = x.ndim - 1 if has_channel else x.ndim
+    labels = GK_LABELS.get(ndim, [f"d_{i}" for i in range(ndim)])
     comb = [list(c) for c in combinations(range(ndim), 2)]
     fig, axes = plt.subplots(
-        ndim,
-        ndim,
-        figsize=(ndim * (3.5 if y is not None else 2), ndim * 1.8),
-        squeeze=False,
+        ndim, ndim, figsize=(ndim * (3.5 if y is not None else 2), ndim * 1.8), squeeze=False
     )
     cmap_obj = matplotlib.colormaps[cmap].copy()
     cmap_obj.set_bad("gray")
 
     def _aggregate(data, other_dims):
         d = data.sum(0) if has_channel and data.ndim > ndim else data
-        if aggregate == "mean":
-            res = d.mean(axis=other_dims)
-        elif aggregate == "std":
-            res = d.std(axis=other_dims)
-        elif aggregate == "slice":
-            slices = [slice(None)] * ndim
-            for o in other_dims:
-                slices[o] = d.shape[o] // 2
-            res = d[tuple(slices)]
-        else:
-            res = d.mean(axis=other_dims)
-        res = np.asarray(res)
-        if mark_bad:
-            s = np.asarray(d.std(axis=other_dims))
-            res = np.where(s == 0, np.nan, res)
-        return res
+        return np.asarray(d.mean(axis=other_dims))
 
     for i in range(ndim):
         for j in range(ndim):
@@ -146,10 +91,10 @@ def plot_nd(
                 ax.set_xlabel(rf"${labels[j]}$", fontsize=22, labelpad=2)
             ax.set_xticks([])
             ax.set_yticks([])
-            _force_aspect(ax, aspect=aspect * (2.1 if y is not None else 1.0))
+            _force_aspect(ax, aspect=2.1 if y is not None else 1.0)
 
     plt.subplots_adjust(left=0.01, right=0.99, bottom=0.01, top=0.99, wspace=0, hspace=0)
-    return _plt_to_wandb_image(fig) if to_wandb else fig
+    return fig
 
 
 def generate_val_plots(
@@ -158,7 +103,6 @@ def generate_val_plots(
     phase: str,
     *,
     ts: Optional[np.ndarray] = None,
-    to_wandb: bool = True,
 ) -> dict[str, object]:
     """Cross-section panels for validation.
 
@@ -177,25 +121,14 @@ def generate_val_plots(
             continue
         x, y = rollout[key], gt[key]
         if cfg["recombine"]:
-            if y.shape[0] != 2:
-                y = _recombine_zf(y, axis=0)
-            axis = 1 if x.ndim == 7 else 0
-            if x.shape[axis] != 2:
-                x = _recombine_zf(x, axis=axis)
-        if x.ndim == 7:
-            x = x[0]
+            x, y = recombine_zf(x, axis=0), recombine_zf(y, axis=0)
         x, y = x.squeeze(), y.squeeze()
-        fig = plot_nd(x, y, cmap=cfg["cmap"])
-        plots[cfg["name"]] = _plt_to_wandb_image(fig) if to_wandb else fig
+        plots[cfg["name"]] = _plt_to_wandb_image(plot_nd(x, y, cmap=cfg["cmap"]))
     return plots
 
 
 def avg_flux_confidence(
-    pred_means: np.ndarray,
-    pred_stds: np.ndarray,
-    tgt_vals: np.ndarray,
-    traj_ids: list,
-    to_wandb: bool = True,
+    pred_means: np.ndarray, pred_stds: np.ndarray, tgt_vals: np.ndarray, traj_ids: list
 ):
     """Per-trajectory flux mean ± std vs ground truth."""
     fig, ax = plt.subplots(figsize=(12, 6), constrained_layout=True)
@@ -221,4 +154,4 @@ def avg_flux_confidence(
     ax.set_ylim(bottom=0)
     ax.legend(frameon=True, loc="upper right")
     ax.grid(True, axis="y", alpha=0.3, ls="--")
-    return _plt_to_wandb_image(fig) if to_wandb else fig
+    return _plt_to_wandb_image(fig)

@@ -44,7 +44,7 @@ def _toy_ae(key):
 
 def test_save_model_only_roundtrip(tmp_path):
     ae = _toy_ae(jr.PRNGKey(0))
-    x = jr.normal(jr.PRNGKey(1), (2, 2, *ae.backbone.full_resolution))
+    x = jr.normal(jr.PRNGKey(1), (2, 2, 4, 4, 4, 16, 8))
     out_before = jax.vmap(lambda xi: ae(xi)["df"])(x)
 
     path = tmp_path / "ae.eqx"
@@ -58,7 +58,7 @@ def test_save_model_only_roundtrip(tmp_path):
 def test_full_checkpoint_roundtrip(tmp_path):
     """Full training-state snapshot: model + opt state + epoch + loss."""
     ae = _toy_ae(jr.PRNGKey(0))
-    x = jr.normal(jr.PRNGKey(1), (2, 2, *ae.backbone.full_resolution))
+    x = jr.normal(jr.PRNGKey(1), (2, 2, 4, 4, 4, 16, 8))
     out_before = jax.vmap(lambda xi: ae(xi)["df"])(x)
 
     # fake opt state — just a pytree mirroring the model leaves

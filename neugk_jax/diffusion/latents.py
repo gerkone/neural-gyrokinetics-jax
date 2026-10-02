@@ -19,24 +19,17 @@ from typing import Callable, Optional
 import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.utils import RunningMeanStd
-
-
-def _tqdm(*args, **kwargs):
-    try:
-        from tqdm import tqdm
-
-        return tqdm(*args, **kwargs)
-    except ImportError:
-        return args[0] if args else iter(())
+from neugk_jax.dataset.cyclone import COND_META_KEYS
+from neugk_jax.training.ddp import barrier
+from neugk_jax.utils import RunningStats, atomic_write, progress
 
 
 def latent_cache_path(
-    dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False, timestep_std_filter=None
+    dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False
 ) -> Path:
     """Cache file for a split's latents.
 
-    ``<path>/diff_<split>_latents_offset<o>[_mu][_std<f>]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
+    ``<path>/diff_<split>_latents_offset<o>[_mu]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
     where ``<run>`` is the last ``_`` field of the AE run directory (a checkpoint file resolves
     to its directory).
     """
@@ -50,7 +43,6 @@ def latent_cache_path(
         f"{split}_latents",
         f"offset{dataset.offset}",
         "mu" if decouple_mu else "",
-        f"std{timestep_std_filter}" if timestep_std_filter else "",
         file_hash,
         "latents",
         "ae" + run_dir.split("_")[-1],
@@ -81,10 +73,8 @@ def latent_cache_meta(
 
 
 def write_cache_meta(cache_file: str | Path, meta: dict) -> None:
-    path = cache_meta_path(cache_file)
-    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(meta, indent=2, sort_keys=True))
-    os.replace(tmp, path)
+    text = json.dumps(meta, indent=2, sort_keys=True)
+    atomic_write(cache_meta_path(cache_file), lambda f: f.write(text), mode="w")
 
 
 def check_cache_meta(cache_file: str | Path, meta: Optional[dict]) -> None:
@@ -109,22 +99,12 @@ def check_cache_meta(cache_file: str | Path, meta: Optional[dict]) -> None:
         )
 
 
-def _barrier(name: str) -> None:
-    import jax
-
-    if jax.process_count() > 1:
-        from jax.experimental import multihost_utils
-
-        multihost_utils.sync_global_devices(name)
-
-
 def precompute_latents(
     dataset,
     *,
     encode_fn: Callable,
     cache_file: str | Path,
     batch_size: int = 4,
-    overwrite: bool = False,
     meta: Optional[dict] = None,
     latent_shape=None,
 ) -> None:
@@ -141,32 +121,31 @@ def precompute_latents(
     import jax
 
     cache_file = Path(cache_file)
-    if (overwrite or not cache_file.exists()) and jax.process_index() == 0:
+    if not cache_file.exists() and jax.process_index() == 0:
         latents_dict = _encode_all(dataset, encode_fn, batch_size)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_file.with_name(cache_file.name + f".tmp{os.getpid()}")
-        with open(tmp, "wb") as f:
-            pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
         if meta is not None:
             write_cache_meta(cache_file, meta)
-        os.replace(tmp, cache_file)
-    _barrier(f"latents:{cache_file.name}")
+        atomic_write(
+            cache_file, lambda f: pickle.dump(latents_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+    barrier(f"latents:{cache_file.name}")
     load_precomputed_latents(dataset, cache_file, latent_shape=latent_shape, meta=meta)
 
 
 def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
+    from neugk_jax.training.data import eval_plans, stack_fields
+
     latents_dict: dict[tuple[int, int], dict] = {}
-    n = len(dataset)
-    for start in _tqdm(range(0, n, batch_size), desc=f"precompute {dataset.split} latents"):
-        samples = [dataset[i] for i in range(start, min(start + batch_size, n))]
-        # pad the tail so the encoder sees one batch shape
-        padded = samples + [samples[-1]] * (batch_size - len(samples))
-        df_batch = jnp.stack([jnp.asarray(s.df) for s in padded])
-        cond_batch = None
-        if samples[0].conditioning is not None:
-            cond_batch = jnp.stack([jnp.asarray(s.conditioning) for s in padded])
-        z_np = np.asarray(encode_fn(df_batch, cond_batch))
-        for b, s in enumerate(samples):
+    # the tail batch repeats its last sample so the encoder sees one batch shape
+    plans = eval_plans(None, range(len(dataset)), batch_size)
+    for plan in progress(plans, True, desc=f"precompute {dataset.split} latents"):
+        samples = [dataset[int(i)] for i in plan.indices]
+        batch = {
+            k: jnp.asarray(v) for k, v in stack_fields(samples, ("df", "conditioning")).items()
+        }
+        z_np = np.asarray(encode_fn(batch["df"], batch.get("conditioning")))
+        for b, s in enumerate(samples[: int(plan.mask.sum())]):
             entry = {
                 "x": z_np[b],
                 "phi": np.asarray(s.phi) if s.phi is not None else None,
@@ -183,21 +162,15 @@ def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
 
 def latent_arrays(dataset) -> tuple[np.ndarray, np.ndarray | None]:
     """Latents ``(N, *latent_shape)`` and conditioning ``(N, n_cond)`` in flat-index order."""
-    n = len(dataset)
-    keys = [dataset.flat_index_to_file_and_tstep[i] for i in range(n)]
+    keys = [dataset.flat_index_to_file_and_tstep[i] for i in range(len(dataset))]
     z = np.stack([np.asarray(dataset.precomputed_latents[k]["x"], np.float32) for k in keys])
     if not dataset.conditions:
         return z, None
-    return z, np.stack([np.asarray(dataset[i].conditioning, np.float32) for i in range(n)])
+    return z, np.stack([dataset.conditioning(f, dataset.get_timestep(f, t)) for f, t in keys])
 
 
 def load_precomputed_latents(
-    dataset,
-    pickle_path: str | Path,
-    *,
-    remap: bool = True,
-    latent_shape=None,
-    meta: Optional[dict] = None,
+    dataset, pickle_path: str | Path, *, latent_shape=None, meta: Optional[dict] = None
 ) -> None:
     """Populate ``dataset.precomputed_latents`` from a cache pickle and switch to ``mode="diff"``.
 
@@ -207,8 +180,8 @@ def load_precomputed_latents(
     (see :func:`check_cache_meta`). The cache is verified against this dataset: every
     indexed ``(fid, t_idx)`` must be present, the scalar conditions it carries must agree
     with the trajectory metadata and the latents must have ``latent_shape`` when given.
-    With ``remap`` a cache keyed by a different file ordering is re-keyed onto this
-    dataset's fids (see :func:`remap_latent_cache`) instead of failing.
+    A cache keyed by a different file ordering is re-keyed onto this dataset's fids
+    (see :func:`remap_latent_cache`) instead of failing.
     """
     p = Path(pickle_path)
     if not p.exists():
@@ -219,16 +192,11 @@ def load_precomputed_latents(
     try:
         verify_latent_cache(dataset, cache)
     except ValueError:
-        if not remap:
-            raise
         cache = remap_latent_cache(dataset, cache)
     verify_latent_cache(dataset, cache, latent_shape=latent_shape)
     dataset.precomputed_latents = cache
     dataset.mode = "diff"
     _compute_latent_stats(dataset)
-
-
-_COND_ALIASES = {"itg": "ion_temp_grad", "dg": "density_grad", "s_hat": "s_hat", "q": "q"}
 
 
 def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
@@ -240,11 +208,11 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     """
 
     def _tuple_of(get):
-        return np.array([float(np.squeeze(get(k))) for k in ("itg", "dg", "s_hat", "q")])
+        return np.array([float(np.squeeze(get(k))) for k in COND_META_KEYS])
 
     ours = {}
     for fid, meta in dataset.metadata.items():
-        key = tuple(np.round(_tuple_of(lambda k: meta[_COND_ALIASES[k]]), 6))
+        key = tuple(np.round(_tuple_of(lambda k: meta[COND_META_KEYS[k]]), 6))
         if key in ours:
             raise ValueError(
                 f"trajectories {ours[key]} and {fid} share conditions {key}; "
@@ -259,7 +227,7 @@ def remap_latent_cache(dataset, cache: dict, *, tol: float = 1e-3) -> dict:
     mapping: dict[int, int] = {}
     for cfid in cache_fids:
         entry = cache[(cfid, steps[cfid][0])]
-        if not all(k in entry for k in _COND_ALIASES):
+        if not all(k in entry for k in COND_META_KEYS):
             raise ValueError("cache entries carry no scalar conditions; cannot remap")
         d = np.abs(keys - _tuple_of(lambda k: entry[k])).max(axis=1)
         j = int(np.argmin(d))
@@ -304,11 +272,10 @@ def verify_latent_cache(dataset, cache: dict, *, latent_shape=None) -> None:
             f"latent cache shape {tuple(x.shape)} != model latent {tuple(latent_shape)}"
         )
     # the scalar conditions pin the fid -> trajectory mapping
-    aliases = _COND_ALIASES
     bad = []
     for fid in sorted({k[0] for k in wanted}):
         entry = cache[(fid, sorted(t for f, t in wanted if f == fid)[0])]
-        for short, meta_key in aliases.items():
+        for short, meta_key in COND_META_KEYS.items():
             if short not in entry:
                 continue
             want = float(np.squeeze(dataset.metadata[fid][meta_key]))
@@ -324,14 +291,8 @@ def verify_latent_cache(dataset, cache: dict, *, latent_shape=None) -> None:
 
 def _compute_latent_stats(dataset) -> None:
     """Running stats over all cached latents — used to scale by 1/std at train time."""
-    stats = None
+    stats = RunningStats(prior_count=0.0)
     for s in dataset.precomputed_latents.values():
         x = s["x"]
-        mean = np.mean(x, keepdims=True)
-        var = np.var(x, keepdims=True)
-        mn = np.min(x, keepdims=True)
-        mx = np.max(x, keepdims=True)
-        if stats is None:
-            stats = RunningMeanStd(shape=mean.shape)
-        stats.update(mean, var, mn, mx, count=1)
+        stats.merge(*(f(x, keepdims=True) for f in (np.mean, np.var, np.min, np.max)))
     dataset.latent_stats = stats

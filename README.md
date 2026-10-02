@@ -27,7 +27,7 @@ public data tests.
 - `neugk_jax/evaluate/` — base evaluator, flux integrals, spectral metrics
 - `configs/` — Hydra configs; `configs/checkpoints/` holds release model configs
 - `main.py` — Hydra entrypoint
-- `scripts/` — `translate_*ckpt.py`, `eval_diffusion.py`
+- `scripts/` — `translate_ckpt.py` (AE / DiT / GyroSwin), `eval_diffusion.py`
 - `docs/metrics.md` — validation metric definitions and renames
 - `tests/`
 

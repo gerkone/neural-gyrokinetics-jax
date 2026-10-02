@@ -156,8 +156,8 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     path, resolution = cyclone_dir
     ae_cfg = _tiny_ae_cfg(path, resolution)
     # build + save a tiny ae so the fm runner has something to load
+    from neugk_jax.models.build import build_ae_from_config
     from neugk_jax.training.checkpoint import save_model_only
-    from scripts.translate_ckpt import build_ae_from_config
 
     # FlowMatchingRunner expects ae config at <ae_ckpt_dir>/config.yaml with resolution for build_ae_from_config
     ae_dir = tmp_path / "ae_ckpt"

@@ -7,16 +7,10 @@ there directly — re-exporting it here would create a circular import via
 
 from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet, SwinNDUnet
-from neugk_jax.models.patching import (
-    PatchEmbed,
-    PatchExpand,
-    PatchMerge,
-    pad_to_blocks,
-    unpad,
-)
-from neugk_jax.models.swin import DiTSwinLayer, Film, SwinLayer
+from neugk_jax.models.patching import PatchEmbed, PatchExpand, PatchMerge, pad_to_blocks, unpad
+from neugk_jax.models.swin import BlockStack, Film, swin_layer
 from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, Linear
-from neugk_jax.models.vit import DiTLayer, LayerModes, ViTLayer
+from neugk_jax.models.vit import vit_layer
 
 __all__ = [
     "MLP",
@@ -31,11 +25,9 @@ __all__ = [
     "PatchExpand",
     "pad_to_blocks",
     "unpad",
-    "SwinLayer",
-    "DiTSwinLayer",
-    "ViTLayer",
-    "DiTLayer",
-    "LayerModes",
+    "BlockStack",
+    "swin_layer",
+    "vit_layer",
     "SwinNDUnet",
     "Swin5DUnet",
 ]

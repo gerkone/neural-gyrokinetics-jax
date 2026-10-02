@@ -44,44 +44,25 @@ def _zonal_profiles(phi_spec: np.ndarray, geom: Dict[str, np.ndarray]) -> Dict[s
     return {"zfphi": prof(zon), "zfflow": prof(1j * kx * zon), "zfshear": prof(-(kx**2) * zon)}
 
 
-def diagnostics(
-    phi_fft_: np.ndarray,
-    eflux_field: np.ndarray,
-    ds: float,
-    aggregate: str = "mid",
-) -> Dict[str, np.ndarray]:
+def diagnostics(phi_fft_: np.ndarray, eflux_field: np.ndarray, ds: float) -> Dict[str, np.ndarray]:
     """Turbulence diagnostics from the potential FFT and the heat-flux field.
 
-    The last three axes of ``phi_fft_`` are ``(nx, *, ny)``; ``kxspec``
-    sums the y axis, ``kyspec`` sums the x (``*``) axis. ``aggregate``
-    selects how the remaining nx axis is collapsed: ``"mean"`` sums it,
-    ``"mid"`` takes the central slice (index ``shape[-3] // 2``), ``"none"``
-    keeps it.
+    The last three axes of ``phi_fft_`` are ``(nx, *, ny)``; ``kxspec`` sums the y axis,
+    ``kyspec`` sums the x (``*``) axis, and both take the central nx slice
+    (index ``shape[-3] // 2``).
     """
-    diag: Dict[str, np.ndarray] = {}
     nx = phi_fft_.shape[-3]
     power = phi_fft_.real**2 + phi_fft_.imag**2
-
-    kxspec = power.sum(axis=-1) * ds  # reduce y -> (..., nx, mid)
-    kyspec = power.sum(axis=-2) * ds  # reduce mid -> (..., nx, ny)
-
-    def _agg(spec):  # collapse the nx axis (now at -2)
-        if aggregate == "mean":
-            return spec.sum(axis=-2)
-        if aggregate == "mid":
-            return np.take(spec, nx // 2, axis=-2)
-        return spec
-
-    diag["kxspec"] = _agg(kxspec)
-    diag["kyspec"] = _agg(kyspec)
-
-    # heat-flux spectrum: sum everything except the trailing wavenumber axis
-    diag["qspec"] = (
-        eflux_field.sum(axis=tuple(range(eflux_field.ndim - 1)))
-        if eflux_field.ndim >= 2
-        else eflux_field.sum()
-    )
-    return diag
+    return {
+        "kxspec": np.take(power.sum(axis=-1) * ds, nx // 2, axis=-2),
+        "kyspec": np.take(power.sum(axis=-2) * ds, nx // 2, axis=-2),
+        # heat-flux spectrum: sum everything except the trailing wavenumber axis
+        "qspec": (
+            eflux_field.sum(axis=tuple(range(eflux_field.ndim - 1)))
+            if eflux_field.ndim >= 2
+            else eflux_field.sum()
+        ),
+    }
 
 
 def spectral_diagnostics(
@@ -146,7 +127,7 @@ def metrics_from_spectral_sums(sums: Dict[str, np.ndarray]) -> Dict[str, float]:
         out[f"{key}_pc"] = float(_pearson(p, g))
         out[f"{key}_sc"] = float(_spearman(p, g))
         out[f"{key}_l1"] = float(np.abs(p - g).sum())
-        out[f"{key}_rl2"] = float(np.linalg.norm(p - g) / (np.linalg.norm(g) + 1e-12))
+        out[f"{key}_rl2"] = _rl2(p, g)
         out[f"{key}_rl1"] = float(np.abs(p - g).sum() / (np.abs(g).sum() + 1e-12))
         pn, gn = p / (p.sum() + 1e-12), g / (g.sum() + 1e-12)
         out[f"{key}_wd"] = float(_wasserstein_1d(pn, gn))
@@ -158,8 +139,7 @@ def metrics_from_spectral_sums(sums: Dict[str, np.ndarray]) -> Dict[str, float]:
 
 
 def time_averaged_spectral_metrics(
-    pred_diags: List[Dict[str, np.ndarray]],
-    gt_diags: List[Dict[str, np.ndarray]],
+    pred_diags: List[Dict[str, np.ndarray]], gt_diags: List[Dict[str, np.ndarray]]
 ) -> Dict[str, float]:
     """Spectral metrics of one trajectory's paired snapshot diagnostics."""
     return metrics_from_spectral_sums(spectral_sums(pred_diags, gt_diags))

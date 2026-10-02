@@ -121,7 +121,9 @@ def test_getitem_shapes(synthetic_dir):
     assert int(s.file_index) == 0
 
 
-def test_collate_batches(synthetic_dir):
+def test_stack_fields_batches(synthetic_dir):
+    from neugk_jax.training.data import stack_fields
+
     root, _ = synthetic_dir
     ds = CycloneDataset(
         path=str(root),
@@ -132,10 +134,13 @@ def test_collate_batches(synthetic_dir):
         mode="ae",
         backend=NumpyBackend(),
     )
-    batch = CycloneDataset.collate([ds[i] for i in range(3)])
-    assert batch.df.shape == (3, 2, *ds.resolution)
-    assert batch.conditioning.shape == (3, 4)
-    assert batch.flux.shape == (3,)
+    batch = stack_fields(
+        [ds[i] for i in range(3)], ("df", "conditioning", "flux", "file_index", "phi")
+    )
+    assert batch["df"].shape == (3, 2, *ds.resolution)
+    assert batch["conditioning"].shape == (3, 4)
+    assert batch["flux"].shape == (3,)
+    assert batch["file_index"].dtype == np.int32 and "phi" not in batch
 
 
 def test_normalize_denormalize_roundtrip(synthetic_dir):
@@ -149,12 +154,10 @@ def test_normalize_denormalize_roundtrip(synthetic_dir):
         normalization_scope="dataset",
         backend=NumpyBackend(),
     )
-    # craft a synthetic field of known mean/std and roundtrip through normalize
+    # craft a synthetic field of known mean/std and roundtrip through the table
     x = np.full((2, *ds.resolution), 5.0, dtype=np.float32)
-    z = ds.normalize(0, df=x)
-    scale, shift = ds.scale_shift([0], "df", x.ndim)
-    y = z * scale + shift
-    assert np.allclose(y, x, atol=1e-5)
+    z = ds.norm.normalize("df", x, 0)
+    assert np.allclose(ds.norm.denormalize("df", z, 0), x, atol=1e-5)
 
 
 def test_separate_zf_doubles_channels(synthetic_dir):
@@ -283,6 +286,6 @@ def test_normalized_field_without_stats_raises(synthetic_dir):
         normalization_stats={"df": {"full": {"mean": 0.0, "std": 1.0}}},
         backend=NumpyBackend(),
     )
-    ds.normalize(0, df=np.zeros((2, *ds.resolution), np.float32))
+    ds.norm.normalize("df", np.zeros((2, *ds.resolution), np.float32), 0)
     with pytest.raises(KeyError, match="flux"):
-        ds.normalize(0, flux=np.float32(1.0))
+        ds.norm.normalize("flux", np.float32(1.0), 0)

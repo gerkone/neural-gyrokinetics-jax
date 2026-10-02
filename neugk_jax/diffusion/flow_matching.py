@@ -22,6 +22,8 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
+from neugk_jax.losses import masked_mean, per_sample_mse
+
 
 def sample_prior(key, shape, dtype=jnp.float32):
     return jr.normal(key, shape, dtype=dtype)
@@ -97,41 +99,31 @@ def fm_forward_loss(
     pred = jax.vmap(model_fn)(*args)
     if mask is None:
         return jnp.mean((pred - target_v) ** 2)
-    per_sample = jnp.mean(((pred - target_v) ** 2).reshape(bs, -1), axis=-1)
-    return jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+    return masked_mean(per_sample_mse(pred, target_v), mask)
 
 
-def _euler_step(velocity, x, ti, dti):
-    return velocity(x, ti) * dti
+def dit_flow_loss(model, z, cond, key, *, latent_scale, use_ot, train: bool, mask=None):
+    """:func:`fm_forward_loss` of a DiT ``model(x, t, cond, key=, inference=)`` on latents ``z``.
 
+    ``train`` turns on dropout/drop-path with per-sample keys split off ``key``.
+    """
+    fm_key, drop_key = jr.split(key)
 
-def _midpoint_step(velocity, x, ti, dti):
-    k1 = velocity(x, ti)
-    return velocity(x + 0.5 * dti * k1, ti + 0.5 * dti) * dti
+    def fwd(x, t, *rest):
+        c = rest[0] if cond is not None else None
+        k = rest[-1] if train else None
+        return model(x, t, c, key=k, inference=not train)
 
-
-def _heun_step(velocity, x, ti, dti):
-    # explicit trapezoid
-    k1 = velocity(x, ti)
-    k2 = velocity(x + dti * k1, ti + dti)
-    return 0.5 * dti * (k1 + k2)
-
-
-def _rk4_step(velocity, x, ti, dti):
-    k1 = velocity(x, ti)
-    k2 = velocity(x + 0.5 * dti * k1, ti + 0.5 * dti)
-    k3 = velocity(x + 0.5 * dti * k2, ti + 0.5 * dti)
-    k4 = velocity(x + dti * k3, ti + dti)
-    return (dti / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-
-_STEPPERS = {
-    "euler": _euler_step,
-    "midpoint": _midpoint_step,
-    "heun": _heun_step,
-    "rk4": _rk4_step,
-}
-NFE_PER_STEP = {"euler": 1, "midpoint": 2, "heun": 2, "rk4": 4}
+    return fm_forward_loss(
+        fwd,
+        z,
+        cond,
+        key=fm_key,
+        latent_scale=latent_scale,
+        use_ot=use_ot,
+        dropout_key=drop_key if train else None,
+        mask=mask,
+    )
 
 
 def euler_sample(
@@ -143,12 +135,8 @@ def euler_sample(
     steps: int = 10,
     latent_scale: float = 1.0,
     dtype=jnp.float32,
-    method: str = "euler",
 ) -> jnp.ndarray:
-    """Integrate the velocity field over ``[0, 1]``.
-
-    ``method`` selects the explicit scheme (``euler``, ``midpoint``, ``heun``, ``rk4``); compare
-    schemes at matched NFE via :data:`NFE_PER_STEP`, not at matched step count.
+    """Euler-integrate the velocity field over ``[0, 1]``.
 
     Fused as a single ``jax.lax.scan`` so the whole sampling roll-out is
     one jit'd kernel. ``shape = (B, *latent_grid, z_dim)`` matches the
@@ -170,11 +158,9 @@ def euler_sample(
         def velocity(x, ti):
             return jax.vmap(model_fn)(x, jnp.full((bs,), ti, dtype=dtype))
 
-    increment = _STEPPERS[method]
-
     def step(x, ti_dti):
         ti, dti = ti_dti
-        return x + increment(velocity, x, ti, dti), None
+        return x + velocity(x, ti) * dti, None
 
     x, _ = jax.lax.scan(step, x0, (ts, dts))
     return x / latent_scale

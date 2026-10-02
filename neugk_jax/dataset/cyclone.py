@@ -5,45 +5,39 @@ returns precomputed latents (after running ``precompute_latents``);
 ``mode="next"`` additionally returns next-step targets (``y_df``, ``y_phi``,
 ``y_flux``, ``y_fluxavg``) for autoregressive training.
 
-Returns host-side numpy arrays in a frozen ``CycloneSample`` dataclass.
-JAX consumes them via ``jnp.asarray`` when the dataloader stacks a batch.
+Returns a frozen ``CycloneSample`` dataclass; the frames carry the array type of the
+backend (host numpy, or device jax for ``KvikIOBackend``), the scalars are numpy.
 """
 
 from __future__ import annotations
 
 import copy
-import dataclasses
 import os
-import pickle
 import warnings
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.dataset.backend import DataBackend, KvikIOBackend, resolve_trajectories
-from neugk_jax.utils import RunningMeanStd
+from neugk_jax.dataset.backend import DataBackend, expand_spec
+from neugk_jax.dataset.normalization import NormTable, load_stats, metadata_stats
+from neugk_jax.utils import RunningStats
 from neugk_jax.utils import separate_zf as separate_zf_fn
+
+# heat-flux steps averaged into the trajectory flux
+FLUX_AVG_WINDOW = 80
+# condition names of the scalar trajectory parameters -> their metadata keys
+COND_META_KEYS = {"itg": "ion_temp_grad", "dg": "density_grad", "s_hat": "s_hat", "q": "q"}
+DEFAULT_CONDITIONS = tuple(COND_META_KEYS)
+
+
+def avg_flux(flux) -> float:
+    return float(np.mean(np.asarray(flux)[1:][-FLUX_AVG_WINDOW:]))
 
 
 def _f32(x):
-    if x is None:
-        return None
-    return x.astype(jnp.float32) if isinstance(x, jax.Array) else np.asarray(x).astype(np.float32)
-
-
-class _StatsUnpickler(pickle.Unpickler):
-    """Unpickles stats pickles that reference ``neugk.*.RunningMeanStd``."""
-
-    def find_class(self, module, name):
-        # the jax twin carries the same buffers and pickle restores __dict__ directly
-        if module.startswith("neugk.") and name == "RunningMeanStd":
-            return RunningMeanStd
-        return super().find_class(module, name)
+    return None if x is None else x.astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -71,42 +65,6 @@ class CycloneSample:
     y_fluxavg: np.ndarray | None = None
 
 
-def collate(batch: Sequence[CycloneSample]) -> CycloneSample:
-    """Stack a list of samples into a batched ``CycloneSample``.
-
-    Detects the array flavour from the first sample's ``df``: ``jax.Array``
-    inputs (kvikio + ``return_jax=True``) are stacked via ``jnp.stack`` to
-    keep the batch on GPU; everything else goes through ``np.stack``.
-    """
-    use_jax = isinstance(batch[0].df, jax.Array)
-    stacker = jnp.stack if use_jax else np.stack
-
-    def stack(key: str):
-        vals = [getattr(s, key) for s in batch]
-        if vals[0] is None:
-            return None
-        return stacker(vals)
-
-    return CycloneSample(
-        df=stack("df"),
-        phi=stack("phi"),
-        flux=stack("flux"),
-        avg_flux=stack("avg_flux"),
-        timestep=stack("timestep"),
-        file_index=stack("file_index"),
-        timestep_index=stack("timestep_index"),
-        conditioning=stack("conditioning"),
-        itg=stack("itg"),
-        dg=stack("dg"),
-        s_hat=stack("s_hat"),
-        q=stack("q"),
-        y_df=stack("y_df"),
-        y_phi=stack("y_phi"),
-        y_flux=stack("y_flux"),
-        y_fluxavg=stack("y_fluxavg"),
-    )
-
-
 class CycloneDataset:
     """Map-style dataset over preprocessed gyrokinetics trajectories.
 
@@ -114,9 +72,10 @@ class CycloneDataset:
     ----------
     path, trajectories
         Directory + trajectory spec (string with ``{1-5,7}`` ranges or list).
+    backend
+        The :class:`DataBackend` reading the trajectories (see ``make_backend``).
     split
-        ``"train"`` or ``"val"``. ``val`` may use ``partial_holdouts`` to
-        carve out the tail of each trajectory.
+        ``"train"`` or ``"val"``.
     fields_to_load
         Subset of ``("df", "phi")`` to read from disk. ``flux`` is always
         derivable from metadata.
@@ -130,12 +89,8 @@ class CycloneDataset:
     normalization, normalization_scope, normalization_stats
         Normalization config, its scope (``"dataset"`` or per-trajectory),
         and optional precomputed stats.
-    separate_zf, decouple_mu
+    separate_zf
         Optional channel-axis preprocessing matching the AE config.
-    lightweight_metadata
-        Read ``metadata_light.pkl`` instead of the full pickle (~900x smaller —
-        the full one carries per-element df moments). Requires
-        ``normalization_stats``, since the per-trajectory moments are then absent.
     bundle_seq_length
         Time-bundling stride. Default ``1`` (one timestep per sample).
     offset
@@ -146,27 +101,21 @@ class CycloneDataset:
         self,
         *,
         path: str,
+        backend: DataBackend,
         split: str = "train",
         trajectories: Optional[Any] = None,
-        partial_holdouts: Optional[dict] = None,
         fields_to_load: Sequence[str] = ("df",),
-        conditions: Sequence[str] = ("itg", "dg", "s_hat", "q"),
+        conditions: Sequence[str] = DEFAULT_CONDITIONS,
         mode: str = "ae",
         normalization: Optional[dict] = None,
         normalization_scope: str = "dataset",
         normalization_stats: Optional[dict | str] = None,
-        spatial_ifft: bool = True,
-        real_potens: bool = True,
         cond_filters: Optional[dict] = None,
         bundle_seq_length: int = 1,
         offset: int = 0,
         tail_offset: int = 0,
         subsample: int = 1,
         separate_zf: bool = False,
-        decouple_mu: bool = False,
-        lightweight_metadata: bool = False,
-        backend: Optional[DataBackend] = None,
-        num_workers: int = 0,
         rank: int = 0,
     ):
         assert split in ("train", "val")
@@ -182,77 +131,39 @@ class CycloneDataset:
         self.normalization = normalization
         self.normalization_scope = normalization_scope
         self.normalization_stats = normalization_stats
-        self.spatial_ifft = spatial_ifft
-        self.real_potens = real_potens
         self.cond_filters = cond_filters or {}
         self.bundle_seq_length = bundle_seq_length
         self.offset = offset
         self.tail_offset = tail_offset
         self.subsample = subsample
         self.separate_zf = separate_zf
-        self.decouple_mu = decouple_mu
-        self.lightweight_metadata = lightweight_metadata
-        if lightweight_metadata and normalization is not None and normalization_stats is None:
-            raise ValueError(
-                "lightweight_metadata drops the per-trajectory df moments; pass "
-                "normalization_stats or disable it"
-            )
-        # default to KvikIOBackend for gpu-direct reads; falls back to NumpyBackend transparently
-        self.backend = backend or KvikIOBackend(rank=rank)
-        self.num_workers = num_workers
+        self.backend = backend
         self.rank = rank
-        self.partial_holdouts = partial_holdouts or {}
 
         # latent storage (mode="diff"); filled by precompute_latents()
         self.precomputed_latents: dict[tuple[int, int], dict] | None = None
-        self.latent_stats: RunningMeanStd | None = None
+        self.latent_stats: RunningStats | None = None
 
-        if trajectories is not None:
-            if split == "val" and self.partial_holdouts:
-                raw = [os.path.join(path, k) for k in self.partial_holdouts]
-            else:
-                raw = resolve_trajectories(path, trajectories)
-        else:
+        if trajectories is None:
             raw = [
-                os.path.join(path, n)
-                for n in os.listdir(path)
-                if self.backend.is_valid(os.path.join(path, n))
+                p for p in (os.path.join(path, n) for n in os.listdir(path)) if backend.is_valid(p)
             ]
-        self.files = sorted(
-            {
-                self.backend.format_path(f, spatial_ifft, None, real_potens)
-                for f in raw
-                if self.backend.is_valid(
-                    self.backend.format_path(f, spatial_ifft, None, real_potens)
-                )
-            }
-        )
+        else:
+            raw = [os.path.join(path, n) for n in expand_spec(trajectories)]
+        self.files = sorted({p for p in map(backend.trajectory_path, raw) if backend.is_valid(p)})
         if not self.files:
             raise RuntimeError(f"no trajectories found under {path}")
 
-        # metadata loads are I/O bound and tiny; cap workers at 16
-        with ThreadPoolExecutor(max_workers=max(1, min(16, num_workers or 8))) as ex:
-            metas = list(
-                ex.map(
-                    lambda f: self.backend.read_metadata(
-                        f,
-                        self.fields_to_load,
-                        lightweight=lightweight_metadata,
-                    ),
-                    self.files,
-                )
-            )
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            metas = list(ex.map(backend.read_metadata, self.files))
         self.metadata: dict[int, dict] = {}
         kept_files = []
-        # metadata keys _build_sample hard-requires, plus any non-alias conditioning field
-        required = {"ion_temp_grad", "density_grad", "s_hat", "q", "flux", "timesteps"}
-        required |= {c for c in self.conditions if c not in ("itg", "dg", "s_hat", "q", "timestep")}
+        # metadata keys every sample needs, plus any other conditioning field
+        required = {*COND_META_KEYS.values(), "flux", "timesteps"}
+        required |= {c for c in self.conditions if c not in COND_META_KEYS and c != "timestep"}
         for fp, meta in zip(self.files, metas):
             if not self._passes_cond_filter(meta):
                 continue
-            # ood trajectories use "fluxes" key instead of "flux" — normalise here
-            if "flux" not in meta and "fluxes" in meta:
-                meta["flux"] = meta["fluxes"]
             missing = sorted(k for k in required if k not in meta)
             if missing:
                 # traj missing a conditioning/metadata field -> exclude it rather than crash
@@ -265,7 +176,6 @@ class CycloneDataset:
         self.files = kept_files
 
         self.flat_index_to_file_and_tstep: dict[int, tuple[int, int]] = {}
-        self.file_and_tstep_to_flat_index: dict[tuple[int, int], int] = {}
         self.file_num_timesteps: list[int] = []
         flat = 0
         for fid, meta in self.metadata.items():
@@ -276,17 +186,25 @@ class CycloneDataset:
             n = len(timesteps[::subsample]) - bundle_seq_length * 2 + 1
             for t_idx in range(max(0, n)):
                 self.flat_index_to_file_and_tstep[flat] = (fid, t_idx * subsample)
-                self.file_and_tstep_to_flat_index[(fid, t_idx * subsample)] = flat
                 flat += 1
         self.length = flat
 
         # resolution: assume same across files
-        self.resolution = tuple(int(r) for r in self.metadata[0]["resolution"])
+        self.resolution = tuple(self.metadata[0]["resolution"])
         self.df_shape = (2, *self.resolution)
         self.phi_resolution = (self.resolution[3], self.resolution[2], self.resolution[4])
 
-        # normalisation stats: prefer normalization_stats if provided, fall back to per-trajectory metadata moments
-        self.stats = self._build_stats()
+        # normalization_stats when given, else the per-trajectory metadata moments
+        if isinstance(normalization_stats, (str, os.PathLike)):
+            self.stats = load_stats(normalization_stats, normalization)
+        elif normalization_stats is not None:
+            self.stats = normalization_stats
+        else:
+            self.stats = metadata_stats(self.metadata, self.fields_to_load) if normalization else {}
+        ndims = {"df": len(self.df_shape), "phi": len(self.phi_resolution), "flux": 0, "fluxavg": 0}
+        self.norm = NormTable.from_stats(
+            self.stats, normalization, normalization_scope, len(self.files), ndims
+        )
 
     def _passes_cond_filter(self, meta: dict) -> bool:
         for cond_name, cond_range in self.cond_filters.items():
@@ -299,194 +217,90 @@ class CycloneDataset:
             if not isinstance(cond_range[0], (list, tuple)):
                 cond_range = [cond_range]
             if cond_name == "flux":
-                bound = self.offset if self.offset > 0 else 80
+                bound = self.offset if self.offset > 0 else FLUX_AVG_WINDOW
                 cond = float(np.mean(cond[:bound] if where == "first" else cond[-bound:]))
             if not any(lo <= cond <= hi for lo, hi in cond_range):
                 return False
         return True
 
-    def _build_stats(self) -> dict[str, dict]:
-        """Construct ``stats[field][fid|'full']`` from metadata moments.
-
-        ``normalization_stats`` can be:
-
-        * a ``dict`` already in the ``stats[field][key]`` form — used as-is;
-        * a ``str`` / ``Path`` pointing at a stats pickle: ``RunningMeanStd`` per
-          field, reduced with the per-field ``agg_axes`` from ``self.normalization``
-          into the aggregation the model config requests, or a pickled dict already
-          in the ``stats[field][key]`` form (used as-is).
-        """
-        if isinstance(self.normalization_stats, (str, os.PathLike)):
-            return self._load_stats_pkl(self.normalization_stats)
-        if self.normalization_stats is not None:
-            return self.normalization_stats
-        if self.normalization is None:
-            return {}
-        out: dict[str, dict] = {k: defaultdict(dict) for k in self.fields_to_load}
-        agg: dict[str, RunningMeanStd] = {k: RunningMeanStd() for k in self.fields_to_load}
-        for fid, meta in self.metadata.items():
-            for k in self.fields_to_load:
-                if f"{k}_mean" in meta:
-                    mean = meta[f"{k}_mean"]
-                    var = meta[f"{k}_std"] ** 2
-                    mn = meta.get(f"{k}_min", mean)
-                    mx = meta.get(f"{k}_max", mean)
-                    out[k][fid] = {"mean": mean, "std": np.sqrt(var), "min": mn, "max": mx}
-                    n = len(meta["timesteps"])
-                    agg[k].update(mean, var, mn, mx, count=n)
-        for k in self.fields_to_load:
-            if agg[k].count:
-                out[k]["full"] = {
-                    "mean": np.asarray(agg[k].mean, dtype=np.float32),
-                    "std": np.asarray(np.sqrt(agg[k].var), dtype=np.float32),
-                    "min": np.asarray(agg[k].min, dtype=np.float32),
-                    "max": np.asarray(agg[k].max, dtype=np.float32),
-                }
-        return out
-
-    def _load_stats_pkl(self, path) -> dict[str, dict]:
-        """Load a ``RunningMeanStd`` pickle and apply per-field ``agg_axes``.
-
-        Returns the stats dict in our internal format
-        (``stats[field]['full']`` with mean / std / min / max numpy arrays).
-        """
-        with open(path, "rb") as f:
-            raw = _StatsUnpickler(f).load()
-        if all(isinstance(v, dict) for v in raw.values()):
-            return {str(k): v for k, v in raw.items()}
-        out: dict[str, dict] = {}
-        for k, rms in raw.items():
-            mean = np.asarray(rms.mean, dtype=np.float64)
-            var = np.asarray(rms.var, dtype=np.float64)
-            mn = np.asarray(rms.min, dtype=np.float64)
-            mx = np.asarray(rms.max, dtype=np.float64)
-            agg = None
-            if self.normalization and k in self.normalization:
-                agg = self.normalization[k].get("agg_axes")
-            if agg:
-                agg = tuple(int(a) for a in agg)
-                # keepdims so the result broadcasts directly against the data tensor
-                new_mean = mean.mean(axis=agg, keepdims=True)
-                new_var = var.mean(axis=agg, keepdims=True) + mean.var(axis=agg, keepdims=True)
-                new_min = mn.min(axis=agg, keepdims=True)
-                new_max = mx.max(axis=agg, keepdims=True)
-                mean, var, mn, mx = new_mean, new_var, new_min, new_max
-            out.setdefault(k, {})["full"] = {
-                "mean": mean.astype(np.float32),
-                "std": np.sqrt(var).astype(np.float32),
-                "min": mn.astype(np.float32),
-                "max": mx.astype(np.float32),
-            }
-        return out
-
-    def _get_scale_shift(
-        self, fid: int, field: str, x: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if self.normalization_scope == "sample" or self.normalization is None:
-            return np.float32(1.0), np.float32(0.0)
-        if field not in self.normalization:
-            return np.float32(1.0), np.float32(0.0)
-        key = "full" if self.normalization_scope == "dataset" else fid
-        stats = self.stats.get(field, {}).get(key, {})
-        if not stats:
-            raise KeyError(
-                f"normalization lists {field!r} but there are no {field!r} stats "
-                f"for {key!r}; add them to normalization_stats or drop the field"
-            )
-        nt = self.normalization[field]["type"]
-        if nt == "zscore":
-            mean = np.asarray(stats["mean"], dtype=np.float32)
-            std = np.asarray(stats["std"], dtype=np.float32)
-            return std, mean
-        if nt == "minmax":
-            lo = np.asarray(stats["min"], dtype=np.float32)
-            hi = np.asarray(stats["max"], dtype=np.float32)
-            beta1 = self.normalization[field].get("minmax_beta1", 8)
-            beta2 = self.normalization[field].get("minmax_beta2", 4)
-            scale = (hi - lo) / beta1
-            shift = lo + scale * beta2
-            return scale, shift
-        raise ValueError(nt)
-
-    def normalize(self, fid: int, *, df=None, phi=None, flux=None, fluxavg=None) -> np.ndarray:
-        x, field = self._unpack_field(df=df, phi=phi, flux=flux, fluxavg=fluxavg)
-        scale, shift = self._get_scale_shift(fid, field, x)
-        return (x - shift) / scale
-
-    def scale_shift(self, fids: Sequence[int], field: str, sample_ndim: int):
-        """Per-batch ``(scale, shift)`` for ``field`` that broadcast against a
-        batch of ``sample_ndim``-dimensional samples.
-
-        Shared statistics (dataset scope, or none) are returned without a batch
-        axis; per-trajectory statistics are stacked along a leading batch axis.
-        """
-        dummy = np.zeros((1,) * sample_ndim, dtype=np.float32)
-        pairs = [self._get_scale_shift(int(f), field, dummy) for f in fids]
-        shared = self.normalization is None or self.normalization_scope in ("dataset", "sample")
-        if shared:
-            scale, shift = pairs[0]
-            return np.asarray(scale, np.float32), np.asarray(shift, np.float32)
-
-        def stack(arrs):
-            out = []
-            for a in arrs:
-                a = np.asarray(a, np.float32)
-                # match the sample rank (pad or drop leading unit axes) so the batch axis lines up
-                while a.ndim > sample_ndim and a.shape[0] == 1:
-                    a = a[0]
-                out.append(a.reshape((1,) * (sample_ndim - a.ndim) + a.shape))
-            return np.stack(out)
-
-        return stack([p[0] for p in pairs]), stack([p[1] for p in pairs])
-
-    @staticmethod
-    def _unpack_field(*, df=None, phi=None, flux=None, fluxavg=None):
-        if df is not None:
-            return df, "df"
-        if phi is not None:
-            return phi, "phi"
-        if flux is not None:
-            return flux, "flux"
-        if fluxavg is not None:
-            return fluxavg, "fluxavg"
-        raise ValueError("provide exactly one of df, phi, flux, fluxavg")
-
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, index: int) -> CycloneSample:
-        fid, t_idx = self.flat_index_to_file_and_tstep[index]
-        if self.mode == "diff" and self.precomputed_latents is not None:
-            return self._get_latent_sample(fid, t_idx)
-        if self.mode == "next":
-            return self._get_next_sample(fid, t_idx)
-        return self._get_ae_sample(fid, t_idx)
+        return self.sample(*self.flat_index_to_file_and_tstep[index])
 
     def with_mode(self, mode: str) -> "CycloneDataset":
         view = copy.copy(self)
         view.mode = mode
         return view
 
+    def _frames(self, handle, fid: int, t: int) -> dict:
+        """Normalized float32 ``df``/``phi`` frames (those loaded) at raw frame index ``t``."""
+        out = {}
+        if "df" in self.fields_to_load:
+            df = self.backend.read_df(handle, t, self.df_shape)
+            out["df"] = separate_zf_fn(df, axis=0) if self.separate_zf else df
+        if "phi" in self.fields_to_load:
+            out["phi"] = self.backend.read_phi(handle, t, self.phi_resolution)
+        return {k: _f32(self.norm.normalize(k, v, fid)) for k, v in out.items()}
+
+    def _targets(self, handle, fid: int, t_idx: int) -> dict:
+        """Normalized next-step targets (frames, ``flux``, ``fluxavg``) of sample ``(fid, t_idx)``."""
+        t = t_idx + self.offset + self.bundle_seq_length
+        flux = self.metadata[fid]["flux"]
+        out = self._frames(handle, fid, t)
+        out["flux"] = np.asarray(flux[t], dtype=np.float32)
+        out["fluxavg"] = np.float32(avg_flux(flux))
+        for k in ("flux", "fluxavg"):
+            out[k] = np.asarray(self.norm.normalize(k, out[k], fid), np.float32)
+        return out
+
     def get_target(self, fid: int, t_idx: int) -> dict[str, np.ndarray]:
-        """Normalized next-step targets ``y_*`` of ``(fid, t_idx)`` without reading the input."""
         fid, t_idx = int(fid), int(t_idx)
-        meta = self.metadata[fid]
-        gt_t = t_idx + self.offset + self.bundle_seq_length
-        out: dict[str, np.ndarray] = {}
         with self.backend.open(self.files[fid]) as handle:
-            gt_str = str(gt_t).zfill(5)
-            if "df" in self.fields_to_load:
-                y_df = self.backend.read_df(handle, gt_str, self.df_shape, [0, 1])
-                if self.separate_zf:
-                    y_df = separate_zf_fn(y_df, axis=0)
-                out["df"] = y_df
-            if "phi" in self.fields_to_load:
-                out["phi"] = self.backend.read_phi(handle, gt_str, self.phi_resolution)
-        out["flux"] = np.asarray(meta["flux"][gt_t], dtype=np.float32)
-        out["fluxavg"] = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
-        if self.normalization is not None:
-            out = {k: self.normalize(fid, **{k: v}) for k, v in out.items()}
-        return {k: _f32(v) for k, v in out.items()}
+            return self._targets(handle, fid, t_idx)
+
+    def sample(self, fid: int, t_idx: int) -> CycloneSample:
+        """The sample of trajectory ``fid`` at timestep index ``t_idx`` in the current mode."""
+        meta, t = self.metadata[fid], t_idx + self.offset
+        flux, timestep = meta["flux"][t], meta["timesteps"][t]
+        targets = {}
+        if self.mode == "diff" and self.precomputed_latents is not None:
+            cached = self.precomputed_latents[(fid, t_idx)]
+            frames = {"df": cached["x"].astype(np.float32), "phi": cached.get("phi")}
+            flux, timestep = cached.get("flux", flux), cached.get("timestep", timestep)
+        else:
+            with self.backend.open(self.files[fid]) as handle:
+                frames = self._frames(handle, fid, t)
+                if self.mode == "next":
+                    targets = self._targets(handle, fid, t_idx)
+        timestep = np.asarray(timestep, dtype=np.float32)
+        return CycloneSample(
+            df=frames.get("df"),
+            phi=frames.get("phi"),
+            flux=np.asarray(flux, dtype=np.float32),
+            avg_flux=np.float32(self.get_avg_flux(fid)),
+            timestep=timestep,
+            file_index=np.int64(fid),
+            timestep_index=np.int64(t_idx),
+            conditioning=self.conditioning(fid, timestep),
+            **{
+                k: np.asarray(np.squeeze(meta[v]), dtype=np.float32)
+                for k, v in COND_META_KEYS.items()
+            },
+            **{f"y_{k}": v for k, v in targets.items()},
+        )
+
+    def conditioning(self, fid: int, timestep) -> Optional[np.ndarray]:
+        """The ``conditions`` of trajectory ``fid`` at ``timestep``, packed in sorted order."""
+        if not self.conditions:
+            return None
+        meta = self.metadata[fid]
+        vals = [
+            timestep if k == "timestep" else np.squeeze(meta[COND_META_KEYS.get(k, k)])
+            for k in self.conditions
+        ]
+        return np.concatenate([np.atleast_1d(np.asarray(v, np.float32)) for v in vals])
 
     def num_ts(self, fid: int) -> int:
         """Raw timesteps of trajectory ``fid`` after ``offset``, tail and subsampled ones included.
@@ -501,125 +315,10 @@ class CycloneDataset:
             self.metadata[int(fid)]["timesteps"][int(t_idx) + self.offset], dtype=np.float32
         )
 
-    def _get_ae_sample(self, fid: int, t_idx: int) -> CycloneSample:
-        meta = self.metadata[fid]
-        original_t = t_idx + self.offset
-        f_path = self.files[fid]
-        df = phi = None
-        with self.backend.open(f_path) as handle:
-            t_str = str(original_t).zfill(5)
-            if "df" in self.fields_to_load:
-                df = self.backend.read_df(handle, t_str, self.df_shape, [0, 1])
-                if self.separate_zf:
-                    df = separate_zf_fn(df, axis=0)
-            if "phi" in self.fields_to_load:
-                phi = self.backend.read_phi(handle, t_str, self.phi_resolution)
-
-        flux = np.asarray(meta["flux"][original_t], dtype=np.float32)
-        timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
-        if df is not None and self.normalization is not None:
-            df = self.normalize(fid, df=df)
-            df = df.astype(jnp.float32) if isinstance(df, jax.Array) else df.astype(np.float32)
-        if phi is not None and self.normalization is not None:
-            phi = self.normalize(fid, phi=phi)
-            phi = phi.astype(jnp.float32) if isinstance(phi, jax.Array) else phi.astype(np.float32)
-
-        return self._build_sample(fid, t_idx, df, phi, flux, timestep, meta)
-
-    def _get_next_sample(self, fid: int, t_idx: int) -> CycloneSample:
-        meta = self.metadata[fid]
-        original_t = t_idx + self.offset
-        gt_t = original_t + self.bundle_seq_length
-        df = y_df = phi = y_phi = None
-        with self.backend.open(self.files[fid]) as handle:
-            t_str, gt_str = str(original_t).zfill(5), str(gt_t).zfill(5)
-            if "df" in self.fields_to_load:
-                df = self.backend.read_df(handle, t_str, self.df_shape, [0, 1])
-                y_df = self.backend.read_df(handle, gt_str, self.df_shape, [0, 1])
-                if self.separate_zf:
-                    df = separate_zf_fn(df, axis=0)
-                    y_df = separate_zf_fn(y_df, axis=0)
-            if "phi" in self.fields_to_load:
-                phi = self.backend.read_phi(handle, t_str, self.phi_resolution)
-                y_phi = self.backend.read_phi(handle, gt_str, self.phi_resolution)
-
-        flux = np.asarray(meta["flux"][original_t], dtype=np.float32)
-        y_flux = np.asarray(meta["flux"][gt_t], dtype=np.float32)
-        y_fluxavg = np.asarray(np.mean(np.asarray(meta["flux"])[1:][-80:]), dtype=np.float32)
-        timestep = np.asarray(meta["timesteps"][original_t], dtype=np.float32)
-        if self.normalization is not None:
-            if df is not None:
-                df, y_df = self.normalize(fid, df=df), self.normalize(fid, df=y_df)
-            if phi is not None:
-                phi, y_phi = self.normalize(fid, phi=phi), self.normalize(fid, phi=y_phi)
-            y_flux = self.normalize(fid, flux=y_flux)
-            y_fluxavg = self.normalize(fid, fluxavg=y_fluxavg)
-        sample = self._build_sample(fid, t_idx, _f32(df), _f32(phi), flux, timestep, meta)
-        return dataclasses.replace(
-            sample,
-            y_df=_f32(y_df),
-            y_phi=_f32(y_phi),
-            y_flux=np.asarray(y_flux, np.float32),
-            y_fluxavg=np.asarray(y_fluxavg, np.float32),
-        )
-
-    def _get_latent_sample(self, fid: int, t_idx: int) -> CycloneSample:
-        cached = self.precomputed_latents[(fid, t_idx)]
-        meta = self.metadata[fid]
-        flux = np.asarray(cached.get("flux", meta["flux"][t_idx + self.offset]), dtype=np.float32)
-        timestep = np.asarray(
-            cached.get("timestep", meta["timesteps"][t_idx + self.offset]), dtype=np.float32
-        )
-        return self._build_sample(
-            fid,
-            t_idx,
-            cached["x"].astype(np.float32),
-            cached.get("phi"),
-            flux,
-            timestep,
-            meta,
-        )
-
-    def _build_sample(self, fid, t_idx, df, phi, flux, timestep, meta) -> CycloneSample:
-        itg = np.asarray(np.squeeze(meta["ion_temp_grad"]), dtype=np.float32)
-        dg = np.asarray(np.squeeze(meta["density_grad"]), dtype=np.float32)
-        s_hat = np.asarray(np.squeeze(meta["s_hat"]), dtype=np.float32)
-        q = np.asarray(np.squeeze(meta["q"]), dtype=np.float32)
-        cond_vec = None
-        if self.conditions:
-            packed = []
-            local = {"itg": itg, "dg": dg, "s_hat": s_hat, "q": q, "timestep": timestep}
-            for k in self.conditions:
-                v = local.get(k)
-                if v is None:
-                    v = np.asarray(np.squeeze(meta[k]), dtype=np.float32)
-                packed.append(np.atleast_1d(v))
-            cond_vec = np.concatenate(packed).astype(np.float32)
-
-        avg = float(np.mean(meta["flux"][-80:]))
-        return CycloneSample(
-            df=df,
-            phi=phi,
-            flux=flux,
-            avg_flux=np.float32(avg),
-            timestep=timestep,
-            file_index=np.int64(fid),
-            timestep_index=np.int64(t_idx),
-            conditioning=cond_vec,
-            itg=itg,
-            dg=dg,
-            s_hat=s_hat,
-            q=q,
-        )
-
     def get_avg_flux(self, fid: int) -> float:
-        return float(np.mean(self.metadata[fid]["flux"][-80:]))
+        return avg_flux(self.metadata[fid]["flux"])
 
     def get_ds(self, fid: int) -> float | None:
         # parallel (s) grid spacing; None when the trajectory metadata doesn't carry it
         ds = self.metadata[fid].get("ds")
         return None if ds is None else float(ds)
-
-    @staticmethod
-    def collate(batch: Sequence[CycloneSample]) -> CycloneSample:
-        return collate(batch)

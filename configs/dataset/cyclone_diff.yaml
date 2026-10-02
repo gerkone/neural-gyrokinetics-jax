@@ -1,5 +1,4 @@
 # must match the dataset the ae was trained with (see configs/dataset/cyclone_ae.yaml)
-name: cyclone
 # preprocessed dataset root (required): export NEUGK_DATA or pass dataset.path=...
 path: ${oc.env:NEUGK_DATA}
 backend: kvikio

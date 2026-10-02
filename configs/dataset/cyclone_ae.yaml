@@ -1,4 +1,3 @@
-name: cyclone
 # preprocessed dataset root (required): export NEUGK_DATA or pass dataset.path=...
 path: ${oc.env:NEUGK_DATA}
 backend: kvikio  # gpu-direct reads via cupy+kvikio, zero-copy to jax; falls back to numpy

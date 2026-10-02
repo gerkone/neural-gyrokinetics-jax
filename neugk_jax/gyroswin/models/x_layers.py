@@ -1,10 +1,9 @@
 """Cross-attention layers used to mix the df and phi U-Net latents.
 
-``MixingBlock`` is a single cross-attention + MLP block; ``VSpaceReduce``
-integrates over the velocity axes via a learned query token; ``RSpaceReduce``
-does the same over real space (the ``integral`` flux-head reduction).
-``FluxDecoder`` is the scalar flux head, optionally FiLM-conditioned on the
-raw conditioning scalars.
+``MixingBlock`` is a single cross-attention + MLP block; ``QueryPool`` pools groups of
+tokens with a learned query token (the velocity-space integral of the df latents).
+``FluxDecoder`` is the scalar flux head, optionally FiLM-conditioned on the raw
+conditioning scalars.
 """
 
 from __future__ import annotations
@@ -17,17 +16,10 @@ import jax.numpy as jnp
 import jax.random as jr
 from einops import rearrange
 
-from neugk_jax.models.attention import MultiHeadCrossAttention
+from neugk_jax.models.attention import MultiHeadCrossAttention, einsum_attention
 from neugk_jax.models.embeddings import ContinuousConditionEmbed
-from neugk_jax.models.swin import Film, _DropPath
-from neugk_jax.models.utils import MLP, LayerNorm, Linear, dropout, gelu, split_key
-
-
-def _pool_attention(q, k, v, scale, attn_drop, key, inference):
-    # q: (g, h, d); k, v: (g, n, h, d) -> (g, h, d)
-    attn = jax.nn.softmax(jnp.einsum("ghd,gnhd->ghn", q, k) * scale, axis=-1)
-    attn = dropout(attn, attn_drop, key=key, inference=inference)
-    return jnp.einsum("ghn,gnhd->ghd", attn, v)
+from neugk_jax.models.swin import Film, _DropPath, run_blocks
+from neugk_jax.models.utils import MLP, LayerNorm, Linear, gelu, split_key
 
 
 class MixingBlock(eqx.Module):
@@ -71,10 +63,7 @@ class MixingBlock(eqx.Module):
         self.drop_path = _DropPath(drop_path)
         self.norm2 = LayerNorm(left_dim, elementwise_affine=True)
         self.mlp = MLP(
-            [left_dim, int(left_dim * mlp_ratio), left_dim],
-            act_fn=act_fn,
-            drop=drop,
-            key=k2,
+            [left_dim, int(left_dim * mlp_ratio), left_dim], act_fn=act_fn, drop=drop, key=k2
         )
 
     def __call__(
@@ -98,11 +87,10 @@ class MixingBlock(eqx.Module):
         return x.reshape(l_shape)
 
 
-class VSpaceReduce(eqx.Module):
-    """Integrate velocity axes of a 5D df latent into a 3D phi-shaped latent.
+class QueryPool(eqx.Module):
+    """Learned-query attention pooling ``(groups, tokens, dim) -> (groups, out_dim)``.
 
-    A learned query token (``integral_token``) cross-attends to the velocity
-    tokens at each (s, x, y) position. Output shape: ``(s, x, y, out_dim)``.
+    The query token ``integral_token`` (a buffer) attends over the tokens of each group.
     """
 
     kv: Linear
@@ -111,9 +99,6 @@ class VSpaceReduce(eqx.Module):
     buffer_fields = ("integral_token",)
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
-    out_dim: int = eqx.field(static=True)
-    decouple_mu: bool = eqx.field(static=True)
-    scale: float = eqx.field(static=True)
     attn_drop: float = eqx.field(static=True)
 
     def __init__(
@@ -123,40 +108,36 @@ class VSpaceReduce(eqx.Module):
         num_heads: int,
         *,
         key,
-        decouple_mu: bool = False,
-        gain: float = 1e-2,
         qkv_bias: bool = False,
         attn_drop: float = 0.0,
     ):
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.out_dim = out_dim
-        self.scale = self.head_dim**-0.5
-        self.decouple_mu = decouple_mu
         self.attn_drop = attn_drop
         kkv, kp, ktoken = jr.split(key, 3)
         self.kv = Linear(dim, 2 * dim, key=kkv, use_bias=qkv_bias)
         self.proj = Linear(dim, out_dim, key=kp, use_bias=True)
-        self.integral_token = gain * jr.normal(ktoken, (1, 1, dim))
+        self.integral_token = 1e-2 * jr.normal(ktoken, (1, 1, dim))
 
-    def __call__(self, df: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
-        # df comes as (vp, [mu,] s, x, y, C); decouple_mu controls whether mu is present
-        if self.decouple_mu:
-            vpar, ns, nx, ny, dim = df.shape
-            df_t = rearrange(df, "vp s x y c -> (s x y) vp c")
-        else:
-            vpar, mu, ns, nx, ny, dim = df.shape
-            df_t = rearrange(df, "vp mu s x y c -> (s x y) (vp mu) c")
-        n_groups, n_tok, _ = df_t.shape
-        kv = self.kv(df_t).reshape(n_groups, n_tok, 2, self.num_heads, self.head_dim)
-        q = self.integral_token.reshape(1, self.num_heads, self.head_dim)
-        q = jnp.broadcast_to(q, (n_groups, self.num_heads, self.head_dim))
-        out = _pool_attention(
-            q, kv[:, :, 0], kv[:, :, 1], self.scale, self.attn_drop, key, inference
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
+        g, n, dim = x.shape
+        kv = self.kv(x).reshape(g, n, 2, self.num_heads, self.head_dim)
+        q = jnp.broadcast_to(
+            self.integral_token.reshape(1, 1, self.num_heads, self.head_dim),
+            (g, 1, self.num_heads, self.head_dim),
         )
-        out = self.proj(out.reshape(n_groups, self.num_heads * self.head_dim))
-        return out.reshape(ns, nx, ny, self.out_dim)
+        scale = self.head_dim**-0.5
+        out = einsum_attention(
+            q, kv[:, :, 0], kv[:, :, 1], scale, None, self.attn_drop, key, inference
+        )
+        return self.proj(out.reshape(g, dim))
+
+
+def velocity_pool(pool: QueryPool, df: jnp.ndarray, *, key=None, inference: bool = True):
+    pattern = "vp s x y c -> (s x y) vp c" if df.ndim == 5 else "vp mu s x y c -> (s x y) (vp mu) c"
+    out = pool(rearrange(df, pattern), key=key, inference=inference)
+    return out.reshape(*df.shape[-4:-1], -1)
 
 
 class LatentMixingTransformer(eqx.Module):
@@ -210,28 +191,23 @@ class LatentMixingTransformer(eqx.Module):
         self, left: jnp.ndarray, right: jnp.ndarray, cond=None, *, key=None, inference: bool = True
     ) -> jnp.ndarray:
         c = self.cond_embed(cond) if self.cond_embed is not None else None
-        x = left
-        for i, (blk, k) in enumerate(zip(self.blocks, split_key(key, len(self.blocks)))):
-            if c is not None:
-                x = self.conditioning[i](x, c)
-            x = blk(x, right, key=k, inference=inference)
-        return x
+        return run_blocks(
+            self.blocks, self.conditioning, left, c, right, key=key, inference=inference
+        )
 
 
 class FluxDecoder(eqx.Module):
     """Predict a scalar flux from the per-scale (phi, df) latents.
 
     One ``LatentMixingTransformer`` stage per scale: stage ``i`` cross-attends the
-    phi latent (query) to the df latent (kv), pools over space (``max``, ``mean``
-    or an ``integral`` query token) to a vector of ``left_dims[i]``, and the
-    per-scale vectors are concatenated and fed to ``flux_mlp`` (sum -> half -> 1).
-    ``n_cond > 0`` FiLM-conditions every stage on the raw conditioning scalars.
+    phi latent (query) to the df latent (kv), max-pools over space to a vector of
+    ``left_dims[i]``, and the per-scale vectors are concatenated and fed to ``flux_mlp``
+    (sum -> half -> 1). ``n_cond > 0`` FiLM-conditions every stage on the raw
+    conditioning scalars.
     """
 
     blocks: list
-    reductions: Optional[list]
     flux_mlp: MLP
-    reduction: str = eqx.field(static=True)
     detach_latents: bool = eqx.field(static=True)
     use_cond: bool = eqx.field(static=True)
 
@@ -243,40 +219,29 @@ class FluxDecoder(eqx.Module):
         depth: int,
         *,
         key,
-        reduction: str = "max",
         attn_drop: float = 0.1,
         drop: float = 0.0,
         detach_latents: bool = False,
         n_cond: int = 0,
         cond_embed_dim: int = 128,
     ):
-        if reduction not in ("max", "mean", "integral"):
-            raise ValueError(f"unknown flux reduction {reduction!r}")
-        ks = jr.split(key, 2 * len(left_dims) + 1)
+        kb, km = jr.split(key)
         self.blocks = [
             LatentMixingTransformer(
                 left_dims[i],
                 right_dims[i],
                 num_heads,
                 depth,
-                key=ks[i],
+                key=k,
                 attn_drop=attn_drop,
                 drop=drop,
                 n_cond=n_cond,
                 cond_embed_dim=cond_embed_dim,
             )
-            for i in range(len(left_dims))
+            for i, k in enumerate(jr.split(kb, len(left_dims)))
         ]
-        if reduction == "integral":
-            self.reductions = [
-                RSpaceReduce(d, d, num_heads, key=ks[len(left_dims) + i], attn_drop=0.1)
-                for i, d in enumerate(left_dims)
-            ]
-        else:
-            self.reductions = None
         flux_latent = int(sum(left_dims))
-        self.flux_mlp = MLP([flux_latent, flux_latent // 2, 1], act_fn=gelu, drop=drop, key=ks[-1])
-        self.reduction = reduction
+        self.flux_mlp = MLP([flux_latent, flux_latent // 2, 1], act_fn=gelu, drop=drop, key=km)
         self.detach_latents = detach_latents
         self.use_cond = n_cond > 0
 
@@ -292,60 +257,10 @@ class FluxDecoder(eqx.Module):
     ) -> jnp.ndarray:
         if self.detach_latents:
             left, right = jax.lax.stop_gradient(left), jax.lax.stop_gradient(right)
-        k_mix, k_red = split_key(key, 2)
         x = self.blocks[i](
-            left, right, cond if self.use_cond else None, key=k_mix, inference=inference
+            left, right, cond if self.use_cond else None, key=key, inference=inference
         )
-        if self.reduction == "integral":
-            return self.reductions[i](x, key=k_red, inference=inference)
-        x = x.reshape(-1, x.shape[-1])
-        return jnp.max(x, axis=0) if self.reduction == "max" else jnp.mean(x, axis=0)
+        return jnp.max(x.reshape(-1, x.shape[-1]), axis=0)
 
     def __call__(self, flux_lats, *, key=None, inference: bool = True) -> jnp.ndarray:
         return self.flux_mlp(jnp.concatenate(flux_lats, axis=-1), key=key, inference=inference)
-
-
-class RSpaceReduce(eqx.Module):
-    """Pool every spatial axis into a single token (used by the flux head)."""
-
-    kv: Linear
-    proj: Linear
-    integral_token: jax.Array
-    buffer_fields = ("integral_token",)
-    num_heads: int = eqx.field(static=True)
-    head_dim: int = eqx.field(static=True)
-    out_dim: int = eqx.field(static=True)
-    scale: float = eqx.field(static=True)
-    attn_drop: float = eqx.field(static=True)
-
-    def __init__(
-        self,
-        dim: int,
-        out_dim: int,
-        num_heads: int,
-        *,
-        key,
-        gain: float = 1e-2,
-        attn_drop: float = 0.0,
-    ):
-        assert dim % num_heads == 0
-        self.attn_drop = attn_drop
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.out_dim = out_dim
-        self.scale = self.head_dim**-0.5
-        kkv, kp, kt = jr.split(key, 3)
-        self.kv = Linear(dim, 2 * dim, key=kkv, use_bias=False)
-        self.proj = Linear(dim, out_dim, key=kp, use_bias=True)
-        self.integral_token = gain * jr.normal(kt, (1, 1, dim))
-
-    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
-        # x: (..., C) -> one group holding every token
-        x_t = x.reshape(1, -1, x.shape[-1])
-        kv = self.kv(x_t).reshape(1, x_t.shape[1], 2, self.num_heads, self.head_dim)
-        q = self.integral_token.reshape(1, self.num_heads, self.head_dim)
-        out = _pool_attention(
-            q, kv[:, :, 0], kv[:, :, 1], self.scale, self.attn_drop, key, inference
-        )
-        out = out.reshape(1, self.num_heads * self.head_dim)
-        return self.proj(out).reshape(self.out_dim)

@@ -14,10 +14,7 @@ import json
 import os
 import re
 
-SPLIT_TRAJECTORIES = {
-    "id": "iteration_{8,115,131,148,235,262}",
-    "ood": "ood_iteration_{0-4}",
-}
+SPLIT_TRAJECTORIES = {"id": "iteration_{8,115,131,148,235,262}", "ood": "ood_iteration_{0-4}"}
 
 
 def _save_plot(obj, path: str) -> None:
@@ -31,14 +28,11 @@ def _save_plot(obj, path: str) -> None:
 
 def trained_latent_scale(dit_ckpt: str, cfg):
     """``latent_scale`` from a jax checkpoint's meta, else from the run config, else None."""
-    import pickle
+    from neugk_jax.training.checkpoint import load_meta
 
-    if dit_ckpt.endswith(".eqx"):
-        with open(dit_ckpt, "rb") as f:
-            meta = pickle.load(f).get("meta") or {}
-        if meta.get("latent_scale") is not None:
-            return float(meta["latent_scale"])
-    value = cfg.get("latent_scale")
+    value = load_meta(dit_ckpt).get("latent_scale") if dit_ckpt.endswith(".eqx") else None
+    if value is None:
+        value = cfg.get("latent_scale")
     return None if value is None else float(value)
 
 
@@ -83,13 +77,11 @@ def main():
     from omegaconf import OmegaConf
 
     from neugk_jax.dataset.factory import build_dataset
+    from neugk_jax.diffusion.runner import load_autoencoder
     from neugk_jax.evaluate import DiffusionEvaluator
+    from neugk_jax.models.build import build_dit_from_config
     from neugk_jax.training.runner import conditioning_slots
-    from neugk_jax.translate import (
-        build_ae_from_config,
-        build_dit_from_config,
-        load_or_translate,
-    )
+    from neugk_jax.translate import load_or_translate
 
     cfg = OmegaConf.load(args.config)
     dcfg = cfg.get("dataset") or OmegaConf.create({})
@@ -98,8 +90,7 @@ def main():
         dcfg.backend = "numpy"
 
     # ae config lives next to the ae checkpoint, same convention as FlowMatchingRunner
-    ae_cfg = os.path.join(os.path.dirname(args.ae_ckpt), "config.yaml")
-    ae = load_or_translate(build_ae_from_config(ae_cfg, key=jr.PRNGKey(0)), args.ae_ckpt)
+    ae = load_autoencoder(args.ae_ckpt)
     dit = load_or_translate(
         build_dit_from_config(args.config, ae, key=jr.PRNGKey(0)), args.dit_ckpt
     )
