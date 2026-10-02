@@ -113,13 +113,13 @@ class PatchEmbed(eqx.Module):
 
 
 def merge_grid(grid_size: Sequence[int]) -> tuple[int, ...]:
-    return tuple((g + 1) // 2 if g >= 2 else g for g in grid_size)
+    return tuple((g + 1) // 2 if g > 2 else g for g in grid_size)
 
 
 class PatchMerge(eqx.Module):
     """Fold with patch=2 + norm + linear up-project.
 
-    Halves every spatial axis with size ≥ 2; channels become ``dim * c_multiplier``.
+    Halves every spatial axis with more than 2 patches; channels become ``dim * c_multiplier``.
     """
 
     proj: Linear
@@ -137,7 +137,7 @@ class PatchMerge(eqx.Module):
         c_multiplier: int = 2,
         rms_norm: bool = False,
     ):
-        self.patch_size = tuple(2 if g >= 2 else 1 for g in grid_size)
+        self.patch_size = tuple(2 if g > 2 else 1 for g in grid_size)
         # odd-length axes round up; forward pads them to the next multiple
         self.target_grid_size = merge_grid(grid_size)
         in_features = dim * math.prod(self.patch_size)

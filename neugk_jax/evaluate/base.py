@@ -59,9 +59,13 @@ def recon_metrics(pred, x, pred_d, tgt_d) -> dict:
     }
 
 
+def take_rows(table: dict, fids) -> dict:
+    return jax.tree_util.tree_map(lambda a: a[fids], table)
+
+
 def integrate(geom, fids, df, phi=None):
     """Batched flux integral of a denormalized df (separate-zf layouts are recombined)."""
-    g = jax.tree_util.tree_map(lambda a: a[fids], geom)
+    g = take_rows(geom, fids)
     df = recombine_zf(df, axis=1)
     if phi is None:
         return jax.vmap(flux_integral)(g, df)

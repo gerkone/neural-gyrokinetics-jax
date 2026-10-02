@@ -142,7 +142,8 @@ class SwinNDUnet(eqx.Module):
     and widths are still derived), ``build_middle=False`` the global-attention bottleneck and
     its upscale; owners of such a U-Net drive those parts themselves.
     ``decoder_rms_norm`` selects the norm of the decoder Swin layers and the bottleneck
-    upscale, independently of ``rms_norm``.
+    upscale, independently of ``rms_norm``. ``enc_cond_dim`` / ``dec_cond_dim`` set the
+    condition width of the encoder / decoder stages (0: unconditioned), else ``n_cond`` sets both.
     """
 
     patch_embed: Optional[PatchEmbed]
@@ -190,6 +191,8 @@ class SwinNDUnet(eqx.Module):
         rms_norm: bool = False,
         decoder_rms_norm: bool = False,
         up_use_skip: bool = True,
+        enc_cond_dim: Optional[int] = None,
+        dec_cond_dim: Optional[int] = None,
         cond_mode: str = "dit",
         legacy_double_shortcut: bool = False,
         n_cond: int = 0,
@@ -229,6 +232,9 @@ class SwinNDUnet(eqx.Module):
         if n_cond > 0:
             self.cond_embed = ContinuousConditionEmbed(cond_embed_dim, n_cond, key=keys[-1])
             cond_dim = self.cond_embed.cond_dim
+        # per-path overrides of the u-net condition; 0 disables conditioning on that path
+        down_cond = cond_dim if enc_cond_dim is None else (enc_cond_dim or None)
+        up_cond = cond_dim if dec_cond_dim is None else (dec_cond_dim or None)
         layer_kw = dict(
             mlp_ratio=hidden_mlp_ratio,
             drop_path=drop_path,
@@ -258,7 +264,7 @@ class SwinNDUnet(eqx.Module):
                     key=keys[1 + i],
                     c_multiplier=c_multiplier,
                     rms_norm=rms_norm,
-                    **layer_kw,
+                    **{**layer_kw, "cond_dim": down_cond},
                 )
                 self.down_blocks.append(blk)
             down_dims.append(down_dims[i] * c_multiplier)
@@ -310,7 +316,7 @@ class SwinNDUnet(eqx.Module):
                     use_skip=up_use_skip,
                     rms_norm=rms_norm,
                     decoder_rms_norm=decoder_rms_norm,
-                    **layer_kw,
+                    **{**layer_kw, "cond_dim": up_cond},
                 )
             )
 
@@ -326,7 +332,7 @@ class SwinNDUnet(eqx.Module):
             norm=False,
             use_conv=conv_patch,
             patch_skip=unpatch_patch_skip,
-            cond_dim=cond_dim,
+            cond_dim=up_cond,
         )
         self.base_resolution = tuple(base_resolution)
         self.patch_size = tuple(patch_size)

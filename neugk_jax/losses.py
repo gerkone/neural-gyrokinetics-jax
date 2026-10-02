@@ -20,6 +20,10 @@ def per_sample_rel_l2(p, t, eps: float = 1e-12):
     return jnp.linalg.norm(_flat(p - t), axis=-1) / (jnp.linalg.norm(_flat(t), axis=-1) + eps)
 
 
+def per_sample_rel_l1(p, t, eps: float = 1e-8):
+    return jnp.sum(jnp.abs(_flat(p - t)), axis=-1) / (jnp.sum(jnp.abs(_flat(t)), axis=-1) + eps)
+
+
 def per_sample_rel_norm_mse(p, t, eps: float = 1e-4):
     return jnp.sum(_flat(p - t) ** 2, axis=-1) / (jnp.sum(_flat(t) ** 2, axis=-1) + eps)
 
@@ -47,6 +51,26 @@ def df_loss(pred: jnp.ndarray, target: jnp.ndarray, *, separate_zf: bool = False
         zf_loss = jnp.mean((pred[:, :2] - target[:, :2]) ** 2)
         return zf_loss + relative_norm_mse(pred[:, 2:], target[:, 2:])
     return relative_norm_mse(pred, target)
+
+
+def recon_loss(pred, target, loss_type: str = "mse", *, separate_zf: bool = False, eps=1e-8):
+    """Batch ``mse`` | ``l1`` | ``relative_mse`` | ``relative_l1`` (global ratios) loss.
+
+    ``separate_zf`` sums it over the zf (0:2) and the other (2:) channel slots.
+    """
+    if separate_zf:
+        zf = recon_loss(pred[:, :2], target[:, :2], loss_type)
+        return zf + recon_loss(pred[:, 2:], target[:, 2:], loss_type)
+    if loss_type == "l1":
+        return l1(pred, target)
+    d = pred - target
+    if loss_type == "mse":
+        return jnp.mean(d**2)
+    if loss_type == "relative_mse":
+        return jnp.sum(d**2) / (jnp.sum(target**2) + eps)
+    if loss_type == "relative_l1":
+        return jnp.sum(jnp.abs(d)) / (jnp.sum(jnp.abs(target)) + eps)
+    raise NotImplementedError(f"loss_type {loss_type!r} is not supported")
 
 
 def l1(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:

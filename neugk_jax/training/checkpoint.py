@@ -23,6 +23,17 @@ import numpy as np
 from neugk_jax.utils import atomic_write
 
 
+def resolve_checkpoint(path) -> Path:
+    """Checkpoint file for a run directory (``best.eqx``, else ``best.pth``) or a file path."""
+    p = Path(path)
+    if p.is_dir():
+        for name in ("best.eqx", "best.pth"):
+            if (p / name).exists():
+                return p / name
+        raise FileNotFoundError(f"no best.eqx / best.pth in {p}")
+    return p
+
+
 def _to_numpy_tree(tree):
     return jax.tree_util.tree_map(lambda x: np.asarray(x) if isinstance(x, jax.Array) else x, tree)
 
@@ -94,6 +105,11 @@ def load_checkpoint(path: str | os.PathLike, model_template) -> CheckpointState:
         loss=float(bundle["loss"]),
         meta=bundle.get("meta", {}),
     )
+
+
+def read_checkpoint_meta(path: str | os.PathLike) -> dict:
+    with open(path, "rb") as f:
+        return pickle.load(f).get("meta", {})
 
 
 class AsyncCheckpointer:

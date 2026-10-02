@@ -1,10 +1,10 @@
 """Flux integrals and spectral fields of a spatial df.
 
 ``precompute_geometry`` + ``flux_integral`` are the jittable single-sample field solve and
-fluxes used in training and evaluation. ``gyaradax_spectral_fields`` keeps the per-mode
-potential and heat flux for the spectral metrics via the ``gyaradax`` package (electrostatic
-only); it runs in float64 inside a local ``jax.enable_x64`` context and undoes gyaradax's
-global x64 switch on import.
+fluxes used in training and evaluation, ``spectral_integrals`` adds the ky spectra.
+``gyaradax_spectral_fields`` keeps the per-mode potential and heat flux for the spectral
+metrics via the ``gyaradax`` package (electrostatic only); it runs in float64 inside a local
+``jax.enable_x64`` context and undoes gyaradax's global x64 switch on import.
 """
 
 from __future__ import annotations
@@ -259,3 +259,22 @@ def flux_spectrum(geom_t: dict, df: jnp.ndarray) -> jnp.ndarray:
     """Per-ky heat flux of a spatial df (the field-solved potential's)."""
     spec = df_to_spec(df)
     return _pev_fluxes(geom_t, spec, *_solve_fields(geom_t, spec), axis=(0, 1, 2, 3))[1]
+
+
+def spectral_integrals(geom_t: dict, df: jnp.ndarray, *, ds: float) -> dict:
+    """Jittable single-sample potential, fluxes and ky spectra from a spatial df.
+
+    Same field solve as :func:`flux_integral`. Returns ``phi`` (dataset layout), the scalar
+    ``pflux`` / ``eflux``, ``kyspec = ds * sum_(s, kx) |phi_k|^2`` and ``qspec``, the heat
+    flux per ky.
+    """
+    spec = df_to_spec(df)
+    phi_s, apar_s, bpar_s = _solve_fields(geom_t, spec)
+    pflux, eflux, _ = _pev_fluxes(geom_t, spec, phi_s, apar_s, bpar_s, axis=(0, 1, 2, 3))
+    return {
+        "phi": spec_to_phi(jnp.transpose(phi_s, (1, 0, 2))),
+        "pflux": jnp.sum(pflux),
+        "eflux": jnp.sum(eflux),
+        "kyspec": ds * jnp.sum(jnp.real(phi_s) ** 2 + jnp.imag(phi_s) ** 2, axis=(0, 1)),
+        "qspec": eflux,
+    }

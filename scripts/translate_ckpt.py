@@ -22,21 +22,25 @@ def main():
     p.add_argument(
         "--strict", action="store_true", help="abort on any leaf that has no torch counterpart"
     )
+    p.add_argument("--legacy-swin-shortcut", action="store_true", help="doubled swin residual")
     args = p.parse_args()
 
     torch_state = translate.load_torch_state(args.torch_ckpt)
     print(f"loaded torch state: {len(torch_state)} keys")
     key = jr.PRNGKey(0)
+    legacy = {"legacy_double_shortcut": args.legacy_swin_shortcut or None}
     if args.kind == "dit":
         if not (args.ae_ckpt and args.ae_config):
             p.error("--kind=dit needs --ae-ckpt and --ae-config")
-        ae = load_model_only(args.ae_ckpt, build.build_ae_from_config(args.ae_config, key=key))
+        ae = load_model_only(
+            args.ae_ckpt, build.build_ae_from_config(args.ae_config, key=key, **legacy)
+        )
         template = build.build_dit_from_config(args.config, ae, key=key)
         print(f"built DiT: latent_shape={template.latent_shape}, cond_dim={template.cond_dim}")
     elif args.kind == "gyroswin":
-        template = build.build_gyroswin_from_config(args.config, key=key)
+        template = build.build_gyroswin_from_config(args.config, key=key, **legacy)
     else:
-        template = build.build_ae_from_config(args.config, key=key)
+        template = build.build_ae_from_config(args.config, key=key, **legacy)
     fn = {"ae": translate.translate_ae, "dit": translate.translate_dit}.get(
         args.kind, translate.translate_gyroswin
     )

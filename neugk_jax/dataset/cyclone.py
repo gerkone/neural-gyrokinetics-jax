@@ -322,3 +322,24 @@ class CycloneDataset:
         # parallel (s) grid spacing; None when the trajectory metadata doesn't carry it
         ds = self.metadata[fid].get("ds")
         return None if ds is None else float(ds)
+
+    def spectral_stats(self, key: str) -> dict[str, np.ndarray]:
+        """Per-mode ``mean`` / ``std`` of ``log1p`` of a served spectrum (``kyspec``, ``fluxspec``).
+
+        Pooled over the trajectories from ``offset`` on, each weighted by its timestep count.
+        """
+        missing = [self.files[f] for f, m in self.metadata.items() if key not in m]
+        if missing:
+            raise KeyError(f"no {key!r} in the metadata of {len(missing)} trajectories")
+        rms = RunningStats(prior_count=1e-4)
+        for meta in self.metadata.values():
+            spec = np.log1p(np.asarray(meta[key], dtype=np.float64)[self.offset :])
+            rms.merge(
+                spec.mean(axis=0),
+                spec.var(axis=0),
+                spec.min(axis=0),
+                spec.max(axis=0),
+                count=len(meta["timesteps"][self.offset :]),
+            )
+        stats = rms.moments(np.float32)
+        return {"mean": stats["mean"], "std": stats["std"]}

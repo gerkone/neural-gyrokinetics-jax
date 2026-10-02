@@ -135,16 +135,15 @@ class RunningStats:
     def moments(self, dtype=None, axes=None) -> dict:
         """``mean``/``var``/``std``/``min``/``max``, optionally pooled over ``axes`` (keepdims).
 
-        Pooling over ``axes`` takes the mean of the means, the mean variance plus the
-        variance of the means, and the extreme min/max.
+        Pooling over ``axes`` runs in the stored precision and takes the mean of the means, the
+        mean variance plus the variance of the means, and the extreme min/max.
         """
-        mean, var = np.asarray(self.mean, np.float64), np.asarray(self.var, np.float64)
-        mn, mx = np.asarray(self.min, np.float64), np.asarray(self.max, np.float64)
+        mean, var = np.asarray(self.mean), np.asarray(self.var)
+        mn, mx = np.asarray(self.min), np.asarray(self.max)
         if axes:
-            mean, var = (
-                mean.mean(axis=axes, keepdims=True),
-                var.mean(axis=axes, keepdims=True) + mean.var(axis=axes, keepdims=True),
-            )
+            pooled = mean.mean(axis=axes, keepdims=True)
+            spread = ((mean - pooled) ** 2).mean(axis=axes, keepdims=True)
+            mean, var = pooled, var.mean(axis=axes, keepdims=True) + spread
             mn, mx = mn.min(axis=axes, keepdims=True), mx.max(axis=axes, keepdims=True)
         out = {"mean": mean, "var": var, "std": np.sqrt(var), "min": mn, "max": mx}
         return out if dtype is None else {k: v.astype(dtype) for k, v in out.items()}

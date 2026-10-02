@@ -70,6 +70,7 @@ def main():
         default=1,
         help="stochastic samples per condition (ensemble size for the flux UQ)",
     )
+    p.add_argument("--legacy-swin-shortcut", action="store_true", help="doubled swin residual")
     args = p.parse_args()
 
     # heavy imports after argparse so --help stays instant
@@ -90,7 +91,7 @@ def main():
         dcfg.backend = "numpy"
 
     # ae config lives next to the ae checkpoint, same convention as FlowMatchingRunner
-    ae = load_autoencoder(args.ae_ckpt)
+    ae = load_autoencoder(args.ae_ckpt, legacy=args.legacy_swin_shortcut)
     dit = load_or_translate(
         build_dit_from_config(args.config, ae, key=jr.PRNGKey(0)), args.dit_ckpt
     )
