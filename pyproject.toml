@@ -29,6 +29,12 @@ dependencies = [
 [project.optional-dependencies]
 cuda = ["jax[cuda12]"]
 gyro = ["gyaradax @ git+https://github.com/gerkone/gyaradax.git@master"]
+# neugk_jax.transport.gyroflow builds on BaseGKWGyaradaxPlugin, which upstream
+# TORAX does not carry yet (google-deepmind/torax#2189)
+transport = [
+    "gyaradax @ git+https://github.com/gerkone/gyaradax.git@master",
+    "torax @ git+https://github.com/gerkone/torax.git@qlgyx",
+]
 io = ["cupy-cuda12x", "kvikio-cu12"]
 h5 = ["h5py>=3"]   # H5Backend (single-file .h5 trajectories)
 dev = ["pytest>=7", "pytest-xdist", "ruff>=0.5", "h5py>=3", "huggingface_hub>=0.20"]
