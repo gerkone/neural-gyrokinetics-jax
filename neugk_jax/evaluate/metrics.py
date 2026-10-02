@@ -48,14 +48,12 @@ def diagnostics(phi_fft_: np.ndarray, eflux_field: np.ndarray, ds: float) -> Dic
     """Turbulence diagnostics from the potential FFT and the heat-flux field.
 
     The last three axes of ``phi_fft_`` are ``(nx, *, ny)``; ``kxspec`` sums the y axis,
-    ``kyspec`` sums the x (``*``) axis, and both take the central nx slice
-    (index ``shape[-3] // 2``).
+    ``kyspec`` sums the x (``*``) axis, and both sum the nx axis (the whole field line).
     """
-    nx = phi_fft_.shape[-3]
     power = phi_fft_.real**2 + phi_fft_.imag**2
     return {
-        "kxspec": np.take(power.sum(axis=-1) * ds, nx // 2, axis=-2),
-        "kyspec": np.take(power.sum(axis=-2) * ds, nx // 2, axis=-2),
+        "kxspec": power.sum(axis=(-3, -1)) * ds,
+        "kyspec": power.sum(axis=(-3, -2)) * ds,
         # heat-flux spectrum: sum everything except the trailing wavenumber axis
         "qspec": (
             eflux_field.sum(axis=tuple(range(eflux_field.ndim - 1)))

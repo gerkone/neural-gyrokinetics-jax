@@ -19,7 +19,9 @@ public data tests.
 ## Layout
 
 - `neugk_jax/models/` — equinox modules (MLP, embeddings, patching, attention, Swin/ViT, gk_unet, DiT)
-- `neugk_jax/autoencoders/` — Swin5DAE
+- `neugk_jax/pinc/` — Swin5DAE (optionally encoder / decoder conditioned), the PINC-AE
+  LoRA fine-tune on the physics losses (`experiment=pinc_revival`) and Swin5DVQVAE with EMA VQ /
+  FSQ / LFQ quantizers (`experiment=vqvae`)
 - `neugk_jax/diffusion/` — flow matching
 - `neugk_jax/gyroswin/` — GyroSwin multitask model, runner and rollout evaluator
 - `neugk_jax/dataset/` — CycloneDataset (ae / diff / next modes), binary and h5 backends
@@ -27,14 +29,14 @@ public data tests.
 - `neugk_jax/evaluate/` — base evaluator, flux integrals, spectral metrics
 - `configs/` — Hydra configs; `configs/checkpoints/` holds release model configs
 - `main.py` — Hydra entrypoint
-- `scripts/` — `translate_ckpt.py` (AE / DiT / GyroSwin), `eval_diffusion.py`
+- `scripts/` — `translate_ckpt.py` (AE / DiT / GyroSwin), `eval_diffusion.py`, `export_pinc_torch.py`
 - `docs/metrics.md` — validation metric definitions and renames
 - `tests/`
 
 ## Running
 
 Dataset paths are required: `export NEUGK_DATA=/path/to/preprocessed` (or `dataset.path=...`),
-and `experiment=diffusion` needs `ae_checkpoint=<ae run dir>`.
+and `experiment=diffusion` / `experiment=pinc_revival` need `ae_checkpoint=<ae run dir>`.
 
 ## Tests
 

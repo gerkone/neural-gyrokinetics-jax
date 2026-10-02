@@ -6,7 +6,7 @@ __all__ = ["BaseEvaluator", "AEEvaluator", "DiffusionEvaluator", "GyroSwinEvalua
 def __getattr__(name):
     # lazy re-exports to avoid circular imports with the workflow evaluators
     if name == "AEEvaluator":
-        from neugk_jax.autoencoders.eval import AEEvaluator
+        from neugk_jax.pinc.eval import AEEvaluator
 
         return AEEvaluator
     if name == "DiffusionEvaluator":

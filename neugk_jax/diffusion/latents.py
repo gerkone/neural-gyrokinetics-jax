@@ -25,14 +25,16 @@ from neugk_jax.utils import RunningStats, atomic_write, progress
 
 
 def latent_cache_path(
-    dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False
+    dataset, split: str, ae_checkpoint: str, *, decouple_mu: bool = False, kind: str = "latents"
 ) -> Path:
-    """Cache file for a split's latents.
+    """Cache file for a split's latents (``kind="latents"``) or VQ code indices (``"indices"``).
 
-    ``<path>/diff_<split>_latents_offset<o>[_mu]_<sha256(sorted basenames)[:12]>_latents_ae<run>.pkl``
-    where ``<run>`` is the last ``_`` field of the AE run directory (a checkpoint file resolves
-    to its directory).
+    ``<path>/diff_<split>_<kind>_offset<o>[_mu]_<sha256(sorted basenames)[:12]>_<kind>_<tag><run>.pkl``
+    where ``<tag>`` is ``ae`` for latents and ``vqvae`` for indices and ``<run>`` is the last ``_``
+    field of the AE run directory (a checkpoint file resolves to its directory).
     """
+    if kind not in ("latents", "indices"):
+        raise ValueError(f"unknown cache kind {kind!r}")
     basenames = sorted(os.path.basename(f) for f in dataset.files)
     file_hash = hashlib.sha256("".join(basenames).encode()).hexdigest()[:12]
     run_dir = os.path.abspath(str(ae_checkpoint))
@@ -40,12 +42,12 @@ def latent_cache_path(
         run_dir = os.path.dirname(run_dir)
     segments = [
         "diff",
-        f"{split}_latents",
+        f"{split}_{kind}",
         f"offset{dataset.offset}",
         "mu" if decouple_mu else "",
         file_hash,
-        "latents",
-        "ae" + run_dir.split("_")[-1],
+        kind,
+        ("ae" if kind == "latents" else "vqvae") + run_dir.split("_")[-1],
     ]
     return Path(dataset.path) / ("_".join(filter(None, segments)) + ".pkl")
 
@@ -111,7 +113,8 @@ def precompute_latents(
     """Encode the dataset through ``encode_fn`` into ``cache_file`` (or load it if present).
 
     ``encode_fn(df_batch, cond_batch) -> latent_batch`` maps ``(B, C, *resolution)`` to
-    ``(B, *latent_grid, latent_channels)``. Entries:
+    ``(B, *latent_grid, latent_channels)``, or to integer code grids stored flattened as int64.
+    Entries:
     ``{(fid, t_idx): {"x", "phi", "flux", "timestep", <one raw scalar per condition>}}``.
     Process 0 encodes and writes atomically, with ``meta`` (see :func:`latent_cache_meta`)
     as a ``<cache>.meta.json`` sidecar; the others wait. Every process then loads the cache
@@ -145,6 +148,8 @@ def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
             k: jnp.asarray(v) for k, v in stack_fields(samples, ("df", "conditioning")).items()
         }
         z_np = np.asarray(encode_fn(batch["df"], batch.get("conditioning")))
+        if z_np.dtype.kind in "iu":
+            z_np = z_np.reshape(len(samples), -1).astype(np.int64)
         for b, s in enumerate(samples[: int(plan.mask.sum())]):
             entry = {
                 "x": z_np[b],
@@ -163,7 +168,8 @@ def _encode_all(dataset, encode_fn: Callable, batch_size: int) -> dict:
 def latent_arrays(dataset) -> tuple[np.ndarray, np.ndarray | None]:
     """Latents ``(N, *latent_shape)`` and conditioning ``(N, n_cond)`` in flat-index order."""
     keys = [dataset.flat_index_to_file_and_tstep[i] for i in range(len(dataset))]
-    z = np.stack([np.asarray(dataset.precomputed_latents[k]["x"], np.float32) for k in keys])
+    z = np.stack([np.asarray(dataset.precomputed_latents[k]["x"]) for k in keys])
+    z = z if z.dtype.kind in "iu" else z.astype(np.float32)
     if not dataset.conditions:
         return z, None
     return z, np.stack([dataset.conditioning(f, dataset.get_timestep(f, t)) for f, t in keys])

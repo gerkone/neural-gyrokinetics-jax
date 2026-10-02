@@ -50,11 +50,18 @@ def test_flux_integral_matches_torch(sample):
 
 
 @needs_gyaradax
-def test_spectral_metrics_match_torch(sample):
+def test_spectral_metrics_match_torch(sample, monkeypatch):
+    import functools
+
     import torch
     from neugk.pinc.eval import metrics as tmetrics
 
     from neugk_jax.evaluate import metrics as jmetrics
+
+    # field-line sums (gkw kykx spectra), also where the torch tree still takes the mid slice
+    monkeypatch.setattr(
+        tmetrics, "diagnostics", functools.partial(tmetrics.diagnostics, aggregate="mean")
+    )
 
     df, geom, ds_val = sample
     rng = np.random.default_rng(0)

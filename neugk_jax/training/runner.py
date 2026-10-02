@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import optax
-from omegaconf import OmegaConf, open_dict
+from omegaconf import OmegaConf
 
 from neugk_jax.dataset.factory import build_splits
 from neugk_jax.models.utils import trainable_mask
@@ -52,10 +52,13 @@ def weight_decay_mask(params, exclude):
     return jax.tree_util.tree_map_with_path(keep, params)
 
 
-def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999):
-    """Clip + Adam chain; ``decoupled`` selects AdamW, else Adam with coupled L2 decay."""
+def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999, mask=None):
+    """Clip + Adam chain over the ``mask`` leaves (default ``trainable_mask``).
+
+    ``decoupled`` selects AdamW, else Adam with coupled L2 decay.
+    """
     wd = tcfg.get("weight_decay", 0.0)
-    params = eqx.filter(model, trainable_mask(model))
+    params = eqx.filter(model, trainable_mask(model) if mask is None else mask)
     mask = weight_decay_mask(params, tcfg.get("exclude_from_wd", []))
     clip = (
         optax.clip_by_global_norm(tcfg.get("clip_to", 1.0))
@@ -87,17 +90,22 @@ def train_update(model, opt_state, loss_fn, optimizer, mask, *, has_aux: bool = 
 
 @dataclass(frozen=True, eq=False)
 class StepSpec:
-    """Static part of a train step: the loss hook, optimizer and trainable mask (hashed by identity)."""
+    """Static part of a train step: loss hook, optimizer, trainable mask and post-update hook."""
 
     name: str
     loss_fn: Callable
     optimizer: Any
     mask: Any
+    post_update: Callable
 
 
 @eqx.filter_jit(donate="all-except-first")
 def train_step(inputs, model, opt_state, spec: StepSpec):
-    """``inputs = (batch, ctx, key)``; ``ctx`` holds the run-constant device tables (not donated)."""
+    """``inputs = (batch, ctx, key)``; ``ctx`` holds the run-constant device tables (not donated).
+
+    A ``"state"`` entry of the loss aux is not logged but handed to
+    ``spec.post_update(model, state, key) -> (model, logs)`` after the optimizer step.
+    """
     count_trace(f"train_step:{spec.name}")
     batch, ctx, key = inputs
 
@@ -107,7 +115,9 @@ def train_step(inputs, model, opt_state, spec: StepSpec):
     model, opt_state, (value, aux) = train_update(
         model, opt_state, loss, spec.optimizer, spec.mask, has_aux=True
     )
-    return model, opt_state, {"total": value, **aux}
+    aux = dict(aux)
+    model, extra = spec.post_update(model, aux.pop("state", None), jr.fold_in(key, 1))
+    return model, opt_state, {"total": value, **aux, **extra}
 
 
 @eqx.filter_jit(donate="all")
@@ -129,9 +139,10 @@ class BaseRunner:
     ``loss_fn(model, batch, key) -> (loss, aux)``, ``make_evaluator()``; optional
     ``load_batch(ds, indices, read)``, ``step_context()`` (run-constant device arrays merged
     into the batch), ``step_extras(step)`` (per-step arrays merged into the batch),
-    ``checkpoint_meta()`` (extra checkpoint metadata). Models built from the run config use
-    the corrected swin residual unless ``model.legacy_swin_shortcut`` is set; process 0
-    writes the resolved config to ``<output_path>/config.yaml``.
+    ``trainable_mask(model)`` (the leaves the optimizer updates), ``post_update(model, state,
+    key) -> (model, logs)`` (non-gradient buffer updates from the ``"state"`` loss aux),
+    ``checkpoint_meta()`` (extra checkpoint metadata). Process 0 writes the resolved config to
+    ``<output_path>/config.yaml``.
     """
 
     # validation metrics that select best.eqx, first present wins (lower is better)
@@ -143,9 +154,6 @@ class BaseRunner:
 
     def __init__(self, cfg, *, output_path: str | None = None):
         self.cfg = cfg
-        if cfg.get("model") is not None and cfg.model.get("legacy_swin_shortcut") is None:
-            with open_dict(cfg):
-                cfg.model.legacy_swin_shortcut = False
         configure_compilation_cache(cfg)
         self.dist = init_distributed()
         self.logger = Logger(
@@ -163,7 +171,9 @@ class BaseRunner:
         self.model = self.build_model(jr.PRNGKey(self.seed))
         self.setup_optimizer()
         self.ctx = replicate(self.dist, self.step_context())
-        self.spec = StepSpec(type(self).__name__, self.loss_fn, self.optimizer, self.trainable)
+        self.spec = StepSpec(
+            type(self).__name__, self.loss_fn, self.optimizer, self.trainable, self.post_update
+        )
         self._maybe_resume()
         self.evaluator = self.make_evaluator()
         self.save_config()
@@ -213,6 +223,12 @@ class BaseRunner:
     def step_context(self) -> dict:
         return {}
 
+    def trainable_mask(self, model):
+        return trainable_mask(model)
+
+    def post_update(self, model, state, key):
+        return model, {}
+
     def step_extras(self, step: int) -> dict:
         return {}
 
@@ -234,10 +250,15 @@ class BaseRunner:
             n_epochs=tcfg.n_epochs,
             min_lr=tcfg.get("final_learning_rate", 1e-6),
         )
+        self.trainable = self.trainable_mask(self.model)
         self.optimizer = build_optimizer(
-            self.schedule, tcfg, self.model, decoupled=self.decoupled_wd, b2=self.adam_b2
+            self.schedule,
+            tcfg,
+            self.model,
+            decoupled=self.decoupled_wd,
+            b2=self.adam_b2,
+            mask=self.trainable,
         )
-        self.trainable = trainable_mask(self.model)
         self.opt_state = self.optimizer.init(eqx.filter(self.model, self.trainable))
         self.model = replicate(self.dist, self.model)
         self.opt_state = replicate(self.dist, self.opt_state)

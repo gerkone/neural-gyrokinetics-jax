@@ -100,14 +100,14 @@ def test_async_checkpoint_reports_write_errors(tmp_path):
 
 
 def test_ae_train_step_does_not_retrace_across_epochs(tmp_path):
-    from test_e2e_loop import _make_traj, _tiny_ae_cfg
+    from helpers import make_traj, tiny_ae_cfg
 
-    from neugk_jax.autoencoders.runner import AERunner
+    from neugk_jax.pinc.runner import AERunner
 
     res = (4, 4, 4, 16, 8)
-    _make_traj(tmp_path, "iteration_0", n_t=5, resolution=res)
-    _make_traj(tmp_path, "iteration_1", n_t=4, resolution=res)
-    cfg = _tiny_ae_cfg(tmp_path, res, tmp_path / "run")
+    make_traj(tmp_path, "iteration_0", n_t=5, resolution=res)
+    make_traj(tmp_path, "iteration_1", n_t=4, resolution=res)
+    cfg = tiny_ae_cfg(tmp_path, res, tmp_path / "run")
     cfg.training.n_epochs = 2
     r = AERunner(cfg, output_path=cfg.output_path)
     logs1, info = r.train_epoch(1, jr.PRNGKey(0))

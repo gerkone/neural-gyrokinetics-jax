@@ -8,6 +8,8 @@ defaults:
   - override /training: diffusion
 
 workflow: diffusion
+# true for an ae trained with the doubled swin residual whose config lacks the key
+ae_legacy_swin_shortcut: false
 # sampler latent scale; null computes 1 / std of the train latents (saved to config and checkpoint)
 latent_scale: null
 model:

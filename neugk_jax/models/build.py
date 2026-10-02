@@ -1,4 +1,4 @@
-"""Model construction from configs: ``Swin5DAE``, ``DiT`` and ``GyroSwinMultitask``.
+"""Model construction from configs: ``Swin5DAE`` / ``Swin5DVQVAE``, ``DiT`` and ``GyroSwinMultitask``.
 
 Every builder takes a YAML path, an OmegaConf config or a mapping with a ``model`` section
 (and a ``dataset`` section for the resolution and the zonal-flow layout); the run builders
@@ -9,6 +9,7 @@ and the dataset it trains on. Config keys the port does not implement raise.
 from __future__ import annotations
 
 import copy
+from functools import partial
 from typing import Mapping, Optional, Sequence
 
 import jax
@@ -27,9 +28,9 @@ def force_f32(model):
     whenever ``jax_enable_x64`` is on (gyaradax flips it on import).
     """
     return jax.tree_util.tree_map(
-        lambda x: x.astype(jnp.float32)
-        if isinstance(x, jax.Array) and x.dtype == jnp.float64
-        else x,
+        lambda x: (
+            x.astype(jnp.float32) if isinstance(x, jax.Array) and x.dtype == jnp.float64 else x
+        ),
         model,
     )
 
@@ -52,8 +53,7 @@ def _df_channels(dataset: Mapping) -> int:
 
 
 def _legacy_shortcut(mcfg: Mapping, override: Optional[bool]) -> bool:
-    # checkpoints without the flag were trained with the doubled swin residual
-    return bool(mcfg.get("legacy_swin_shortcut", True)) if override is None else override
+    return bool(mcfg.get("legacy_swin_shortcut", False)) if override is None else override
 
 
 _AE_VIT_KEYS = {
@@ -64,7 +64,6 @@ _AE_VIT_KEYS = {
     "qk_norm",
     "use_rpb",
     "gated_attention",
-    # no effect on the unconditioned model or on its outputs
     "modulation",
     "gradient_checkpoint",
 }
@@ -81,6 +80,31 @@ _AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_l
 _NO_PE = {"use_abs_pe": False, "use_rope": False}
 
 
+def ae_conditioning(mcfg: Mapping) -> tuple[list[str], list[str]]:
+    # (encoder, decoder) condition names, each defaulting to model.conditioning
+    cond = list(mcfg.get("conditioning") or [])
+    enc = mcfg.get("encoder_conditioning")
+    dec = mcfg.get("decoder_conditioning")
+    return (cond if enc is None else list(enc)), (cond if dec is None else list(dec))
+
+
+def _check_ae(mcfg: Mapping, conditioned: bool) -> None:
+    vit = mcfg.get("vit", {})
+    unsupported = {
+        f"model.model_type={mcfg.get('model_type')!r}": mcfg.get("model_type", "ae")
+        not in ("ae", "vqvae"),
+        f"model.vit.modulation={vit.get('modulation')!r}": conditioned
+        and vit.get("modulation", "dit") != "dit",
+        "model.flux_head": bool((mcfg.get("flux_head") or {}).get("enable")),
+        f"model.act_fn={mcfg.get('act_fn')!r}": mcfg.get("act_fn", "GELU") != "GELU",
+        f"model.norm_fn={mcfg.get('norm_fn')!r}": mcfg.get("norm_fn", "RMSNorm")
+        not in ("RMSNorm", "LayerNorm"),
+    }
+    bad = [k for k, v in unsupported.items() if v]
+    if bad:
+        raise NotImplementedError(", ".join(bad))
+
+
 def build_ae_from_config(
     cfg_path,
     *,
@@ -88,20 +112,29 @@ def build_ae_from_config(
     resolution: Optional[Sequence[int]] = None,
     legacy_double_shortcut: Optional[bool] = None,
 ):
-    """``Swin5DAE`` of a config; ``legacy_double_shortcut`` defaults to
-    ``model.legacy_swin_shortcut``, else True."""
-    from neugk_jax.autoencoders import Swin5DAE
+    """``Swin5DAE`` (``Swin5DVQVAE`` for ``model.model_type: vqvae``) of a config.
+
+    ``model.encoder_conditioning`` / ``model.decoder_conditioning`` condition each path; an
+    absent ``model.norm_fn`` is RMSNorm for the AE and LayerNorm for the VQ-VAE.
+    ``legacy_double_shortcut`` (the doubled swin residual) defaults to
+    ``model.legacy_swin_shortcut``, else False.
+    """
+    from neugk_jax.pinc import Swin5DAE, Swin5DVQVAE
 
     cfg = to_dict(cfg_path)
     mcfg = cfg["model"]
+    vq = mcfg.get("model_type") == "vqvae"
+    enc_cond, dec_cond = ae_conditioning(mcfg)
+    _check_ae(mcfg, bool(enc_cond or dec_cond))
     vit, patch, bn = mcfg.get("vit", {}), mcfg.get("patch", {}), mcfg.get("bottleneck", {})
     validate_keys("model.vit", vit, _AE_VIT_KEYS, _NO_PE)
     validate_keys("model.patch", patch, _AE_PATCH_KEYS)
     validate_keys("model.bottleneck", bn, _AE_BOTTLENECK_KEYS)
     dataset = cfg.get("dataset", {})
     depth = vit["depth"]
+    cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
     return force_f32(
-        Swin5DAE(
+        cls(
             space=5,
             decouple_mu=mcfg.get("decouple_mu", True),
             dim=mcfg["latent_dim"],
@@ -127,11 +160,15 @@ def build_ae_from_config(
             drop_path=float(vit.get("drop_path", 0.1)),
             normalized_latent=bn.get("normalized_latent", False),
             qkv_bias=vit.get("qkv_bias", False),
-            qk_norm=vit.get("qk_norm", False),
+            qk_norm=vit.get("qk_norm", True),
             use_rpb=vit.get("use_rpb", True),
             gated_attention=vit.get("gated_attention", False),
             norm_affine=False,
+            rms_norm=mcfg.get("norm_fn", "LayerNorm" if vq else "RMSNorm") == "RMSNorm",
             legacy_double_shortcut=_legacy_shortcut(mcfg, legacy_double_shortcut),
+            use_checkpoint=bool(vit.get("gradient_checkpoint", False)),
+            encoder_conditioning=enc_cond,
+            decoder_conditioning=dec_cond,
             key=key,
         )
     )
@@ -230,7 +267,7 @@ def build_gyroswin_from_config(
     legacy_double_shortcut: Optional[bool] = None,
 ):
     """``GyroSwinMultitask`` of a config; outputs and the flux head follow the loss config,
-    ``legacy_double_shortcut`` defaults to ``model.legacy_swin_shortcut``, else True."""
+    ``legacy_double_shortcut`` defaults to ``model.legacy_swin_shortcut``, else False."""
     from neugk_jax.gyroswin.models.gyroswin import GyroSwinMultitask
     from neugk_jax.training.loss_scheduler import LossConfig
 

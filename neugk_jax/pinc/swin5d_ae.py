@@ -2,7 +2,9 @@
 
 The bottleneck inserts two extra global-attention stages (``middle_pre`` /
 ``middle_post``) around a channel projection that compresses the latent
-dimension.
+dimension. Encoder and decoder can be conditioned separately on scalar
+conditions (DiT modulation); the model takes the condition vector ordered by the
+sorted union of both key sets.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
 
+from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet
 from neugk_jax.models.patching import PatchExpand
 from neugk_jax.models.swin import BlockStack
@@ -24,6 +27,8 @@ class Swin5DAE(eqx.Module):
     """Wraps Swin5DUnet with a bottleneck projection."""
 
     backbone: Swin5DUnet
+    enc_cond_embed: Optional[ContinuousConditionEmbed]
+    dec_cond_embed: Optional[ContinuousConditionEmbed]
     middle_pre: BlockStack
     middle_post: BlockStack
     middle_downproj: Linear
@@ -35,6 +40,9 @@ class Swin5DAE(eqx.Module):
     bottleneck_dim: int = eqx.field(static=True)
     bottleneck_grid_size: tuple[int, ...] = eqx.field(static=True)
     normalized_latent: bool = eqx.field(static=True)
+    condition_keys: tuple[str, ...] = eqx.field(static=True)
+    enc_indices: Optional[tuple[int, ...]] = eqx.field(static=True)
+    dec_indices: Optional[tuple[int, ...]] = eqx.field(static=True)
 
     def __init__(
         self,
@@ -67,11 +75,32 @@ class Swin5DAE(eqx.Module):
         use_rpb: bool = False,
         gated_attention: bool = False,
         norm_affine: bool = False,
+        rms_norm: bool = True,
         legacy_double_shortcut: bool = False,
         decoder_rms_norm: bool = False,
+        use_checkpoint: bool = False,
+        encoder_conditioning: Sequence[str] = (),
+        decoder_conditioning: Sequence[str] = (),
+        cond_embed_dim: int = 32,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
+        enc_keys = tuple(sorted(encoder_conditioning or ()))
+        dec_keys = tuple(sorted(decoder_conditioning or ()))
+        union = tuple(sorted(set(enc_keys) | set(dec_keys)))
+        self.condition_keys = union
+        self.enc_indices = tuple(union.index(k) for k in enc_keys) if enc_keys else None
+        self.dec_indices = tuple(union.index(k) for k in dec_keys) if dec_keys else None
+
+        def cond_embed(keys, i):
+            if not keys:
+                return None
+            return ContinuousConditionEmbed(cond_embed_dim, len(keys), key=jr.fold_in(key, i))
+
+        self.enc_cond_embed = cond_embed(enc_keys, 7)
+        self.dec_cond_embed = cond_embed(dec_keys, 8)
+        enc_cdim = self.enc_cond_embed.cond_dim if enc_keys else 0
+        dec_cdim = self.dec_cond_embed.cond_dim if dec_keys else 0
         self.backbone = Swin5DUnet(
             space=space,
             decouple_mu=decouple_mu,
@@ -98,8 +127,11 @@ class Swin5DAE(eqx.Module):
             gated_attention=gated_attention,
             norm_affine=norm_affine,
             legacy_double_shortcut=legacy_double_shortcut,
-            rms_norm=True,
+            use_checkpoint=use_checkpoint,
+            rms_norm=rms_norm,
             decoder_rms_norm=decoder_rms_norm,
+            enc_cond_dim=enc_cdim,
+            dec_cond_dim=dec_cdim,
             # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
             build_middle=False,
@@ -114,7 +146,7 @@ class Swin5DAE(eqx.Module):
         self.bottleneck_dim = bd
         self.bottleneck_grid_size = mid_grid
 
-        # bottleneck vit blocks use affine RMSNorm regardless of the encoder setting
+        # bottleneck vit blocks use an affine norm regardless of the encoder setting
         vit_kw = dict(
             mlp_ratio=hidden_mlp_ratio,
             drop_path=drop_path,
@@ -123,13 +155,13 @@ class Swin5DAE(eqx.Module):
             qk_norm=qk_norm,
             gated_attention=gated_attention,
             norm_affine=True,
-            rms_norm=True,
+            rms_norm=rms_norm,
         )
         self.middle_pre = vit_layer(
-            mid_dim, bottleneck_depth, bottleneck_num_heads, key=k1, **vit_kw
+            mid_dim, bottleneck_depth, bottleneck_num_heads, key=k1, cond_dim=enc_cdim, **vit_kw
         )
         self.middle_post = vit_layer(
-            mid_dim, bottleneck_depth, bottleneck_num_heads, key=k2, **vit_kw
+            mid_dim, bottleneck_depth, bottleneck_num_heads, key=k2, cond_dim=dec_cdim, **vit_kw
         )
         self.middle_downproj = Linear(mid_dim, bd, key=k3)
         self.middle_upproj = Linear(bd, mid_dim, key=k4)
@@ -151,31 +183,54 @@ class Swin5DAE(eqx.Module):
             self.post_z_norm = None
         self.normalized_latent = normalized_latent
 
-    def encode(self, df: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
+    @staticmethod
+    def _embed(embed, condition, indices):
+        if embed is None:
+            return None
+        if condition is None:
+            raise ValueError("this autoencoder is conditioned; pass `condition`")
+        return embed(condition[jnp.asarray(indices)])
+
+    def bottleneck(self, z: jnp.ndarray, *, inference: bool = True) -> tuple[jnp.ndarray, dict]:
+        return z, {}
+
+    def encode(
+        self, df: jnp.ndarray, condition=None, *, key=None, inference: bool = True
+    ) -> jnp.ndarray:
+        cond = self._embed(self.enc_cond_embed, condition, self.enc_indices)
         keys = split_key(key, len(self.backbone.down_blocks) + 1)
         z = self.backbone.patch_encode(df)
         for blk, k in zip(self.backbone.down_blocks, keys):
-            z = blk(z, return_skip=False, key=k, inference=inference)
-        z = self.middle_downproj(self.middle_pre(z, key=keys[-1], inference=inference))
+            z = blk(z, cond, return_skip=False, key=k, inference=inference)
+        z = self.middle_downproj(self.middle_pre(z, cond, key=keys[-1], inference=inference))
         return self.pre_z_norm(z) if self.normalized_latent else z
 
-    def decode(self, z: jnp.ndarray, *, key=None, inference: bool = True):
+    def decode(self, z: jnp.ndarray, condition=None, *, key=None, inference: bool = True):
+        cond = self._embed(self.dec_cond_embed, condition, self.dec_indices)
         keys = split_key(key, len(self.backbone.up_blocks) + 1)
         if self.normalized_latent:
             z = self.post_z_norm(z)
-        z = self.middle_post(self.middle_upproj(z), key=keys[0], inference=inference)
+        z = self.middle_post(self.middle_upproj(z), cond, key=keys[0], inference=inference)
         z = self.middle_upscale(z)
         # no skip connections in the ae decoder
         for blk, k in zip(self.backbone.up_blocks, keys[1:]):
-            z = blk(z, key=k, inference=inference)
-        return {"df": self.backbone.patch_decode(z)}
+            z = blk(z, None, cond, key=k, inference=inference)
+        return {"df": self.backbone.patch_decode(z, cond)}
 
     def __call__(
-        self, df: jnp.ndarray, return_latent: bool = False, *, key=None, inference: bool = True
+        self,
+        df: jnp.ndarray,
+        condition=None,
+        return_latent: bool = False,
+        *,
+        key=None,
+        inference: bool = True,
     ):
         k_enc, k_dec = split_key(key, 2)
-        z = self.encode(df, key=k_enc, inference=inference)
-        out = self.decode(z, key=k_dec, inference=inference)
+        z = self.encode(df, condition, key=k_enc, inference=inference)
+        z, extra = self.bottleneck(z, inference=inference)
+        out = self.decode(z, condition, key=k_dec, inference=inference)
+        out.update(extra)
         if return_latent:
             out["latent"] = z
         return out

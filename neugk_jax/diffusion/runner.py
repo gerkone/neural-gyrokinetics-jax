@@ -24,19 +24,9 @@ from neugk_jax.diffusion.latents import (
     load_precomputed_latents,
 )
 from neugk_jax.models.build import build_dit
+from neugk_jax.training.checkpoint import resolve_checkpoint
 from neugk_jax.training.runner import BaseRunner, conditioning_slots
 from neugk_jax.utils import to_dict
-
-
-def resolve_ae_checkpoint(path) -> Path:
-    """AE checkpoint file for a run directory (``best.eqx``, else ``best.pth``) or a file path."""
-    p = Path(path)
-    if p.is_dir():
-        for name in ("best.eqx", "best.pth"):
-            if (p / name).exists():
-                return p / name
-        raise FileNotFoundError(f"no best.eqx / best.pth in {p}")
-    return p
 
 
 def _same_path(a, b) -> bool:
@@ -75,16 +65,21 @@ def check_ae_dataset(ae_dataset: dict, dataset: dict) -> None:
         raise ValueError(f"diffusion dataset does not match the AE run's dataset:\n{lines}")
 
 
-def load_autoencoder(path, *, resolution=None, dataset: dict | None = None):
-    """AE of a run directory or checkpoint file; ``dataset`` is checked against the run's."""
+def load_autoencoder(path, *, resolution=None, dataset: dict | None = None, legacy=False):
+    """AE of a run directory or checkpoint file; ``dataset`` is checked against the run's.
+
+    ``legacy`` forces the doubled swin residual, else ``model.legacy_swin_shortcut`` decides.
+    """
     from neugk_jax.models.build import build_ae_from_config
     from neugk_jax.translate import load_or_translate
 
-    ae_file = resolve_ae_checkpoint(path)
+    ae_file = resolve_checkpoint(path)
     ae_cfg = to_dict(str(ae_file.parent / "config.yaml"))
     if dataset is not None:
         check_ae_dataset(ae_cfg.get("dataset") or {}, dataset)
-    template = build_ae_from_config(ae_cfg, key=jr.PRNGKey(0), resolution=resolution)
+    template = build_ae_from_config(
+        ae_cfg, key=jr.PRNGKey(0), resolution=resolution, legacy_double_shortcut=legacy or None
+    )
     return load_or_translate(template, str(ae_file))
 
 
@@ -106,10 +101,13 @@ class FlowMatchingRunner(BaseRunner):
         self.build_data("ae")
         dcfg = to_dict(cfg.dataset)
         self.ae = load_autoencoder(
-            cfg.ae_checkpoint, resolution=self.train_ds.resolution, dataset=dcfg
+            cfg.ae_checkpoint,
+            resolution=self.train_ds.resolution,
+            dataset=dcfg,
+            legacy=bool(cfg.get("ae_legacy_swin_shortcut", False)),
         )
         self.latent_shape = (*self.ae.bottleneck_grid_size, int(self.ae.bottleneck_dim))
-        ae_file = resolve_ae_checkpoint(cfg.ae_checkpoint)
+        ae_file = resolve_checkpoint(cfg.ae_checkpoint)
         for ds, key in ((self.train_ds, "latents_cache_train"), (self.val_ds, "latents_cache_val")):
             meta = latent_cache_meta(
                 ds, ae_file, normalization_stats=dcfg.get("normalization_stats")

@@ -53,7 +53,7 @@ def translated(state):
 
 
 @pytest.fixture(scope="module")
-def torch_model(hf_large_weights):
+def torch_model(hf_large_weights, single_swin_residual):
     import torch
     from neugk.gyroswin.models import get_model
     from omegaconf import OmegaConf
