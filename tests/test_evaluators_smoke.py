@@ -7,75 +7,24 @@ fixed-shape padded batches and no retracing across epochs.
 
 from __future__ import annotations
 
-import pickle
-from pathlib import Path
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
+from helpers import make_traj
 from omegaconf import OmegaConf
 
 from neugk_jax.evaluate import AEEvaluator, DiffusionEvaluator
 from neugk_jax.utils import TRACE_COUNTS
 
 
-def _make_geometry(resolution):
-    """Shape-consistent single-species geometry for gyaradax on a tiny grid."""
-    vp, mu, s, x, y = resolution
-    return {
-        "krho": np.arange(y, dtype=np.float64) * 0.5,  # ky=0 zonal mode at index 0
-        "kxrh": (np.arange(x, dtype=np.float64) - x // 2) * 0.4,
-        "ints": np.full(s, 1.0 / s, dtype=np.float64),
-        "intmu": np.linspace(0.1, 0.4, mu, dtype=np.float64),
-        "intvp": np.full(vp, 0.5, dtype=np.float64),
-        "vpgr": np.linspace(-1.5, 1.5, vp, dtype=np.float64),
-        "mugr": np.linspace(0.1, 1.6, mu, dtype=np.float64),
-        "bn": np.ones(s, dtype=np.float64),
-        "ffun": np.ones(s, dtype=np.float64),
-        "efun": np.ones(s, dtype=np.float64),
-        "rfun": np.ones(s, dtype=np.float64),
-        "bt_frac": np.ones(s, dtype=np.float64),
-        "parseval": np.where(np.arange(y) == 0, 1.0, 2.0).astype(np.float64),
-        "little_g": np.tile(np.array([1.0, 0.0, 1.0]), (s, 1)),
-        **{
-            k: np.ones((1,), dtype=np.float64)
-            for k in ("mas", "tmp", "de", "d2X", "signz", "signB", "vthrat")
-        },
-    }
-
-
-def _make_traj(root: Path, name: str, *, n_t: int, resolution):
-    traj = root / f"{name}_ifft_realpotens"
-    data = traj / "data"
-    data.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(hash(name) & 0xFFFFFFFF)
-    for t in range(n_t):
-        rng.standard_normal((2, *resolution)).astype(np.float32).tofile(
-            data / f"timestep_{t:05d}.bin"
-        )
-    meta = {
-        "timesteps": np.arange(n_t, dtype=np.float64),
-        "flux": rng.standard_normal(n_t).astype(np.float32),
-        "ion_temp_grad": np.array([2.3], dtype=np.float32),
-        "density_grad": np.array([1.1], dtype=np.float32),
-        "s_hat": np.array([0.8], dtype=np.float32),
-        "q": np.array([1.4], dtype=np.float32),
-        "resolution": np.array(resolution),
-        "ds": np.float64(0.0625),
-        "geometry": _make_geometry(resolution),
-    }
-    with open(traj / "metadata.pkl", "wb") as f:
-        pickle.dump(meta, f)
-
-
 @pytest.fixture
 def tiny_setup(tmp_path):
     """A synthetic single-trajectory dataset + a tiny Swin5DAE."""
     resolution = (4, 4, 4, 16, 8)
-    _make_traj(tmp_path, "iteration_0", n_t=4, resolution=resolution)
+    make_traj(tmp_path, "iteration_0", n_t=4, resolution=resolution)
     from neugk_jax.dataset import CycloneDataset, NumpyBackend
 
     ds = CycloneDataset(
@@ -89,7 +38,7 @@ def tiny_setup(tmp_path):
         separate_zf=False,
         normalization=None,
     )
-    from neugk_jax.autoencoders import Swin5DAE
+    from neugk_jax.pinc import Swin5DAE
 
     ae = Swin5DAE(
         space=5,
@@ -160,7 +109,7 @@ def test_ae_integrals_use_denormalized_df(tmp_path):
     from neugk_jax.evaluate.integrals import flux_integral, precompute_geometry
 
     resolution = (4, 4, 4, 16, 8)
-    _make_traj(tmp_path, "iteration_0", n_t=4, resolution=resolution)
+    make_traj(tmp_path, "iteration_0", n_t=4, resolution=resolution)
     common = dict(path=str(tmp_path), trajectories="iteration_0", backend=NumpyBackend())
     raw = CycloneDataset(**common)
     std = 3.0

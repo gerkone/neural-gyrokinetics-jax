@@ -9,137 +9,29 @@ finite + key-complete (AE: ``df``; FM: ``fm_loss`` and optional
 
 from __future__ import annotations
 
-import pickle
 from pathlib import Path
 
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
+from helpers import make_traj, tiny_ae_cfg
 from omegaconf import OmegaConf
-
-
-def _make_traj(root: Path, name: str, *, n_t: int, resolution):
-    traj = root / f"{name}_ifft_realpotens"
-    data = traj / "data"
-    data.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(hash(name) & 0xFFFFFFFF)
-    for t in range(n_t):
-        rng.standard_normal((2, *resolution)).astype(np.float32).tofile(
-            data / f"timestep_{t:05d}.bin"
-        )
-    meta = {
-        "timesteps": np.arange(n_t, dtype=np.float64),
-        "flux": rng.standard_normal(n_t).astype(np.float32),
-        "ion_temp_grad": np.array([2.3], dtype=np.float32),
-        "density_grad": np.array([1.1], dtype=np.float32),
-        "s_hat": np.array([0.8], dtype=np.float32),
-        "q": np.array([1.4], dtype=np.float32),
-        "resolution": np.array(resolution),
-        "geometry": {
-            k: np.ones((1,), dtype=np.float64)
-            for k in (
-                "krho",
-                "ints",
-                "intmu",
-                "intvp",
-                "vpgr",
-                "mugr",
-                "bn",
-                "efun",
-                "rfun",
-                "bt_frac",
-                "parseval",
-                "mas",
-                "tmp",
-                "d2X",
-                "signz",
-                "signB",
-                "kxrh",
-                "little_g",
-            )
-        },
-    }
-    with open(traj / "metadata.pkl", "wb") as f:
-        pickle.dump(meta, f)
 
 
 @pytest.fixture
 def cyclone_dir(tmp_path):
     resolution = (4, 4, 4, 16, 8)
-    _make_traj(tmp_path, "iteration_0", n_t=4, resolution=resolution)
-    _make_traj(tmp_path, "iteration_1", n_t=4, resolution=resolution)
+    make_traj(tmp_path, "iteration_0", n_t=4, resolution=resolution)
+    make_traj(tmp_path, "iteration_1", n_t=4, resolution=resolution)
     return tmp_path, resolution
-
-
-def _tiny_ae_cfg(path, resolution, out_path):
-    return OmegaConf.create(
-        {
-            "workflow": "ae",
-            "seed": 0,
-            "output_path": str(out_path),
-            "model": {
-                "name": "ae",
-                "decouple_mu": True,
-                "latent_dim": 16,
-                "patch": {
-                    "patch_size": [2, 0, 2, 4, 2],
-                    "window_size": [2, 0, 2, 2, 2],
-                    "merging_depth": 1,
-                    "unmerging_depth": 1,
-                    "merging_hidden_ratio": 2.0,
-                    "unmerging_hidden_ratio": 2.0,
-                    "c_multiplier": 1,
-                },
-                "vit": {
-                    "num_heads": [2],
-                    "depth": [1],
-                    "use_rpb": False,
-                    "gated_attention": False,
-                    "qk_norm": False,
-                    "qkv_bias": False,
-                },
-                "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2, "normalized_latent": False},
-                "hidden_mlp_ratio": 2.0,
-            },
-            "dataset": {
-                "name": "cyclone",
-                "path": str(path),
-                "backend": "numpy",
-                "training_trajectories": "iteration_0",
-                "validation_trajectories": "iteration_1",
-                "input_fields": ["df"],
-                "conditions": ["itg", "dg", "s_hat", "q"],
-                "separate_zf": False,
-                "offset": 0,
-                "normalization": None,
-                "resolution": list(resolution),
-            },
-            "training": {
-                "batch_size": 1,
-                "n_epochs": 1,
-                "learning_rate": 3e-4,
-                "final_learning_rate": 1e-6,
-                "weight_decay": 0.0,
-                "clip_grad": True,
-                "clip_to": 1.0,
-                "exclude_from_wd": [],
-            },
-            "validation": {
-                "validate_every_n_epochs": 1,
-                "eval_integrals": False,
-                "eval_sampling": False,
-            },
-            "logging": {"mode": "disabled", "tqdm": False},
-        }
-    )
 
 
 def test_ae_e2e_train_eval(cyclone_dir, tmp_path):
     path, resolution = cyclone_dir
     out = tmp_path / "ae_run"
-    cfg = _tiny_ae_cfg(path, resolution, out)
-    from neugk_jax.autoencoders.runner import AERunner
+    cfg = tiny_ae_cfg(path, resolution, out)
+    from neugk_jax.pinc.runner import AERunner
 
     runner = AERunner(cfg, output_path=cfg.output_path)
     runner()  # full epoch
@@ -159,7 +51,7 @@ def test_fm_e2e_train_eval(cyclone_dir, tmp_path):
     # 1. build + save a tiny ae so the fm runner has something to load
     ae_dir = tmp_path / "ae_ckpt"
     ae_dir.mkdir()
-    ae_cfg = _tiny_ae_cfg(path, resolution, ae_dir)
+    ae_cfg = tiny_ae_cfg(path, resolution, ae_dir)
     ae_cfg.dataset.resolution = list(resolution)
     ae_cfg_path = ae_dir / "config.yaml"
     OmegaConf.save(ae_cfg, ae_cfg_path)
@@ -208,12 +100,12 @@ def test_fm_e2e_train_eval(cyclone_dir, tmp_path):
 
 
 def test_ae_resume_keeps_best_and_continues(cyclone_dir, tmp_path):
-    from neugk_jax.autoencoders.runner import AERunner
+    from neugk_jax.pinc.runner import AERunner
     from neugk_jax.training.checkpoint import load_checkpoint
 
     path, resolution = cyclone_dir
     out = tmp_path / "ae_resume"
-    cfg = _tiny_ae_cfg(path, resolution, out)
+    cfg = tiny_ae_cfg(path, resolution, out)
     AERunner(cfg, output_path=cfg.output_path)()
     first = load_checkpoint(out / "ckp.eqx", AERunner(cfg, output_path=cfg.output_path).model)
     best_val = first.meta["best_val"]
@@ -302,13 +194,3 @@ def test_run_id_format():
     import re
 
     assert re.fullmatch(r"\d{8}_\d{6}_\d{3}", _main_module().run_id())
-
-
-def test_runner_writes_config_with_corrected_residual(cyclone_dir, tmp_path):
-    from neugk_jax.autoencoders.runner import AERunner
-
-    path, resolution = cyclone_dir
-    cfg = _tiny_ae_cfg(path, resolution, tmp_path / "run")
-    AERunner(cfg, output_path=cfg.output_path)
-    saved = OmegaConf.load(tmp_path / "run" / "config.yaml")
-    assert saved.model.legacy_swin_shortcut is False

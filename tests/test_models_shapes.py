@@ -7,7 +7,6 @@ import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
-from neugk_jax.autoencoders import Swin5DAE
 from neugk_jax.diffusion.dit import DiT
 from neugk_jax.models import (
     APE,
@@ -24,6 +23,7 @@ from neugk_jax.models import (
     unpad,
     vit_layer,
 )
+from neugk_jax.pinc import Swin5DAE
 
 
 def test_linear_shapes():

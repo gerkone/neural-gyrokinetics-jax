@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
-from neugk_jax.autoencoders import Swin5DAE
+from neugk_jax.pinc import Swin5DAE
 from neugk_jax.training.checkpoint import (
     CheckpointState,
     load_checkpoint,

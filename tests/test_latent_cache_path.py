@@ -26,11 +26,11 @@ def test_cache_path_dir_and_file_agree(tmp_path):
 
 
 def _tiny_dataset(root):
-    from test_e2e_loop import _make_traj
+    from helpers import make_traj
 
     from neugk_jax.dataset import CycloneDataset, NumpyBackend
 
-    _make_traj(root, "iteration_0", n_t=4, resolution=(4, 4, 4, 16, 8))
+    make_traj(root, "iteration_0", n_t=4, resolution=(4, 4, 4, 16, 8))
     return CycloneDataset(path=str(root), trajectories="iteration_0", backend=NumpyBackend())
 
 

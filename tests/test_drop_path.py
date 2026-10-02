@@ -5,8 +5,8 @@ from __future__ import annotations
 import jax.numpy as jnp
 import jax.random as jr
 
-from neugk_jax.autoencoders.swin5d_ae import Swin5DAE
 from neugk_jax.diffusion.dit import DiT
+from neugk_jax.pinc.swin5d_ae import Swin5DAE
 
 
 def _check(fwd):

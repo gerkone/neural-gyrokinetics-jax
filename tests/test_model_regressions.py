@@ -81,7 +81,7 @@ def test_layers_reject_unknown_kwargs():
 
 
 def test_ae_backbone_has_no_dead_middle():
-    from neugk_jax.autoencoders import Swin5DAE
+    from neugk_jax.pinc import Swin5DAE
 
     ae = Swin5DAE(
         decouple_mu=True,
@@ -156,3 +156,27 @@ def test_conditioning_slots_follow_sorted_names():
         assert [ds_conds[i] for i in slots] == ["dg", "itg", "q", "s_hat"]
     assert conditioning_slots(ds_conds, []) is None
     assert np.asarray(conditioning_slots(ds_conds, ["timestep"])).tolist() == [4]
+
+
+def test_builders_default_to_the_single_swin_residual():
+    import copy
+
+    from helpers import GYROSWIN_CFG, tiny_ae_model_cfg
+
+    from neugk_jax.models.build import build_ae_from_config, build_gyroswin_from_config
+
+    ae_cfg = {"model": tiny_ae_model_cfg(), "dataset": {"resolution": [4, 4, 4, 16, 8]}}
+    del ae_cfg["model"]["legacy_swin_shortcut"]
+    gs_cfg = copy.deepcopy(GYROSWIN_CFG)
+    # film-modulated gyroswin: its plain swin blocks carry the residual option
+    gs_cfg["model"]["swin"]["modulation"] = "film"
+    cases = (
+        (build_ae_from_config, ae_cfg, lambda m: m.backbone.down_blocks[0]),
+        (build_gyroswin_from_config, gs_cfg, lambda m: m.df_unet.down_blocks[0]),
+    )
+    for build, cfg, block in cases:
+        for legacy in (None, True):
+            if legacy:
+                cfg["model"]["legacy_swin_shortcut"] = True
+            blk = block(build(cfg, key=jr.PRNGKey(0))).swin.blocks[0]
+            assert blk.legacy_double_shortcut is bool(legacy), build.__name__
