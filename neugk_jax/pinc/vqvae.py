@@ -35,7 +35,7 @@ class Swin5DVQVAE(Swin5DAE):
 
     def quantize(self, z, *, inference: bool = True):
         q, idx, aux = self.vq(z.reshape(-1, z.shape[-1]), inference=inference)
-        return q.reshape(z.shape), idx.reshape(z.shape[:-1]), aux
+        return q.reshape(z.shape).astype(z.dtype), idx.reshape(z.shape[:-1]), aux
 
     def encode_indices(self, df, condition=None):
         return self.quantize(self.encode(df, condition))[1]

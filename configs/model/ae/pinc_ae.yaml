@@ -1,6 +1,6 @@
 # decoder-conditioned 1000x swin5d ae of the pinc_revival two-stage runs
 defaults:
-  - ae/swin5d_ae@_here_
+  - /model/ae/swin5d_ae@_here_
   - _self_
 
 decoder_conditioning: [itg, dg, s_hat, q]

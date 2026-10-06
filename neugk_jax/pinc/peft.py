@@ -1,7 +1,8 @@
-"""PINC-AE PEFT: LoRA adapters on a frozen pretrained conditioned AE, trained on df + physics.
+"""PINC-AE training on df + physics, as a PEFT fine-tune or end to end.
 
-``PINCPEFTRunner`` strictly loads ``ae_checkpoint``, adapts the linears of ``model.peft.lora``
-and trains only the adapters on ``model.loss_weights`` (+ ``model.extra_loss_weights``) of
+``PINCPEFTRunner`` with ``stage=peft`` strictly loads ``ae_checkpoint``, adapts the linears of
+``model.peft.lora`` and trains only the adapters; with ``stage=joint`` it trains every weight of
+a freshly initialized AE. Both train on ``model.loss_weights`` (+ ``model.extra_loss_weights``) of
 ``df`` (MSE), ``phi_int`` / ``flux_int`` (per-snapshot relative L1 of the field solve of the
 denormalized prediction against that of the target) and the ``kyspec`` / ``qspec`` spectral
 losses.
@@ -20,7 +21,7 @@ import numpy as np
 from neugk_jax.evaluate.base import GeometryCache, take_rows
 from neugk_jax.losses import recon_loss
 from neugk_jax.models.lora import lora_mask
-from neugk_jax.pinc.eval import AEEvaluator, reconstruct
+from neugk_jax.pinc.eval import AEEvaluator
 from neugk_jax.pinc.losses import pinc_integrals, pinc_losses, pinc_terms
 from neugk_jax.pinc.runner import AERunner, read_loss_weights
 from neugk_jax.training.checkpoint import resolve_checkpoint
@@ -42,7 +43,7 @@ def uniform_ds(*datasets) -> float:
 
 
 class PINCPEFTRunner(AERunner):
-    """Adapter fine-tune of a pretrained Swin5DAE against the PINC physics losses."""
+    """Adapter fine-tune (``stage=peft``) or joint training of a Swin5DAE against the PINC losses."""
 
     val_metrics = ("phi_int_mse",)
     accepts_vq = True
@@ -62,6 +63,8 @@ class PINCPEFTRunner(AERunner):
 
         if self.cond_slots is None:
             raise ValueError("pinc peft expects a conditioned AE (model.decoder_conditioning)")
+        if not self.peft:
+            return super().build_model(key)
         if not self.cfg.get("ae_checkpoint"):
             raise ValueError("pinc peft needs ae_checkpoint (pretrained AE run dir or file)")
         k_model, k_lora = jr.split(key)
@@ -73,8 +76,12 @@ class PINCPEFTRunner(AERunner):
             print(f"lora adapters: {n / 1e6:.3f}M trainable")
         return model
 
+    @property
+    def peft(self) -> bool:
+        return self.cfg.get("stage") == "peft"
+
     def trainable_mask(self, model):
-        return lora_mask(model)
+        return lora_mask(model) if self.peft else super().trainable_mask(model)
 
     def step_context(self) -> dict:
         return {
@@ -86,7 +93,7 @@ class PINCPEFTRunner(AERunner):
     def loss_fn(self, model, batch, key):
         x, fids, norm = batch["df"], batch["file_index"], batch["norm"]
         keys = jr.split(key, x.shape[0])
-        pred = reconstruct(model, x, batch["conditioning"], keys, inference=False)["df"]
+        pred = self.forward(model, x, batch["conditioning"], keys)["df"]
         losses = pinc_losses(
             take_rows(batch["geom"], fids),
             norm.denormalize("df", pred, fids),

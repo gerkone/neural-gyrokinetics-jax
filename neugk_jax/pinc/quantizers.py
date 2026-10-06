@@ -161,7 +161,9 @@ class FSQ(eqx.Module):
         _, basis, hw = self._tables()
         b = self.bound(z.astype(jnp.float32))
         q = straight_through(b, jnp.round(b)) / hw
-        idx = jnp.round(jnp.sum((q * hw + hw) * basis, axis=-1)).astype(jnp.int32)
+        # integer digits: a float sum is exact only below 2^24 codes
+        digits = jnp.round(jax.lax.stop_gradient(q) * hw + hw).astype(jnp.int32)
+        idx = jnp.sum(digits * basis, axis=-1)
         return q, idx, {}
 
     def batch_loss(self, aux):

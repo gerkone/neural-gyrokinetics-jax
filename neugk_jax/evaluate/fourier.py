@@ -53,3 +53,10 @@ def spec_to_phi(spec, shape: Optional[Sequence[int]] = None):
     nkx, _, nky = spec.shape
     spec = xp.fft.ifftshift(spec, axes=0)
     return xp.fft.irfftn(spec, axes=(0, 2), norm="forward", s=(nkx, nky))
+
+
+def spec_to_phi_complex(spec):
+    """Complex potential of the one-sided spectrum ``(kx, s, ky)``, stacked ``(2, x, s, y)`` (re, im)."""
+    xp = spec.__array_namespace__()
+    phys = xp.fft.ifftn(xp.fft.ifftshift(spec, axes=0), axes=(0, 2), norm="forward")
+    return xp.stack([phys.real, phys.imag])

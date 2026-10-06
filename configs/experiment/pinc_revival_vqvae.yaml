@@ -1,0 +1,15 @@
+# @package _global_
+# pinc_revival base vq-vae (fsq) pretrained on df: python main.py experiment=pinc_revival_vqvae
+defaults:
+  - override /model: ae/pinc_vqvae
+  - override /dataset: cyclone_pinc
+  - override /training: pinc_ae
+
+workflow: vqvae
+training:
+  batch_size: 24  # per device; 8 x 24 with the lr of the ae runs
+  learning_rate: 2.25e-4
+  compute_dtype: bf16
+validation:
+  validate_every_n_epochs: 20
+  eval_integrals: true

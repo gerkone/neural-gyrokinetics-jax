@@ -1,0 +1,342 @@
+# torch config of the jax pinc_revival_vqvae model (export_pinc_torch.py --torch-config): the pinc_revival ae
+# architecture with an fsq bottleneck on the s-patch-2 grid, 576 codes of 16 bits per snapshot (77369x)
+experiment_id: pinc_revival_vqvae_77k (jax-trained, the torch ae architecture with
+  an fsq bottleneck on the s-patch-2 grid)
+seed: 0
+output_path: null
+ddp:
+  enable: true
+  n_nodes: 1
+  debug: false
+deepspeed:
+  enable: false
+  zero_stage: 2
+  offload_optimizer: true
+  offload_param: false
+  offload_activations: false
+  allgather_bucket_size: 500000000.0
+  reduce_bucket_size: 500000000.0
+amp:
+  enable: true
+  bfloat: true
+mode: train
+eval: true
+device: cuda
+load_ckpt: false
+workflow: pinc
+stage: autoencoder
+ae_checkpoint: null
+dataset:
+  name: cyclone
+  path: /local00/bioinf/galletti/preprocessed_kvikio
+  backend: gds
+  gds_override: false
+  prefer_dtype: bf16
+  normalization:
+    df:
+      type: zscore
+      agg_axes:
+      - 1
+      - 3
+      - 4
+      - 5
+    flux:
+      type: zscore
+      agg_axes: null
+    phi:
+      type: zscore
+      agg_axes:
+      - 0
+      - 1
+      - 2
+  normalization_scope: dataset
+  minmax_beta1: 8
+  minmax_beta2: 4
+  subsample: 1
+  val_subsample: 10
+  spatial_ifft: true
+  separate_zf: true
+  norm_decouple_mu: true
+  real_potens: true
+  split_into_bands: null
+  log_transform: false
+  num_workers: 10
+  active_keys:
+  - re
+  - im
+  input_fields:
+  - df
+  training_trajectories: iteration_{1-2,4-7,9-19,21-35,37-40,42-47,49,51-54,56-64,66-72,74-78,80-84,86-93,95-99,101-103,105-107,109-112,114-116,118-120,122-124,126-129,131-133,135-137,139-141,143-145,147-149,152-154,156-158,160-162,164-167,169-171,173-175,177-179,181-184,186-188,190-192,194-196,198-201,203-205,207-209,211-213,215-217,219-222,224,226,228-230,232-234,236-239,241-243,245-247,249-251,253-256,258-260,262-264,266-268,270-273,275-277,279-281,283-285,287-289,292-294,296-298}.h5
+  validation_trajectories:
+  - iteration_3.h5
+  - iteration_50.h5
+  - iteration_150.h5
+  - iteration_225.h5
+  - iteration_290.h5
+  test_trajectories:
+  - iteration_0.h5
+  - iteration_8.h5
+  - iteration_20.h5
+  - iteration_36.h5
+  - iteration_41.h5
+  - iteration_48.h5
+  - iteration_55.h5
+  - iteration_65.h5
+  - iteration_73.h5
+  - iteration_79.h5
+  - iteration_85.h5
+  - iteration_94.h5
+  - iteration_100.h5
+  - iteration_104.h5
+  - iteration_108.h5
+  - iteration_113.h5
+  - iteration_117.h5
+  - iteration_121.h5
+  - iteration_125.h5
+  - iteration_130.h5
+  - iteration_134.h5
+  - iteration_138.h5
+  - iteration_142.h5
+  - iteration_146.h5
+  - iteration_151.h5
+  - iteration_155.h5
+  - iteration_159.h5
+  - iteration_163.h5
+  - iteration_168.h5
+  - iteration_172.h5
+  - iteration_176.h5
+  - iteration_180.h5
+  - iteration_185.h5
+  - iteration_189.h5
+  - iteration_193.h5
+  - iteration_197.h5
+  - iteration_202.h5
+  - iteration_206.h5
+  - iteration_210.h5
+  - iteration_214.h5
+  - iteration_218.h5
+  - iteration_223.h5
+  - iteration_227.h5
+  - iteration_231.h5
+  - iteration_235.h5
+  - iteration_240.h5
+  - iteration_244.h5
+  - iteration_248.h5
+  - iteration_252.h5
+  - iteration_257.h5
+  - iteration_261.h5
+  - iteration_265.h5
+  - iteration_269.h5
+  - iteration_274.h5
+  - iteration_278.h5
+  - iteration_282.h5
+  - iteration_286.h5
+  - iteration_291.h5
+  - iteration_295.h5
+  - iteration_299.h5
+  partial_holdouts: null
+  training_cond_filters:
+    last_flux:
+    - 1.0
+    - .inf
+    first_flux:
+    - 1.0
+    - .inf
+  eval_cond_filters:
+    last_flux:
+    - 1.0
+    - .inf
+    first_flux:
+    - 1.0
+    - .inf
+  augment:
+    noise:
+      active: false
+      noise_std: 0.0001
+    mask_modes:
+      active: false
+      mask_ratio: 0.1
+      is_fourier: false
+      weights: null
+      rescale: false
+      mask_zero_mode: true
+      df_delta_weight: 1.0
+    vicreg_variance:
+      active: false
+      weight: 1.0
+    logdet:
+      active: false
+      weight: 1.0
+  offset: 80
+  timestep_std_filter: null
+  timestep_std_offset: 80
+model:
+  name: vqvae
+  model_type: vqvae
+  bundle_seq_length: 1
+  latent_dim: 1024
+  act_fn: GELU
+  norm_fn: RMSNorm
+  decouple_mu: true
+  encoder_conditioning: []
+  decoder_conditioning:
+  - itg
+  - dg
+  - s_hat
+  - q
+  extra_zf_loss: false
+  init_weights: kaiming_uniform
+  patching_init_weights: kaiming_uniform
+  cond_init_weights: normal_smallvar
+  loss_scheduler: {}
+  loss_weights:
+    df: 1.0
+    vq_commit: 1.0
+  extra_loss_weights: {}
+  patch:
+    patch_size:
+    - 4
+    - 0
+    - 2
+    - 5
+    - 4
+    window_size:
+    - 4
+    - 0
+    - 4
+    - 9
+    - 4
+    merging_depth: 2
+    unmerging_depth: 2
+    merging_hidden_ratio: 1.0
+    unmerging_hidden_ratio: 1.0
+    c_multiplier: 1.0
+  vit:
+    num_heads:
+    - 16
+    depth:
+    - 8
+    gradient_checkpoint: false
+    use_abs_pe: false
+    use_rpb: true
+    use_rope: false
+    gated_attention: true
+    modulation: dit
+    drop_path: 0.1
+    qk_norm: true
+  bottleneck:
+    dim: 32
+    norm_learnable: false
+    normalized_latent: false
+    num_heads: 4
+    depth: 2
+  vq:
+    codebook_size: 8192
+    embedding_dim: 256
+    commitment_weight: 0.25
+    codebook_type: euclidean
+    ema_decay: 0.99
+    threshold_ema_dead_code: 2
+    quantizer: fsq
+    levels:
+    - 8
+    - 8
+    - 8
+    - 5
+    - 5
+    - 5
+  legacy_swin_shortcut: true
+training:
+  batch_size: 32
+  n_epochs: 400
+  num_workers: 1
+  pin_memory: true
+  learning_rate: 0.0003
+  use_latest_checkpoint: false
+  final_learning_rate: 1.0e-06
+  weight_decay: 1.0e-06
+  exclude_from_wd:
+  - cond
+  predict_delta: false
+  scheduler: cosine
+  optimizer: adam
+  muon_lr_multiplier: 100
+  clip_grad: true
+  clip_to: 1.0
+  gradnorm_balancer: none
+  integral_precision: float64
+  params_to_include: null
+  pushforward:
+    epochs:
+    - 100
+    - 130
+    - 160
+    unrolls:
+    - 0
+    - 0
+    - 0
+    probs:
+    - 10
+    - 10
+    - 5
+  pretraining: false
+  pretraining_kwargs:
+    freeze_after: false
+    clip_grad: false
+    scheduler: null
+    weight_decay: 1.0e-05
+    lr: 0.001
+    n_epochs: 35
+    target_modules:
+    - patch_embed
+    - unpatch
+    add_noise: false
+  physics_mode: two_stage
+  integral_loss_type: relative_l1
+  spectral_loss_type: relative_l1
+  eval_loss_type: mse
+validation:
+  batch_size: 16
+  n_eval_steps: 2
+  validate_every_n_epochs: 20
+  eval_integrals: true
+  eval_sample_steps: null
+  model_selection_metric: df
+  eval_metric: null
+  probe:
+    targets:
+    - flux
+    - ion_temp_grad
+    - density_grad
+    - q
+    - s_hat
+    - kyspec
+    - fluxspec
+    - fluxavg
+    sizes:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 32
+    - 32
+    - 1
+    tsne_targets:
+    - flux
+choices:
+  experiment: ae_1000x_two_stage_pretrain
+  validation: default
+  training: default
+  logging: wandb
+  model: pinc/ae
+  dataset: pinc
+  hydra/env: default
+  hydra/callbacks: null
+  hydra/job_logging: default
+  hydra/hydra_logging: default
+  hydra/hydra_help: default
+  hydra/help: default
+  hydra/sweeper: basic
+  hydra/launcher: basic
+  hydra/output: default

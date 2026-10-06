@@ -1,0 +1,15 @@
+# @package _global_
+# single-stage pinc-ae: the pinc_revival ae trained from scratch on df + physics, every weight trainable
+#   python main.py experiment=pinc_revival_ae_joint
+defaults:
+  - override /model: ae/pinc_ae
+  - override /dataset: cyclone_pinc
+  - override /training: pinc_ae
+
+workflow: pinc
+stage: joint
+training:
+  n_epochs: 500
+validation:
+  validate_every_n_epochs: 10
+  eval_integrals: true
