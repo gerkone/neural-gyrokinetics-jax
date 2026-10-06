@@ -1,6 +1,8 @@
 batch_size: 1  # per device; the global batch is batch_size * device_count
 n_epochs: 1
 learning_rate: 3.0e-4
+# adam beta2 (null: the runner's default, 0.999 for the ae)
+adam_b2: null
 final_learning_rate: 1.0e-6
 weight_decay: 1.0e-6
 clip_grad: true

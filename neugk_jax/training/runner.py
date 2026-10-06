@@ -291,7 +291,7 @@ class BaseRunner:
             tcfg,
             self.model,
             decoupled=self.decoupled_wd,
-            b2=self.adam_b2,
+            b2=float(tcfg.get("adam_b2") or self.adam_b2),
             mask=self.trainable,
         )
         self.opt_state = self.optimizer.init(eqx.filter(self.model, self.trainable))
