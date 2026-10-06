@@ -1,0 +1,9 @@
+# the 60 held-out turbulent test trajectories (validation_trajectories) x the steady-state window, one neural field each
+path: ${oc.env:NEUGK_DATA}
+backend: kvikio
+validation_trajectories: [iteration_0, iteration_8, iteration_20, iteration_36, iteration_41, iteration_48, iteration_55, iteration_65, iteration_73, iteration_79, iteration_85, iteration_94, iteration_100, iteration_104, iteration_108, iteration_113, iteration_117, iteration_121, iteration_125, iteration_130, iteration_134, iteration_138, iteration_142, iteration_146, iteration_151, iteration_155, iteration_159, iteration_163, iteration_168, iteration_172, iteration_176, iteration_180, iteration_185, iteration_189, iteration_193, iteration_197, iteration_202, iteration_206, iteration_210, iteration_214, iteration_218, iteration_223, iteration_227, iteration_231, iteration_235, iteration_240, iteration_244, iteration_248, iteration_252, iteration_257, iteration_261, iteration_265, iteration_269, iteration_274, iteration_278, iteration_282, iteration_286, iteration_291, iteration_295, iteration_299]
+timesteps: [90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250, 260]
+# leading steps left out of the per-trajectory spectral stats
+spectral_offset: 80
+# json of per-trajectory {t0, t1, bad} onset windows (transition set, step 2); null: timesteps
+transition_windows: null

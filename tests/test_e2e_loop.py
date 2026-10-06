@@ -174,6 +174,7 @@ def test_resume_hydra_compose_cli_wins(tmp_path):
                 "seed": 3,
                 "training": {"n_epochs": 5, "learning_rate": 1.0},
                 "output_path": "elsewhere",
+                "dataset": {"prefer_dtype": "bf16"},
             }
         ),
         run / "config.yaml",
@@ -188,6 +189,7 @@ def test_resume_hydra_compose_cli_wins(tmp_path):
         merged = entry.resume_config(cfg)
     assert merged.training.n_epochs == 9 and merged.output_path == str(run)
     assert merged.seed == 3 and merged.training.learning_rate == 1.0
+    assert merged.dataset.prefer_dtype == "bf16"
 
 
 def test_run_id_format():
