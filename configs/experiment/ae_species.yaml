@@ -1,0 +1,46 @@
+# @package _global_
+# species-axis swin5d ae on a mix of data types: python main.py experiment=ae_species
+defaults:
+  - override /model: ae/swin5d_ae
+  - override /dataset: cyclone_ae
+  - override /training: ae
+
+workflow: ae
+dataset:
+  # shared keys are the defaults of every part; every part has its own path
+  path: null
+  species_axis: true
+  separate_zf: false
+  # per (channel, species, mu) of the df; each part gets statistics of its own training samples, cached in its data dir and copied into the run dir
+  normalization:
+    df: {type: zscore, agg_axes: [2, 4, 5, 6]}
+  conditions: [dg, etg, itg, kinetic, q, s_hat, temp_ratio]
+  training_cond_filters: null
+  eval_cond_filters: null
+  # sampling share of every part, a constant or a schedule as for the loss schedules (null: by size)
+  mixing:
+    adiabatic: 0.6
+    kinetic: 0.4
+  parts:
+    kinetic:
+      path: /local00/bioinf/galletti/kinetic/preprocessed_kvikio
+      # central kx modes kept on read (null: all 191)
+      kx_crop: 169
+      offset: 0
+      # the 18 test runs of kinetic_exp/work/tables/splits/kinetic_test.txt are in neither list
+      training_trajectories: iteration_{501,505-510,514-517,529,531,534-535,543-544,549-550,553,556,558,562-563,565,567,569,571-574,577-579,581,583,587-588,590,594,597-599,601,609,614,619,621,623,625,628,630-633,641,645,650,652,659,661,663,668,670,673,675,682,685,691,694-695,697-698,701-702,705,707-712,714-715,717-734,736-739,741-750,752,755-757,759-764,766,768-769,771-775,777-781,783-785,787-796,801}
+      validation_trajectories: iteration_{548,575,603,607,642,704,740,767,770}
+    adiabatic:
+      path: /local00/bioinf/galletti/preprocessed_kvikio
+      offset: 80
+      # keys of neural-gyrokinetics configs/dataset/cyclone_full.yaml
+      training_trajectories: iteration_{0-7,9-12,14-64,67-99,101-114,116-130,132-147,149-199,201-234,236-261,263-299}
+      validation_trajectories: [iteration_8, iteration_115, iteration_131, iteration_148, iteration_235, iteration_262]
+model:
+  decoder_conditioning: [dg, etg, itg, kinetic, q, s_hat, temp_ratio]
+  stems:
+    kinetic:
+      # (32, 12, 18, 169, 32) after kx_crop: the adiabatic token grid; 191 modes: patch 11
+      patch_size: [4, 0, 5, 10, 4]
+    adiabatic:
+      patch_size: [4, 0, 4, 5, 4]
