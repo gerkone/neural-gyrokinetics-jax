@@ -14,7 +14,9 @@ from typing import Mapping, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
+from neugk_jax.models.utils import init_linears, zero_init_output
 from neugk_jax.utils import to_dict
 
 # df grid (vp, mu, s, x, y) of the cyclone dataset and the release checkpoints
@@ -75,6 +77,8 @@ _AE_PATCH_KEYS = {
     "merging_hidden_ratio",
     "unmerging_hidden_ratio",
     "c_multiplier",
+    "embedding",
+    "field",
 }
 _AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable"}
 _AE_STEM_KEYS = {
@@ -84,6 +88,7 @@ _AE_STEM_KEYS = {
     "window_size",
     "in_channels",
     "out_channels",
+    "grid",
 }
 _NO_PE = {"use_abs_pe": False, "use_rope": False}
 
@@ -152,51 +157,53 @@ def build_ae_from_config(
             stems={n: {"patch_size": patch["patch_size"], **s} for n, s in stems.items()},
             n_species=max(int(s.get("n_species", 1)) for s in stems.values()),
         )
-        grid = {}
+        grid = {"field": patch.get("field")} if patch.get("embedding", "linear") == "field" else {}
     else:
+        if patch.get("embedding", "linear") != "linear":
+            raise NotImplementedError("model.patch.embedding field needs model.stems")
         cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
         grid = dict(
             space=5,
             base_resolution=list(resolution or dataset.get("resolution") or RESOLUTION),
             patch_size=patch["patch_size"],
         )
-    return force_f32(
-        cls(
-            **grid,
-            decouple_mu=mcfg.get("decouple_mu", True),
-            dim=mcfg["latent_dim"],
-            in_channels=dataset.get("in_channels", _df_channels(dataset)),
-            out_channels=dataset.get("out_channels", _df_channels(dataset)),
-            window_size=patch["window_size"],
-            depth=depth,
-            num_heads=vit["num_heads"],
-            num_layers=mcfg.get(
-                "num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4
-            ),
-            bottleneck_dim=bn.get("dim"),
-            bottleneck_depth=bn.get("depth", 2),
-            bottleneck_num_heads=bn.get("num_heads", 2),
-            hidden_mlp_ratio=mcfg.get("hidden_mlp_ratio", 2.0),
-            merging_hidden_ratio=patch.get("merging_hidden_ratio", 8.0),
-            unmerging_hidden_ratio=patch.get("unmerging_hidden_ratio", 8.0),
-            merging_depth=patch.get("merging_depth", 2),
-            unmerging_depth=patch.get("unmerging_depth", 2),
-            c_multiplier=int(patch.get("c_multiplier", 2)),
-            drop_path=float(vit.get("drop_path", 0.1)),
-            normalized_latent=bn.get("normalized_latent", False),
-            qkv_bias=vit.get("qkv_bias", False),
-            qk_norm=vit.get("qk_norm", True),
-            use_rpb=vit.get("use_rpb", True),
-            gated_attention=vit.get("gated_attention", False),
-            norm_affine=False,
-            rms_norm=mcfg.get("norm_fn", "LayerNorm" if vq else "RMSNorm") == "RMSNorm",
-            legacy_double_shortcut=_legacy_shortcut(mcfg, legacy_double_shortcut),
-            use_checkpoint=bool(vit.get("gradient_checkpoint", False)),
-            encoder_conditioning=enc_cond,
-            decoder_conditioning=dec_cond,
-            key=key,
-        )
+    model = cls(
+        **grid,
+        decouple_mu=mcfg.get("decouple_mu", True),
+        dim=mcfg["latent_dim"],
+        in_channels=dataset.get("in_channels", _df_channels(dataset)),
+        out_channels=dataset.get("out_channels", _df_channels(dataset)),
+        window_size=patch["window_size"],
+        depth=depth,
+        num_heads=vit["num_heads"],
+        num_layers=mcfg.get(
+            "num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4
+        ),
+        bottleneck_dim=bn.get("dim"),
+        bottleneck_depth=bn.get("depth", 2),
+        bottleneck_num_heads=bn.get("num_heads", 2),
+        hidden_mlp_ratio=mcfg.get("hidden_mlp_ratio", 2.0),
+        merging_hidden_ratio=patch.get("merging_hidden_ratio", 8.0),
+        unmerging_hidden_ratio=patch.get("unmerging_hidden_ratio", 8.0),
+        merging_depth=patch.get("merging_depth", 2),
+        unmerging_depth=patch.get("unmerging_depth", 2),
+        c_multiplier=int(patch.get("c_multiplier", 2)),
+        drop_path=float(vit.get("drop_path", 0.1)),
+        normalized_latent=bn.get("normalized_latent", False),
+        qkv_bias=vit.get("qkv_bias", False),
+        qk_norm=vit.get("qk_norm", True),
+        use_rpb=vit.get("use_rpb", True),
+        gated_attention=vit.get("gated_attention", False),
+        norm_affine=False,
+        rms_norm=mcfg.get("norm_fn", "LayerNorm" if vq else "RMSNorm") == "RMSNorm",
+        legacy_double_shortcut=_legacy_shortcut(mcfg, legacy_double_shortcut),
+        use_checkpoint=bool(vit.get("gradient_checkpoint", False)),
+        encoder_conditioning=enc_cond,
+        decoder_conditioning=dec_cond,
+        key=key,
     )
+    model = init_linears(model, mcfg.get("init_weights"), key=jax.random.fold_in(key, 1))
+    return force_f32(zero_init_output(model) if mcfg.get("zero_init_output") else model)
 
 
 def build_dit_from_config(cfg_path, ae, *, key):
@@ -400,7 +407,25 @@ def run_config(cfg, ds=None) -> dict:
             spec.setdefault("n_species", int(part.n_species))
             spec.setdefault("in_channels", _df_channels({"separate_zf": part.separate_zf}))
             spec.setdefault("out_channels", spec["in_channels"])
+            if (out["model"].get("patch") or {}).get("embedding") == "field":
+                spec.setdefault("grid", field_grid(part))
     return out
+
+
+def field_grid(ds) -> dict:
+    """Physical grid of a dataset (first trajectory): vpar / mu nodes and weights, (ds, dx, dy)."""
+    g = ds.geometry(0)
+    nx, ny = (int(r) for r in ds.resolution[3:])
+    # box lengths from the wavenumber spacings; x, y are the real-space grids of those modes
+    lx, ly = (2 * np.pi / np.diff(np.unique(np.asarray(g[k], np.float64))).min() for k in ("kxrh", "krho"))
+    as_list = lambda k: [float(v) for v in np.asarray(g[k], np.float64).ravel()]
+    return {
+        "vpar": as_list("vpgr"),
+        "mu": as_list("mugr"),
+        "intvp": as_list("intvp"),
+        "intmu": as_list("intmu"),
+        "spacing": [float(np.asarray(g["ints"]).ravel()[0]), float(lx / nx), float(ly / ny)],
+    }
 
 
 def build_ae(cfg, ds, *, key):

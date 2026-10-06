@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
+from neugk_jax.models.field_patching import FieldPatchEmbed, FieldUnpatch
 from neugk_jax.models.patching import (
     PatchEmbed,
     PatchExpand,
@@ -395,6 +396,8 @@ class Swin5DUnet(SwinNDUnet):
                 kwargs["merge_mask"] = drop(kwargs["merge_mask"])
             in_channels *= decoupled_dim
             out_channels *= decoupled_dim
+        field_grid = kwargs.pop("field_grid", None)
+        field = dict(kwargs.pop("field", None) or {})
         k_unet, k_vel = jr.split(key)
         super().__init__(
             space=space,
@@ -406,22 +409,40 @@ class Swin5DUnet(SwinNDUnet):
             key=k_unet,
             **kwargs,
         )
+        if field_grid is not None:
+            # coordinate-generated patch / unpatch on the same token lattice
+            ps = self.patch_embed.patch_size
+            padded = [g * p for g, p in zip(self.patch_embed.grid_size, ps)]
+            k_emb, k_unp = jr.split(jr.fold_in(key, 7))
+            mlp = dict(hidden=field.get("hidden", 256), depth=field.get("depth", 2))
+            self.patch_embed = FieldPatchEmbed(
+                padded, ps, in_channels, kwargs["dim"], field_grid, key=k_emb,
+                mlp_depth=kwargs.get("merging_depth", 2), mlp_ratio=kwargs.get("merging_hidden_ratio", 8.0),
+                act_fn=kwargs.get("act_fn", gelu), **mlp,
+            )
+            self.unpatch = FieldUnpatch(
+                kwargs["dim"], padded, ps, out_channels, field_grid, key=k_unp,
+                mlp_ratio=kwargs.get("unmerging_hidden_ratio", 8.0), rank=field.get("rank", 256),
+                cond_dim=kwargs.get("dec_cond_dim") or None, **mlp,
+            )
         self.decouple_mu = decouple_mu
         self.decoupled_dim = decoupled_dim
         self.mu_axis = mu_axis
         pe_grid = tuple(decoupled_dim if i == mu_axis else 1 for i in range(full_space))
         self.vel_pe = APE(full_in, pe_grid, key=k_vel) if decouple_mu else None
 
-    def patch_encode(self, df: jnp.ndarray) -> jnp.ndarray:
+    def patch_encode(self, df: jnp.ndarray, spacing=None) -> jnp.ndarray:
         # (C, *spatial) → channel last → vel_pe → mu folded into channels as (c mu)
         df = jnp.moveaxis(df, 0, -1)
         if self.decouple_mu:
             df = jnp.moveaxis(self.vel_pe(df), self.mu_axis, -1)
             df = df.reshape(*df.shape[:-2], -1)
-        return self.patch_embed(pad_to_blocks(df, self.patch_size))
+        x = pad_to_blocks(df, self.patch_size)
+        return self.patch_embed(x) if spacing is None else self.patch_embed(x, spacing)
 
-    def patch_decode(self, z: jnp.ndarray, condition=None) -> jnp.ndarray:
-        df = unpad(self.unpatch(z, condition), self.base_resolution)
+    def patch_decode(self, z: jnp.ndarray, condition=None, spacing=None) -> jnp.ndarray:
+        x = self.unpatch(z, condition) if spacing is None else self.unpatch(z, condition, spacing)
+        df = unpad(x, self.base_resolution)
         if self.decouple_mu:
             df = df.reshape(*df.shape[:-1], -1, self.decoupled_dim)
             return jnp.moveaxis(jnp.moveaxis(df, -1, self.mu_axis), -1, 0)
