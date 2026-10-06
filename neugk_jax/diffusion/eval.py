@@ -38,22 +38,27 @@ def _traj_id(path: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def _sample_decode(dit, ae, key, cond, n, steps, latent_scale):
+def _sample_decode(dit, ae, key, cond, n, steps, latent_scale, latent_shape=None, stem=None):
     z = euler_sample(
         lambda x, t, c=None: dit(x, t, c),
         key=key,
-        shape=(n, *dit.latent_shape),
+        shape=(n, *(latent_shape or dit.latent_shape)),
         cond=cond,
         steps=steps,
         latent_scale=latent_scale,
     )
-    return jax.vmap(lambda zi: ae.decode(zi)["df"])(z)
+    kw = {} if stem is None else {"stem": stem}
+    return jax.vmap(lambda zi: ae.decode(zi, **kw)["df"])(z)
 
 
 @traced_jit("diffusion_eval_step")
-def diffusion_eval_step(dit, ae, key, batch, acc, norm, geom, steps: int, latent_scale: float):
+def diffusion_eval_step(
+    dit, ae, key, batch, acc, norm, geom, steps: int, latent_scale: float, latent_shape=None, stem=None
+):
     x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
-    pred = _sample_decode(dit, ae, key, batch.get("cond"), x.shape[0], steps, latent_scale)
+    pred = _sample_decode(
+        dit, ae, key, batch.get("cond"), x.shape[0], steps, latent_scale, latent_shape, stem
+    )
     pred_d, tgt_d = norm.denormalize("df", pred, fids), norm.denormalize("df", x, fids)
     eflux = None
     if geom is not None:
@@ -124,6 +129,7 @@ class DiffusionEvaluator(BaseEvaluator):
         autoencoder: Any,
         latent_scale: float,
         cond_slots: Optional[np.ndarray] = None,
+        latent_shape: Optional[tuple] = None,
         steps: Optional[int] = None,
         n_samples: Optional[int] = None,
         stride: Optional[int] = None,
@@ -142,6 +148,8 @@ class DiffusionEvaluator(BaseEvaluator):
         self.ae = replicate_local(self.dist, autoencoder)
         self.latent_scale = float(latent_scale)
         self.cond_slots = cond_slots
+        self.latent_shape = None if latent_shape is None else tuple(latent_shape)
+        self.stem = getattr(val_ds, "stem", None)
         self.steps = int(steps or self.vcfg.get("eval_sample_steps", 50))
         self.n_samples = int(n_samples or self.vcfg.get("eval_n_samples", 1))
         self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
@@ -167,7 +175,17 @@ class DiffusionEvaluator(BaseEvaluator):
             for s in range(self.n_samples):
                 k = jr.fold_in(jr.fold_in(key, plan.number), s)
                 acc, eflux, pred_d, tgt_d = diffusion_eval_step(
-                    model, self.ae, k, batch, acc, self.norm, geom, self.steps, self.latent_scale
+                    model,
+                    self.ae,
+                    k,
+                    batch,
+                    acc,
+                    self.norm,
+                    geom,
+                    self.steps,
+                    self.latent_scale,
+                    self.latent_shape,
+                    self.stem,
                 )
                 if eflux is not None:
                     fluxes.append((plan, eflux))
@@ -190,34 +208,39 @@ class DiffusionEvaluator(BaseEvaluator):
     def _flux_metrics(self, fluxes: list, plots: dict) -> dict:
         from neugk_jax.evaluate.plots import avg_flux_confidence
 
-        # per trajectory: sum, square sum and count of the sampled fluxes of every process
-        traj = np.zeros((len(self.ds.files), 3), np.float64)
+        # per trajectory and species: sum, square sum and count of the sampled fluxes
+        n_sp = int(np.prod(np.shape(fluxes[0][1])[1:])) if fluxes else 1
+        traj = np.zeros((len(self.ds.files), n_sp, 3), np.float64)
         for (plan, _), e in zip(fluxes, jax.device_get([e for _, e in fluxes])):
             valid = plan.mask > 0
-            e = np.asarray(e, np.float64)[valid]
+            e = np.asarray(e, np.float64).reshape(len(valid), n_sp)[valid]
             np.add.at(traj, plan.fids[valid], np.stack([e, e**2, np.ones_like(e)], -1))
         traj = self.sum_process_arrays(traj)
-        fids = np.nonzero(traj[:, 2] > 0)[0]
+        fids = np.nonzero(traj[:, 0, 2] > 0)[0]
         if not len(fids):
             return {}
-        flux_sum, flux_sq, n = traj[fids].T
-        mean = flux_sum / n
-        std = np.sqrt(np.maximum(flux_sq / n - mean**2, 0))
-        tgt = np.asarray([self.ds.get_avg_flux(f) for f in fids])
         names = [self.traj_ids[f] or str(f) for f in fids]
-        out = {
-            "avg_flux_rmse": float(np.sqrt(np.mean((mean - tgt) ** 2))),
-            "avg_flux_rel_err": float(np.mean(np.abs(mean - tgt) / np.maximum(np.abs(tgt), 1e-9))),
-        }
-        for t, pm, ps, gt in zip(names, mean, std, tgt):
-            out[f"avg_flux_pred/{t}"], out[f"avg_flux_std/{t}"] = float(pm), float(ps)
-            out[f"avg_flux_gt/{t}"] = float(gt)
-        if len(tgt) > 2:
-            var = float(np.var(mean))
-            out["avg_flux_corr"] = float(np.corrcoef(mean, tgt)[0, 1])
-            out["avg_flux_slope"] = (
-                float(np.cov(mean, tgt)[0, 1] / var) if var > 0 else float("nan")
+        targets = np.asarray([np.reshape(self.ds.get_avg_flux(f), n_sp) for f in fids])
+        out = {}
+        for sp in range(n_sp):
+            tag = "" if n_sp == 1 else f"_s{sp}"
+            flux_sum, flux_sq, n = traj[fids, sp].T
+            mean = flux_sum / n
+            std = np.sqrt(np.maximum(flux_sq / n - mean**2, 0))
+            tgt = targets[:, sp]
+            out[f"avg_flux_rmse{tag}"] = float(np.sqrt(np.mean((mean - tgt) ** 2)))
+            out[f"avg_flux_rel_err{tag}"] = float(
+                np.mean(np.abs(mean - tgt) / np.maximum(np.abs(tgt), 1e-9))
             )
-        if self.is_rank0:
-            plots["avg_flux_UQ"] = avg_flux_confidence(mean, std, tgt, names)
+            for t, pm, ps, gt in zip(names, mean, std, tgt):
+                out[f"avg_flux_pred{tag}/{t}"], out[f"avg_flux_std{tag}/{t}"] = float(pm), float(ps)
+                out[f"avg_flux_gt{tag}/{t}"] = float(gt)
+            if len(tgt) > 2:
+                var = float(np.var(mean))
+                out[f"avg_flux_corr{tag}"] = float(np.corrcoef(mean, tgt)[0, 1])
+                out[f"avg_flux_slope{tag}"] = (
+                    float(np.cov(mean, tgt)[0, 1] / var) if var > 0 else float("nan")
+                )
+            if self.is_rank0:
+                plots[f"avg_flux_UQ{tag}"] = avg_flux_confidence(mean, std, tgt, names)
         return out

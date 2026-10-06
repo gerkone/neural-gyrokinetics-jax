@@ -107,8 +107,8 @@ def generate_val_plots(
     """Cross-section panels for validation.
 
     ``df`` is plotted with the 5D upper-triangular view (recombines the
-    separate-zf channel back to 2-channel first). ``phi`` is plotted as
-    its native 3D layout ``(s, k_x, k_y)``.
+    separate-zf channel back to 2-channel first), one panel per species when it
+    carries several. ``phi`` is plotted as its native 3D layout ``(s, k_x, k_y)``.
     """
     plots: dict[str, object] = {}
     time_str = f"T={float(ts[0]):.2f}, " if ts is not None and np.asarray(ts).size > 0 else ""
@@ -123,6 +123,12 @@ def generate_val_plots(
         if cfg["recombine"]:
             x, y = recombine_zf(x, axis=0), recombine_zf(y, axis=0)
         x, y = x.squeeze(), y.squeeze()
+        if x.ndim == 7:
+            # (C, species, vp, mu, s, x, y)
+            for sp in range(x.shape[1]):
+                fig = plot_nd(x[:, sp], y[:, sp], cmap=cfg["cmap"])
+                plots[f"{cfg['name']} species {sp}"] = _plt_to_wandb_image(fig)
+            continue
         plots[cfg["name"]] = _plt_to_wandb_image(plot_nd(x, y, cmap=cfg["cmap"]))
     return plots
 

@@ -47,7 +47,7 @@ def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, norm, geom, fiel
     if geom is not None:
         phi_i, (_, eflux, _) = integrate(geom, fids, pred_d["df"], pred_d["phi"])
         values["phi_int"] = per_sample_mse(phi_i, tgt_d["phi"].reshape(phi_i.shape))
-        values["flux_int_rel_err"] = rel_err(eflux, tgt_d["flux"].reshape(-1))
+        values["flux_int_rel_err"] = rel_err(eflux, tgt_d["flux"].reshape(eflux.shape))
     out = {k: acc[k].at[t].add(jnp.sum(v * live)) for k, v in values.items()}
     out["_n"] = acc["_n"].at[t].add(jnp.sum(live))
     return preds["df"], out, pred_d, tgt_d

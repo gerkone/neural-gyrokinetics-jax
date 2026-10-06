@@ -49,17 +49,15 @@ def diagnostics(phi_fft_: np.ndarray, eflux_field: np.ndarray, ds: float) -> Dic
 
     The last three axes of ``phi_fft_`` are ``(nx, *, ny)``; ``kxspec`` sums the y axis,
     ``kyspec`` sums the x (``*``) axis, and both sum the nx axis (the whole field line).
+    ``qspec`` is the heat flux per ky, per species ``(species, ky)`` for a
+    ``(species, kx, ky)`` field.
     """
     power = phi_fft_.real**2 + phi_fft_.imag**2
     return {
         "kxspec": power.sum(axis=(-3, -1)) * ds,
         "kyspec": power.sum(axis=(-3, -2)) * ds,
-        # heat-flux spectrum: sum everything except the trailing wavenumber axis
-        "qspec": (
-            eflux_field.sum(axis=tuple(range(eflux_field.ndim - 1)))
-            if eflux_field.ndim >= 2
-            else eflux_field.sum()
-        ),
+        # heat-flux spectrum: sum the kx axis, keep species
+        "qspec": eflux_field.sum(axis=-2) if eflux_field.ndim >= 2 else eflux_field.sum(),
     }
 
 
@@ -117,11 +115,19 @@ def add_spectral_sums(acc: Optional[Dict[str, np.ndarray]], new: Dict[str, np.nd
 
 
 def metrics_from_spectral_sums(sums: Dict[str, np.ndarray]) -> Dict[str, float]:
-    """Pearson/Spearman/Wasserstein/L1 on the time-averaged ky and Q spectra, zonal-flow errors."""
+    """Pearson/Spearman/Wasserstein/L1 on the time-averaged ky and Q spectra, zonal-flow errors.
+
+    ``qspec`` scores the heat flux summed over species, ``qspec_s{i}`` each species of
+    several.
+    """
     n = float(sums["n"])
     out: Dict[str, float] = {}
-    for key in ("kyspec", "qspec"):
-        p, g = sums[f"{key}_p"] / n, sums[f"{key}_g"] / n
+    spectra = {"kyspec": (sums["kyspec_p"] / n, sums["kyspec_g"] / n)}
+    qp, qg = (np.atleast_2d(sums[f"qspec_{k}"] / n) for k in ("p", "g"))
+    spectra["qspec"] = (qp.sum(0), qg.sum(0))
+    if len(qp) > 1:
+        spectra.update({f"qspec_s{i}": (qp[i], qg[i]) for i in range(len(qp))})
+    for key, (p, g) in spectra.items():
         out[f"{key}_pc"] = float(_pearson(p, g))
         out[f"{key}_sc"] = float(_spearman(p, g))
         out[f"{key}_l1"] = float(np.abs(p - g).sum())
@@ -143,32 +149,34 @@ def time_averaged_spectral_metrics(
     return metrics_from_spectral_sums(spectral_sums(pred_diags, gt_diags))
 
 
-def spectral_sums_layout(n_ky: int) -> Dict[str, tuple]:
+def spectral_sums_layout(n_ky: int, n_species: int = 1) -> Dict[str, tuple]:
     """Shapes of the :func:`spectral_sums` entries for ``n_ky`` binormal modes."""
     return {
         "n": (),
         "kyspec_p": (n_ky,),
         "kyspec_g": (n_ky,),
-        "qspec_p": (n_ky,),
-        "qspec_g": (n_ky,),
+        "qspec_p": (n_species, n_ky),
+        "qspec_g": (n_species, n_ky),
         **{f"{k}_rl2": () for k in _ZF_KEYS},
         "zf_er": (),
     }
 
 
 def pack_spectral_store(
-    store: Dict[int, Dict[str, np.ndarray]], n_files: int, n_ky: int
+    store: Dict[int, Dict[str, np.ndarray]], n_files: int, n_ky: int, n_species: int = 1
 ) -> np.ndarray:
     """Fixed-shape ``(n_files, D)`` array of per-trajectory sums (zeros where absent)."""
-    layout = spectral_sums_layout(n_ky)
+    layout = spectral_sums_layout(n_ky, n_species)
     out = np.zeros((n_files, sum(int(np.prod(s)) for s in layout.values())), np.float64)
     for fid, sums in store.items():
         out[fid] = np.concatenate([np.asarray(sums[k], np.float64).reshape(-1) for k in layout])
     return out
 
 
-def unpack_spectral_store(packed: np.ndarray, n_ky: int) -> Dict[int, Dict[str, np.ndarray]]:
-    layout = spectral_sums_layout(n_ky)
+def unpack_spectral_store(
+    packed: np.ndarray, n_ky: int, n_species: int = 1
+) -> Dict[int, Dict[str, np.ndarray]]:
+    layout = spectral_sums_layout(n_ky, n_species)
     store = {}
     for fid, row in enumerate(packed):
         parts, i = {}, 0
@@ -198,7 +206,7 @@ def accumulate_spectral_diagnostics(
     skipped. Returns ``False`` (without touching ``store``) when the dataset metadata
     carries no ``ds`` so the caller can warn once.
     """
-    from neugk_jax.evaluate.integrals import gyaradax_spectral_fields
+    from neugk_jax.evaluate.integrals import gyaradax_spectral_fields, precompute_geometry
 
     file_idx = np.asarray(file_idx)
     valid = np.ones(len(file_idx), bool) if valid is None else np.asarray(valid, bool)
@@ -208,11 +216,9 @@ def accumulate_spectral_diagnostics(
         return False
     if not len(fids):
         return True
-    geoms = {
-        int(f): {k: np.asarray(v) for k, v in val_ds.metadata[int(f)]["geometry"].items()}
-        for f in fids
-    }
-    rows = [geoms[int(f) if int(f) in geoms else int(fids[0])] for f in file_idx]
+    geoms = {int(f): {k: np.asarray(v) for k, v in val_ds.geometry(int(f)).items()} for f in fids}
+    pre = {f: precompute_geometry(g, np.float64) for f, g in geoms.items()}
+    rows = [pre[int(f) if int(f) in pre else int(fids[0])] for f in file_idx]
     batched = {k: np.stack([g[k] for g in rows]) for k in rows[0]}
     fields = [gyaradax_spectral_fields(src, batched, per_sample=True) for src in (df_pred, df_tgt)]
     for fid in fids:

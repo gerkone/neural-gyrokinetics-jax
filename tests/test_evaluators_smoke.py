@@ -120,7 +120,7 @@ def test_ae_integrals_use_denormalized_df(tmp_path):
     )
     gt = precompute_geometry(raw.metadata[0]["geometry"])
     solve = jax.jit(flux_integral)
-    eflux = np.asarray([float(solve(gt, jnp.asarray(raw[i].df))[1][1]) for i in range(len(raw))])
+    eflux = np.asarray([float(solve(gt, jnp.asarray(raw[i].df))[1][1][0]) for i in range(len(raw))])
 
     ev = AEEvaluator(_cfg(eval_integrals=True), val_ds=ds, batch_size=2)
     metrics, _ = ev(Scaled(2.0), epoch=1)
