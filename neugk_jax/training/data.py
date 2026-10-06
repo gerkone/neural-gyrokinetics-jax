@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import itertools
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from neugk_jax.dataset.cyclone import CycloneSample
@@ -68,15 +72,27 @@ def eval_plans(
     return plans
 
 
+class DeviceRows(list):
+    """Row blocks of one batch field, each stacked on the device that owns its rows."""
+
+
+def _device(x):
+    return next(iter(x.devices())) if isinstance(x, jax.Array) else None
+
+
 def stack_fields(samples: Sequence[CycloneSample], fields: Sequence[str]) -> dict[str, Any]:
     """Stack the named sample fields in their array namespace; host ints become int32.
 
-    Device arrays (``KvikIOBackend`` frames) stay on device; absent fields are left out.
+    Device arrays (``KvikIOBackend`` frames) stay on device, as a :class:`DeviceRows` of per-device
+    stacks when they span several devices; absent fields are left out.
     """
     out = {}
     for f in fields:
         vals = [getattr(s, f) for s in samples]
         if vals[0] is None:
+            continue
+        if len({_device(x) for x in vals}) > 1:
+            out[f] = DeviceRows(jnp.stack(list(g)) for _, g in itertools.groupby(vals, key=_device))
             continue
         v = vals[0].__array_namespace__().stack(vals)
         if isinstance(v, np.ndarray) and v.dtype.kind in "iu":
@@ -98,8 +114,17 @@ class BatchLoader:
         self._readers = ThreadPoolExecutor(max_workers=max(1, int(workers)))
         self._batches = ThreadPoolExecutor(max_workers=self.prefetch)
 
-    def read(self, ds, indices) -> list:
-        return list(self._readers.map(lambda i: ds[int(i)], indices))
+    def read(self, ds, indices, devices=None) -> list:
+        """``ds[i]`` of every index; with ``devices``, each sample is read onto its device."""
+        if devices is None:
+            return list(self._readers.map(lambda i: ds[int(i)], indices))
+        on = getattr(ds.backend, "on_device", None)
+
+        def one(i, d):
+            with on(d) if on is not None else contextlib.nullcontext():
+                return ds[int(i)]
+
+        return list(self._readers.map(one, indices, devices))
 
     def map(self, fn: Callable, items) -> list:
         return list(self._readers.map(fn, items))

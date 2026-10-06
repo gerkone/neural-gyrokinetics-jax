@@ -76,7 +76,13 @@ def build_splits(
     """Train and val datasets sharing one normalization-stats load."""
     train = build_dataset(dcfg, split="train", dist=dist, prefer_dtype=train_dtype, **kwargs)
     stats = train.stats if dcfg.get("normalization_stats") is not None else None
+    # dataset.prefer_dtype is the stored precision, so validation reads it too
     val = build_dataset(
-        dcfg, split="val", dist=dist, stats=stats, **{**kwargs, **(val_overrides or {})}
+        dcfg,
+        split="val",
+        dist=dist,
+        stats=stats,
+        prefer_dtype=dcfg.get("prefer_dtype"),
+        **{**kwargs, **(val_overrides or {})},
     )
     return train, val

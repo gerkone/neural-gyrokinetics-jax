@@ -139,6 +139,7 @@ class CycloneDataset:
         self.separate_zf = separate_zf
         self.backend = backend
         self.rank = rank
+        self._batch_transform = False
 
         # latent storage (mode="diff"); filled by precompute_latents()
         self.precomputed_latents: dict[tuple[int, int], dict] | None = None
@@ -236,13 +237,33 @@ class CycloneDataset:
 
     def _frames(self, handle, fid: int, t: int) -> dict:
         """Normalized float32 ``df``/``phi`` frames (those loaded) at raw frame index ``t``."""
-        out = {}
+        out, raw = {}, {}
         if "df" in self.fields_to_load:
             df = self.backend.read_df(handle, t, self.df_shape)
-            out["df"] = separate_zf_fn(df, axis=0) if self.separate_zf else df
+            if self.batch_transform:
+                raw["df"] = df
+            else:
+                out["df"] = separate_zf_fn(df, axis=0) if self.separate_zf else df
         if "phi" in self.fields_to_load:
             out["phi"] = self.backend.read_phi(handle, t, self.phi_resolution)
-        return {k: _f32(self.norm.normalize(k, v, fid)) for k, v in out.items()}
+        return {**raw, **{k: _f32(self.norm.normalize(k, v, fid)) for k, v in out.items()}}
+
+    @property
+    def batch_transform(self) -> bool:
+        """Serve raw df frames (16-bit shards as stored); :meth:`transform` runs per batch."""
+        return self._batch_transform
+
+    @batch_transform.setter
+    def batch_transform(self, on: bool) -> None:
+        self._batch_transform = bool(on)
+        if hasattr(self.backend, "keep_half"):
+            self.backend.keep_half = self._batch_transform
+
+    def transform(self, df, fids):
+        """The df frame transform on a raw batch ``(B, 2, ...)``: float32, zf separation, normalization."""
+        x = df.astype(np.float32)
+        x = separate_zf_fn(x, axis=1) if self.separate_zf else x
+        return self.norm.normalize("df", x, fids).astype(np.float32)
 
     def _targets(self, handle, fid: int, t_idx: int) -> dict:
         """Normalized next-step targets (frames, ``flux``, ``fluxavg``) of sample ``(fid, t_idx)``."""
@@ -254,6 +275,11 @@ class CycloneDataset:
         for k in ("flux", "fluxavg"):
             out[k] = np.asarray(self.norm.normalize(k, out[k], fid), np.float32)
         return out
+
+    def read_frame(self, fid: int, t: int) -> dict:
+        """The loaded fields of trajectory ``fid`` at raw frame index ``t``, normalized."""
+        with self.backend.open(self.files[int(fid)]) as handle:
+            return self._frames(handle, int(fid), int(t))
 
     def get_target(self, fid: int, t_idx: int) -> dict[str, np.ndarray]:
         fid, t_idx = int(fid), int(t_idx)
@@ -323,23 +349,28 @@ class CycloneDataset:
         ds = self.metadata[fid].get("ds")
         return None if ds is None else float(ds)
 
-    def spectral_stats(self, key: str) -> dict[str, np.ndarray]:
+    def spectral_stats(
+        self, key: str, fids: Optional[Sequence[int]] = None, offset: Optional[int] = None
+    ) -> dict[str, np.ndarray]:
         """Per-mode ``mean`` / ``std`` of ``log1p`` of a served spectrum (``kyspec``, ``fluxspec``).
 
-        Pooled over the trajectories from ``offset`` on, each weighted by its timestep count.
+        Pooled over the trajectories ``fids`` (default: all) from ``offset`` (default: the
+        dataset's) on, each weighted by its timestep count.
         """
-        missing = [self.files[f] for f, m in self.metadata.items() if key not in m]
+        offset = self.offset if offset is None else int(offset)
+        metas = [self.metadata[int(f)] for f in (self.metadata if fids is None else fids)]
+        missing = sum(key not in m for m in metas)
         if missing:
-            raise KeyError(f"no {key!r} in the metadata of {len(missing)} trajectories")
+            raise KeyError(f"no {key!r} in the metadata of {missing} trajectories")
         rms = RunningStats(prior_count=1e-4)
-        for meta in self.metadata.values():
-            spec = np.log1p(np.asarray(meta[key], dtype=np.float64)[self.offset :])
+        for meta in metas:
+            spec = np.log1p(np.asarray(meta[key], dtype=np.float64)[offset:])
             rms.merge(
                 spec.mean(axis=0),
                 spec.var(axis=0),
                 spec.min(axis=0),
                 spec.max(axis=0),
-                count=len(meta["timesteps"][self.offset :]),
+                count=len(meta["timesteps"][offset:]),
             )
         stats = rms.moments(np.float32)
         return {"mean": stats["mean"], "std": stats["std"]}

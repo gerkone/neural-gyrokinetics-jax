@@ -32,6 +32,7 @@ from neugk_jax.training.ddp import (
     init_distributed,
     local_view,
     replicate,
+    row_devices,
     shard_batch,
 )
 from neugk_jax.training.logging import Logger
@@ -97,6 +98,7 @@ class StepSpec:
     optimizer: Any
     mask: Any
     post_update: Callable
+
 
 
 @eqx.filter_jit(donate="all-except-first")
@@ -172,7 +174,11 @@ class BaseRunner:
         self.setup_optimizer()
         self.ctx = replicate(self.dist, self.step_context())
         self.spec = StepSpec(
-            type(self).__name__, self.loss_fn, self.optimizer, self.trainable, self.post_update
+            type(self).__name__,
+            self.loss_fn,
+            self.optimizer,
+            self.trainable,
+            self.post_update,
         )
         self._maybe_resume()
         self.evaluator = self.make_evaluator()
@@ -231,6 +237,10 @@ class BaseRunner:
 
     def step_extras(self, step: int) -> dict:
         return {}
+
+    def place_batch(self, batch: dict) -> dict:
+        """Transform of a training batch once on its devices, in the prefetch thread."""
+        return batch
 
     def load_batch(self, ds, indices, read) -> dict:
         return stack_fields(read(ds, indices), self.batch_fields)
@@ -291,8 +301,14 @@ class BaseRunner:
         perm_key, step_key = jr.split(key)
         perm = np.asarray(jr.permutation(perm_key, len(self.train_ds)))
         plans = train_plans(self.dist, len(self.train_ds), self.tcfg.batch_size, perm)
+        devices = row_devices(self.dist, len(plans[0].indices)) if plans else None
+
+        def load(ds, indices, read):
+            # each row is read onto the device that owns it
+            return self.load_batch(ds, indices, lambda d, i: read(d, i, devices))
+
         batches = self.loader.iterate(
-            self.train_ds, plans, self.load_batch, lambda b: shard_batch(self.dist, b)
+            self.train_ds, plans, load, lambda b: self.place_batch(shard_batch(self.dist, b))
         )
         show = self.dist.is_rank0 and (self.cfg.get("logging") or {}).get("tqdm", False)
         batches = progress(batches, show, total=len(plans), desc=f"epoch {epoch}")

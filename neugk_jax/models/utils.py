@@ -211,6 +211,14 @@ class Gate(eqx.Module):
         return x * jax.nn.sigmoid(self.proj(relu(g)))
 
 
+def cast_floating(tree, dtype):
+    """``tree`` with its floating-point arrays cast to ``dtype`` (a compute copy of fp32 weights)."""
+    return jax.tree_util.tree_map(
+        lambda x: x.astype(dtype) if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,
+        tree,
+    )
+
+
 def trainable_mask(model):
     """Bool pytree over ``model``: True on trainable arrays, False on non-arrays and buffers.
 
