@@ -91,8 +91,11 @@ def stream_stats(ds, normalization: Optional[Mapping], stride: int = 1, workers:
         axes[k] = tuple(int(a) for a in agg) if agg else ()
     pooled = {k: RunningStats(prior_count=0.0) for k in fields}
     indices = range(0, len(raw), max(1, int(stride)))
+    chunks = (indices[i : i + 2 * workers] for i in range(0, len(indices), 2 * workers))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for sample in progress(ex.map(raw.__getitem__, indices), True, total=len(indices), desc="stats"):
+        # executor.map submits eagerly, so read ahead one chunk at a time
+        samples = (s for c in chunks for s in ex.map(raw.__getitem__, c))
+        for sample in progress(samples, True, total=len(indices), desc="stats"):
             for k in fields:
                 x = np.asarray(getattr(sample, k), np.float64)
                 ax = axes[k]
