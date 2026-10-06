@@ -37,7 +37,6 @@ dataset:
       training_trajectories: iteration_{0-7,9-12,14-64,67-99,101-114,116-130,132-147,149-199,201-234,236-261,263-299}
       validation_trajectories: [iteration_8, iteration_115, iteration_131, iteration_148, iteration_235, iteration_262]
 model:
-  decoder_conditioning: [dg, etg, itg, kinetic, q, s_hat, temp_ratio]
   stems:
     kinetic:
       # (32, 12, 18, 169, 32) after kx_crop: the adiabatic token grid; 191 modes: patch 11
