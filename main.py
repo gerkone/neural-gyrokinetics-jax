@@ -35,6 +35,11 @@ def dispatch_runner(cfg: DictConfig) -> None:
     """Workflow → runner dispatch."""
     workflow = cfg.get("workflow", "ae")
     base = workflow.split("_")[0]
+    if base == "stats":
+        from neugk_jax.dataset.factory import write_stats
+
+        write_stats(cfg.dataset)
+        return
     vq = (cfg.get("model") or {}).get("model_type") == "vqvae"
     if base == "pinc" and cfg.get("stage") == "peft":
         from neugk_jax.pinc.peft import PINCPEFTRunner as Runner

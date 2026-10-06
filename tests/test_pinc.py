@@ -34,7 +34,7 @@ def test_pinc_losses_identity_gradient_and_core_agreement():
     # only the mean |pflux| of the target remains
     assert ident["flux_int"] < 1e-12
     np.testing.assert_allclose(p["phi"][0], phi, rtol=1e-12)
-    np.testing.assert_allclose([p["eflux"][0], q_total], [eflux] * 2, rtol=1e-10)
+    np.testing.assert_allclose([p["eflux"][0][0], q_total], [eflux[0]] * 2, rtol=1e-10)
 
     geom32 = jax.tree_util.tree_map(lambda a: np.asarray(a, np.float32), geom)
     tgt32 = jnp.asarray(tgt, jnp.float32)

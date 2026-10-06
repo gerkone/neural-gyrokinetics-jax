@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import itertools
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from neugk_jax.dataset.cyclone import CycloneSample
@@ -27,13 +31,51 @@ class BatchPlan:
 
 
 def train_plans(
-    dist: DistributedInfo, n: int, per_device: int, perm: np.ndarray
+    dist: DistributedInfo,
+    n: int,
+    per_device: int,
+    perm: np.ndarray,
+    groups: Optional[np.ndarray] = None,
+    weights: Optional[Sequence[float]] = None,
 ) -> list[BatchPlan]:
-    """This process's share of each full global batch of a shuffled epoch (the partial tail is dropped)."""
+    """This process's share of each full global batch of a shuffled epoch (partial tails dropped).
+
+    With ``groups`` (a group id per sample index) every batch holds one group; the batches
+    of all groups follow the order of their first sample in ``perm``. ``weights`` (a share
+    per group id) instead splits the epoch's ``n // gbs`` batches between the groups by
+    share, cycling through a group's shuffled samples when it has fewer, and spreads each
+    group's batches evenly over the epoch.
+    """
     gbs = per_device * dist.device_count
+    if groups is None:
+        chunks = [perm[start : start + gbs] for start in range(0, n - gbs + 1, gbs)]
+    elif weights is not None:
+        n_batches = n // gbs
+        share = np.asarray(weights, np.float64) * n_batches
+        counts = np.floor(share).astype(int)
+        # largest remainders take the batches left over by the floor
+        counts[np.argsort(counts - share)[: n_batches - counts.sum()]] += 1
+        rng = np.random.default_rng(perm[: min(n, 8)])
+        chunks, keys = [], []
+        for g, count in enumerate(counts):
+            idx = perm[groups[perm] == g]
+            if count == 0 or len(idx) == 0:
+                continue
+            idx = np.resize(idx, count * gbs)
+            chunks += [idx[b * gbs : (b + 1) * gbs] for b in range(count)]
+            keys += list((np.arange(count) + rng.uniform(size=count)) / count)
+        chunks = [chunks[i] for i in np.argsort(keys)]
+    else:
+        position = np.empty(n, np.int64)
+        position[perm] = np.arange(n)
+        chunks = []
+        for g in np.unique(groups):
+            idx = perm[groups[perm] == g]
+            chunks += [idx[start : start + gbs] for start in range(0, len(idx) - gbs + 1, gbs)]
+        chunks.sort(key=lambda c: position[c[0]])
     plans = []
-    for b, start in enumerate(range(0, n - gbs + 1, gbs)):
-        local = process_batch_indices(dist, perm[start : start + gbs])
+    for b, chunk in enumerate(chunks):
+        local = process_batch_indices(dist, chunk)
         plans.append(BatchPlan(local, np.ones(len(local), np.float32), b))
     return plans
 
@@ -68,15 +110,27 @@ def eval_plans(
     return plans
 
 
+class DeviceRows(list):
+    """Row blocks of one batch field, each stacked on the device that owns its rows."""
+
+
+def _device(x):
+    return next(iter(x.devices())) if isinstance(x, jax.Array) else None
+
+
 def stack_fields(samples: Sequence[CycloneSample], fields: Sequence[str]) -> dict[str, Any]:
     """Stack the named sample fields in their array namespace; host ints become int32.
 
-    Device arrays (``KvikIOBackend`` frames) stay on device; absent fields are left out.
+    Device arrays (``KvikIOBackend`` frames) stay on device, as a :class:`DeviceRows` of per-device
+    stacks when they span several devices; absent fields are left out.
     """
     out = {}
     for f in fields:
         vals = [getattr(s, f) for s in samples]
         if vals[0] is None:
+            continue
+        if len({_device(x) for x in vals}) > 1:
+            out[f] = DeviceRows(jnp.stack(list(g)) for _, g in itertools.groupby(vals, key=_device))
             continue
         v = vals[0].__array_namespace__().stack(vals)
         if isinstance(v, np.ndarray) and v.dtype.kind in "iu":
@@ -98,8 +152,18 @@ class BatchLoader:
         self._readers = ThreadPoolExecutor(max_workers=max(1, int(workers)))
         self._batches = ThreadPoolExecutor(max_workers=self.prefetch)
 
-    def read(self, ds, indices) -> list:
-        return list(self._readers.map(lambda i: ds[int(i)], indices))
+    def read(self, ds, indices, devices=None) -> list:
+        """``ds[i]`` of every index; with ``devices``, each sample is read onto its device."""
+        if devices is None:
+            return list(self._readers.map(lambda i: ds[int(i)], indices))
+        # a dataset mix places the reads of every part
+        on = getattr(ds, "on_device", None) or getattr(ds.backend, "on_device", None)
+
+        def one(i, d):
+            with on(d) if on is not None else contextlib.nullcontext():
+                return ds[int(i)]
+
+        return list(self._readers.map(one, indices, devices))
 
     def map(self, fn: Callable, items) -> list:
         return list(self._readers.map(fn, items))

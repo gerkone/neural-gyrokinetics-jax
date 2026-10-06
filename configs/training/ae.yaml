@@ -13,3 +13,4 @@ amp:
 num_workers: 4  # sample-reading threads
 prefetch: 2     # batches loaded ahead of the step
 save_every_n_epochs: 1
+batch_transform: true  # readers serve raw frames; kx crop, zf split and normalization run once per batch on device

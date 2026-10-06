@@ -11,7 +11,7 @@ import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
 
-from neugk_jax.losses import df_loss, recon_loss
+from neugk_jax.losses import df_loss, part_weight, recon_loss
 from neugk_jax.models.build import ae_conditioning, build_ae
 from neugk_jax.pinc.eval import AEEvaluator, VQVAEEvaluator, reconstruct, select_conditions
 from neugk_jax.pinc.quantizers import VectorQuantizer
@@ -63,6 +63,17 @@ class AERunner(BaseRunner):
         self.cond_slots = conditioning_slots(self.train_ds.conditions, set(enc) | set(dec))
         self.loss_type = self.tcfg.get("loss_type", self.default_loss_type)
         self.extra_zf = bool(self.cfg.model.get("extra_zf_loss", False)) and self.separate_zf
+        # training.batch_transform: readers serve raw frames, normalized per batch in the step
+        self.train_ds.batch_transform = bool(self.tcfg.get("batch_transform", False))
+
+    def place_batch(self, batch: dict) -> dict:
+        # eager ops, bit-identical to the per-sample transform (a jitted fusion is not)
+        if not self.train_ds.batch_transform:
+            return batch
+        args = (batch["df"], batch["file_index"])
+        if "data_type" in batch:
+            args += (batch.pop("data_type"),)
+        return {**batch, "df": self.train_ds.transform(*args)}
 
     def checkpoint_meta(self) -> dict:
         return {"resolution": [int(r) for r in self.train_ds.resolution]}
@@ -75,6 +86,8 @@ class AERunner(BaseRunner):
 
     def load_batch(self, ds, indices, read) -> dict:
         fields = ("df", "file_index", "conditioning")
+        if hasattr(ds, "parts"):
+            fields += ("data_type", "loss_weight")
         return select_conditions(stack_fields(read(ds, indices), fields), self.cond_slots)
 
     def df_recon_loss(self, pred, x):
@@ -87,7 +100,7 @@ class AERunner(BaseRunner):
         keys = jr.split(key, x.shape[0])
         pred = reconstruct(model, x, batch.get("conditioning"), keys, inference=False)["df"]
         loss = self.df_recon_loss(pred, x)
-        return loss, {"df": loss}
+        return loss * part_weight(batch), {"df": loss}
 
     def evaluator_kwargs(self) -> dict:
         return {**super().evaluator_kwargs(), "cond_slots": self.cond_slots}

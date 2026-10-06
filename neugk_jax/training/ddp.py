@@ -113,13 +113,44 @@ def _assemble(x, sharding: NamedSharding, n_rows_global: int):
     return jax.make_array_from_single_device_arrays(shape, sharding, shards)
 
 
+def _assemble_blocks(blocks, sharding: NamedSharding, n_procs: int):
+    # per-device row blocks already on their devices, stitched without copies
+    rows = sum(b.shape[0] for b in blocks)
+    shape = (rows * n_procs, *blocks[0].shape[1:])
+    return jax.make_array_from_single_device_arrays(shape, sharding, list(blocks))
+
+
+def row_devices(dist: DistributedInfo, n_rows: int) -> list:
+    """The local device each of ``n_rows`` process-local batch rows lands on in :func:`shard_batch`."""
+    mesh = dist.mesh
+    if mesh.size == 1:
+        return [mesh.devices.flat[0]] * n_rows
+    shape = (n_rows * dist.num_processes,)
+    index_map = NamedSharding(mesh, P(mesh.axis_names[0])).addressable_devices_indices_map(shape)
+    offset = min(idx[0].start or 0 for idx in index_map.values())
+    out = [None] * n_rows
+    for dev, idx in index_map.items():
+        for r in range((idx[0].start or 0) - offset, (idx[0].stop or shape[0]) - offset):
+            out[r] = dev
+    return out
+
+
 def _put_rows(tree, mesh: Mesh, n_procs: int):
+    from neugk_jax.training.data import DeviceRows
+
+    def is_leaf(x):
+        return isinstance(x, DeviceRows)
+
     if mesh.size == 1:
         return _put(tree, mesh.devices.flat[0])
     sharding = NamedSharding(mesh, P(mesh.axis_names[0]))
-    return jax.tree_util.tree_map(
-        lambda x: _assemble(x, sharding, x.shape[0] * n_procs) if _is_array(x) else x, tree
-    )
+
+    def put(x):
+        if isinstance(x, DeviceRows):
+            return _assemble_blocks(x, sharding, n_procs)
+        return _assemble(x, sharding, x.shape[0] * n_procs) if _is_array(x) else x
+
+    return jax.tree_util.tree_map(put, tree, is_leaf=is_leaf)
 
 
 def shard_batch(dist: DistributedInfo, tree):

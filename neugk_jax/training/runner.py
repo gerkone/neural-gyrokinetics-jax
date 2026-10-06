@@ -22,7 +22,8 @@ import numpy as np
 import optax
 from omegaconf import OmegaConf
 
-from neugk_jax.dataset.factory import build_splits
+from neugk_jax.dataset.factory import build_splits, save_run_stats
+from neugk_jax.evaluate.base import MultiEvaluator
 from neugk_jax.models.utils import trainable_mask
 from neugk_jax.training.checkpoint import AsyncCheckpointer, CheckpointState, load_checkpoint
 from neugk_jax.training.data import BatchLoader, stack_fields, train_plans
@@ -32,6 +33,7 @@ from neugk_jax.training.ddp import (
     init_distributed,
     local_view,
     replicate,
+    row_devices,
     shard_batch,
 )
 from neugk_jax.training.logging import Logger
@@ -175,7 +177,7 @@ class BaseRunner:
             type(self).__name__, self.loss_fn, self.optimizer, self.trainable, self.post_update
         )
         self._maybe_resume()
-        self.evaluator = self.make_evaluator()
+        self.evaluator = self.build_evaluator()
         self.save_config()
 
     @property
@@ -195,10 +197,20 @@ class BaseRunner:
             val_ds=self.val_ds, dist=self.dist, loader=self.loader, batch_size=self.eval_batch_size
         )
 
-    def build_data(self, mode: str, **kwargs) -> None:
+    def build_data(self, mode: str, stats_dir: Optional[str] = None, **kwargs) -> None:
+        """Train and val splits normalized with, in order of preference, the run's own copy of
+        the statistics (a resumed run), those of ``stats_dir`` and :func:`resolve_stats`."""
+        own = self.output_path / "normalization_stats"
+        resuming = (self.output_path / "ckp.eqx").exists()
         self.train_ds, self.val_ds = build_splits(
-            self.cfg.dataset, dist=self.dist, mode=mode, **kwargs
+            self.cfg.dataset,
+            dist=self.dist,
+            mode=mode,
+            run_stats_dir=str(own) if resuming else stats_dir,
+            **kwargs,
         )
+        if self.dist.is_rank0:
+            save_run_stats(self.train_ds, str(own), overwrite=not resuming)
 
     def save_config(self) -> None:
         if self.dist.is_rank0:
@@ -220,6 +232,25 @@ class BaseRunner:
     def make_evaluator(self):
         return None
 
+    def mixing_weights(self, epoch: int):
+        """Sampling share of every part of a dataset mix in ``epoch`` (None: by size)."""
+        weights = getattr(self.train_ds, "group_weights", None)
+        return None if weights is None else weights((epoch - 1) / max(self.tcfg.n_epochs, 1))
+
+    def build_evaluator(self):
+        """``make_evaluator()``, or a :class:`MultiEvaluator` with one per part of a dataset mix."""
+        parts = getattr(self.val_ds, "parts", None)
+        if not parts:
+            return self.make_evaluator()
+        full, evaluators = self.val_ds, {}
+        try:
+            for name, ds in parts.items():
+                self.val_ds = ds
+                evaluators[name] = self.make_evaluator()
+        finally:
+            self.val_ds = full
+        return MultiEvaluator(evaluators) if any(e is not None for e in evaluators.values()) else None
+
     def step_context(self) -> dict:
         return {}
 
@@ -231,6 +262,10 @@ class BaseRunner:
 
     def step_extras(self, step: int) -> dict:
         return {}
+
+    def place_batch(self, batch: dict) -> dict:
+        """Transform of a training batch once on its devices, in the prefetch thread."""
+        return batch
 
     def load_batch(self, ds, indices, read) -> dict:
         return stack_fields(read(ds, indices), self.batch_fields)
@@ -290,9 +325,22 @@ class BaseRunner:
     def train_epoch(self, epoch: int, key) -> tuple[dict, dict]:
         perm_key, step_key = jr.split(key)
         perm = np.asarray(jr.permutation(perm_key, len(self.train_ds)))
-        plans = train_plans(self.dist, len(self.train_ds), self.tcfg.batch_size, perm)
+        plans = train_plans(
+            self.dist,
+            len(self.train_ds),
+            self.tcfg.batch_size,
+            perm,
+            groups=getattr(self.train_ds, "groups", None),
+            weights=self.mixing_weights(epoch),
+        )
+        devices = row_devices(self.dist, len(plans[0].indices)) if plans else None
+
+        def load(ds, indices, read):
+            # each row is read onto the device that owns it
+            return self.load_batch(ds, indices, lambda d, i: read(d, i, devices))
+
         batches = self.loader.iterate(
-            self.train_ds, plans, self.load_batch, lambda b: shard_batch(self.dist, b)
+            self.train_ds, plans, load, lambda b: self.place_batch(shard_batch(self.dist, b))
         )
         show = self.dist.is_rank0 and (self.cfg.get("logging") or {}).get("tqdm", False)
         batches = progress(batches, show, total=len(plans), desc=f"epoch {epoch}")
