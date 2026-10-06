@@ -36,6 +36,10 @@ dataset:
       # keys of neural-gyrokinetics configs/dataset/cyclone_full.yaml
       training_trajectories: iteration_{0-7,9-12,14-64,67-99,101-114,116-130,132-147,149-199,201-234,236-261,263-299}
       validation_trajectories: [iteration_8, iteration_115, iteration_131, iteration_148, iteration_235, iteration_262]
+training:
+  optimizer: muon
+  learning_rate: 1.0e-4
+  adam_b2: 0.95
 model:
   stems:
     kinetic:

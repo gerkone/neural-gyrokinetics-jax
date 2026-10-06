@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import optax
+from optax.contrib import MuonDimensionNumbers, muon
 from omegaconf import OmegaConf
 
 from neugk_jax.dataset.factory import build_splits, save_run_stats
@@ -54,10 +55,18 @@ def weight_decay_mask(params, exclude):
     return jax.tree_util.tree_map_with_path(keep, params)
 
 
+def is_hidden_matrix(path, leaf) -> bool:
+    """A trunk weight matrix (out, in): both sides >= 16, not a patch / unpatch / position-bias layer."""
+    name = jax.tree_util.keystr(path).lower()
+    hidden = not any(k in name for k in ("patch_embed", "unpatch", "rpb"))
+    return leaf.ndim == 2 and min(leaf.shape) >= 16 and hidden
+
+
 def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999, mask=None):
     """Clip + Adam chain over the ``mask`` leaves (default ``trainable_mask``).
 
-    ``decoupled`` selects AdamW, else Adam with coupled L2 decay.
+    ``decoupled`` selects AdamW, else Adam with coupled L2 decay. ``training.optimizer: muon``
+    updates the hidden weight matrices with Muon at ``muon_learning_rate`` (same schedule shape).
     """
     wd = tcfg.get("weight_decay", 0.0)
     params = eqx.filter(model, trainable_mask(model) if mask is None else mask)
@@ -67,6 +76,14 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
         if tcfg.get("clip_grad", True)
         else optax.identity()
     )
+    if tcfg.get("optimizer", "adam") == "muon":
+        ratio = float(tcfg.muon_learning_rate) / float(tcfg.learning_rate)
+        out_in = MuonDimensionNumbers(reduction_axis=1, output_axis=0)
+        dims = lambda p: jax.tree_util.tree_map_with_path(lambda k, x: out_in if is_hidden_matrix(k, x) else None, p)
+        return optax.chain(clip, muon(
+            lambda c: ratio * schedule(c), adam_learning_rate=schedule, adam_b2=b2, weight_decay=wd,
+            adam_weight_decay=wd, muon_weight_dimension_numbers=dims,
+        ))
     if wd <= 0:
         return optax.chain(clip, optax.adam(schedule, b2=b2))
     if decoupled:
@@ -278,13 +295,16 @@ class BaseRunner:
         tcfg = self.tcfg
         self.steps_per_epoch = max(1, len(self.train_ds) // self.global_batch_size)
         self.total_steps = tcfg.n_epochs * self.steps_per_epoch
-        self.schedule = warmup_cosine(
-            peak_lr=tcfg.learning_rate,
-            total_steps=self.total_steps,
-            steps_per_epoch=self.steps_per_epoch,
-            n_epochs=tcfg.n_epochs,
-            min_lr=tcfg.get("final_learning_rate", 1e-6),
-        )
+        if tcfg.get("lr_schedule", "warmup_cosine") == "constant":
+            self.schedule = optax.constant_schedule(tcfg.learning_rate)
+        else:
+            self.schedule = warmup_cosine(
+                peak_lr=tcfg.learning_rate,
+                total_steps=self.total_steps,
+                steps_per_epoch=self.steps_per_epoch,
+                n_epochs=tcfg.n_epochs,
+                min_lr=tcfg.get("final_learning_rate", 1e-6),
+            )
         self.trainable = self.trainable_mask(self.model)
         self.optimizer = build_optimizer(
             self.schedule,
