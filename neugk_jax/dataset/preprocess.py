@@ -361,7 +361,7 @@ class FieldSolver:
 
         with jax.enable_x64(self.x64):
             phi, (_, eflux, _) = self._jits["solve"](self.geom, jnp.asarray(df, self.dtype))
-            return np.asarray(phi, dtype=np.float32), float(eflux)
+            return np.asarray(phi, dtype=np.float32), float(np.sum(eflux))
 
     def flux_spectrum(self, df: np.ndarray) -> np.ndarray:
         import jax
@@ -369,7 +369,7 @@ class FieldSolver:
 
         with jax.enable_x64(self.x64):
             out = self._jits["spectrum"](self.geom, jnp.asarray(df, self.dtype))
-            return np.asarray(out, dtype=np.float64)
+            return np.asarray(out, dtype=np.float64).sum(axis=0)
 
 
 def _new_stats() -> RunningStats:
@@ -715,6 +715,209 @@ def preprocess_gyaradax(
         **{k: np.float32(v) for k, v in _stats_dict("flux", flux_stats).items()},
     }
     write_metadata(out_path, metadata)
+    return out_path
+
+
+KINETIC_STEP_KEYS = ("df", "phi", "fluxes", "time", "step", "ky_spec", "kx_spec", "last_growth_rate")
+FLUX_NAMES = ("pflux", "eflux", "vflux")
+
+
+def load_kinetic_step(path: str) -> dict:
+    """One gyaradax kinetic dump: a raw ``step_*.npz`` or a ``*.bf16.npy`` stream.
+
+    The stream holds the :data:`KINETIC_STEP_KEYS` arrays back to back, ``df`` as bf16 bit
+    patterns of shape ``(species, re/im, ...)``.
+    """
+    if path.endswith(".npz"):
+        with np.load(path) as d:
+            return {k: np.asarray(d[k]) for k in KINETIC_STEP_KEYS}
+    with open(path, "rb") as fh:
+        out = {k: np.load(fh) for k in KINETIC_STEP_KEYS}
+    # bf16 is the upper half of a float32: widen the bits instead of a per-element dtype cast
+    f32 = (out["df"].astype(np.uint32) << 16).view(np.float32)
+    out["df"] = (f32[:, 0] + 1j * f32[:, 1]).astype(np.complex64)
+    return out
+
+
+def kinetic_geometry(cfg) -> dict:
+    """Geometry of a gyaradax kinetic run from its config, with the neugk Parseval weight."""
+    from gyaradax.geometry.geom import create_geometry
+    from gyaradax.geometry.spec import geometry_spec_from_config
+    from gyaradax.params import gkparams_from_config
+    from gyaradax.simulate import _ensure_species_arrays
+
+    geom = create_geometry(geometry_spec_from_config(cfg))
+    geom = _ensure_species_arrays(geom, gkparams_from_config(cfg))
+    keys = ("kxrh", "krho", "intvp", "vpgr", "intmu", "mugr", "ints", "bn", "bt_frac", "rfun",
+            "efun", "little_g", "mas", "tmp", "de", "signz", "vthrat", "d2X", "signB", "parseval")
+    np_geom = {k: np.array(geom[k], dtype=np.float64) for k in keys}
+    # the neugk flux kernel weights ints twice, so ky>0 carries 2 * ns instead of 2
+    np_geom["parseval"][1:] *= len(np_geom["ints"])
+    np_geom["adiabatic"] = np.array(0.0)
+    np_geom["beta"] = np.array(float(cfg.physics.get("beta", 0.0)))
+    np_geom["nlapar"] = np.array(0.0)
+    np_geom["nlbpar"] = np.array(0.0)
+    return np_geom
+
+
+def _kinetic_flux_fn(np_geom: dict):
+    import jax
+    import jax.numpy as jnp
+    from gyaradax.integrals import calculate_fluxes_kinetic, calculate_phi
+
+    g = {k: jnp.asarray(v) for k, v in np_geom.items()}
+    # gyaradax applies ints once, so ky>0 carries the conjugate weight 2
+    g["parseval"] = jnp.where(jnp.abs(g["krho"]) < 1e-12, 1.0, 2.0)
+    g["ffun"] = jnp.zeros_like(g["bn"])
+
+    @jax.jit
+    def fluxes(spec):
+        spec = spec.astype(jnp.complex128)
+        return calculate_fluxes_kinetic(g, spec, calculate_phi(g, spec))
+
+    def run(spec):
+        with jax.enable_x64(True):
+            return np.asarray(fluxes(jnp.asarray(spec)))
+
+    return run
+
+
+def preprocess_gyaradax_kinetic(
+    steps: Iterable[str],
+    config_path: str,
+    target_dir: Optional[str] = TARGET_DIR,
+    out_name: Optional[str] = None,
+    bits: str = "bf16",
+    verify: bool = True,
+    flux_rtol: float = 1e-2,
+    delete_steps: bool = False,
+    show_tqdm: bool = False,
+    first_index: int = 0,
+    append: bool = False,
+) -> str:
+    """Convert a kinetic-electron gyaradax run to the kvikio layout, quantized to ``bits``.
+
+    ``steps`` are the run's own dumps in solver-step order (raw ``.npz`` or ``*.bf16.npy``
+    streams, see :func:`load_kinetic_step`); a generator works, so dumps can be consumed as
+    they arrive and removed with ``delete_steps``. df is written in real space as
+    ``(re/im, species, vpar, mu, s, x, y)``, phi as real ``(x, s, y)``, both only as ``bits``
+    shards. The heat flux of every df is checked against the dumped one. Frames are numbered
+    from ``first_index``; ``append`` adds them after the frames of the existing trajectory
+    (whose per-frame metadata is extended and whose df/phi statistics stay those of the
+    original frames), marking the first appended frame in ``appended_from``; a new trajectory
+    numbered from ``first_index > 0`` records it as ``index_offset``.
+    """
+    import jax.numpy as jnp
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.load(config_path)
+    name = out_name or "iteration_" + os.path.basename(config_path).split("_")[-1].split(".")[0]
+    if target_dir is None:
+        raise ValueError("preprocess_gyaradax_kinetic needs target_dir (or $NEUGK_TARGET_DIR)")
+    out_path = NumpyBackend().trajectory_path(os.path.join(target_dir, KVIKIO_SUBDIR, name))
+    os.makedirs(os.path.join(out_path, "data"), exist_ok=True)
+
+    np_geom = kinetic_geometry(cfg)
+    flux_fn = _kinetic_flux_fn(np_geom) if verify else None
+    rlt = np.atleast_1d(np.asarray(cfg.physics.rlt, dtype=np.float64))
+    rln = np.atleast_1d(np.asarray(cfg.physics.rln, dtype=np.float64))
+    signz, tmp = np_geom["signz"], np_geom["tmp"]
+    ion, elec = int(np.argmax(signz > 0)), int(np.argmax(signz < 0))
+    n_species = len(signz)
+    resolution = tuple(len(np_geom[k]) for k in ("intvp", "intmu", "ints", "kxrh", "krho"))
+
+    times, solver_steps, fluxes, kyspecs, kxspecs, growth = [], [], [], [], [], []
+    # df statistics pre-reduced over (vpar, s, x, y): one value per (re/im, species, mu)
+    df_axes = (2, 4, 5, 6)
+    df_stats, phi_stats = _new_stats(), _new_stats()
+    old = load_meta(os.path.join(out_path, "metadata")) if append else None
+    if append:
+        first_index = int(old.get("index_offset", 0)) + len(old["timesteps"])
+    for idx, step_path in progress(enumerate(steps, first_index), show_tqdm, desc=name, leave=False):
+        d = load_kinetic_step(step_path)
+        # transform, statistics and bf16 cast on the default jax device
+        df = spec_to_df(jnp.asarray(d["df"]))
+        phi = spec_to_phi(np.moveaxis(d["phi"], 0, 1).astype(np.complex64)).astype(np.float32)
+        dumped = np.asarray(d["fluxes"], dtype=np.float64).reshape(n_species, len(FLUX_NAMES))
+        if verify:
+            got = flux_fn(d["df"])
+            if np.abs(got[:, 1] - dumped[:, 1]).max() > flux_rtol * max(np.abs(dumped[:, 1]).max(), 1e-12):
+                warnings.warn(f"{name} step {int(np.ravel(d['step'])[0])}: heat flux {got[:, 1]} != {dumped[:, 1]}")
+        count = float(np.prod([df.shape[a] for a in df_axes]))
+        df_stats.merge(
+            *(np.asarray(f(df, axis=df_axes, keepdims=True), np.float64)
+              for f in (jnp.mean, jnp.var, jnp.min, jnp.max)),
+            count,
+        )
+        phi_stats.push(phi)
+        for kind, arr in (("timestep", df), ("poten", phi)):
+            if bits == "bf16":
+                payload, scale = np.asarray(jnp.asarray(arr).astype(jnp.bfloat16)).ravel(), None
+            else:
+                payload, scale = quant.quantize(np.asarray(arr).ravel(), bits)
+            quant.write(os.path.join(out_path, "data", frame_name(kind, idx) + quant.SUFFIX[bits]),
+                        payload, scale)
+        times.append(float(np.ravel(d["time"])[0]))
+        solver_steps.append(int(np.ravel(d["step"])[0]))
+        fluxes.append(dumped.reshape(-1))
+        kyspecs.append(np.asarray(d["ky_spec"], dtype=np.float64))
+        kxspecs.append(np.asarray(d["kx_spec"], dtype=np.float64))
+        growth.append(np.asarray(d["last_growth_rate"], dtype=np.float64))
+        if delete_steps:
+            os.remove(step_path)
+    if not times:
+        raise FileNotFoundError(f"no dumps for {name}")
+
+    metadata = {
+        "simulation_code": "gyaradax",
+        "source_config": os.path.abspath(config_path),
+        "ds": float(np_geom["ints"][0]),
+        "resolution": resolution,
+        "df_shape": (2, n_species, *resolution),
+        "phi_shape": (resolution[3], resolution[2], resolution[4]),
+        "axis_order": "df: (re/im, species, vpar, mu, s, x, y); phi: (x, s, y); x, y real space",
+        "channel_layout": "reim_species",
+        "quantization": bits,
+        "real_space_convention": "ifftn(fftshift(spec, axes=kx), axes=(kx, ky), norm='forward')",
+        "n_species": n_species,
+        "ion_species_index": ion,
+        "electron_species_index": elec,
+        "ion_temp_grad": np.array([rlt[ion]]),
+        "electron_temp_grad": np.array([rlt[elec]]),
+        "density_grad": np.array([rln[ion]]),
+        "rlt": rlt,
+        "rln": rln,
+        "tmp": tmp,
+        "ion_temp": np.array([tmp[ion]]),
+        "electron_temp": np.array([tmp[elec]]),
+        "temp_ratio": np.array([tmp[elec] / tmp[ion]]),
+        "s_hat": np.array([float(cfg.geometry.shat)]),
+        "q": np.array([float(cfg.geometry.q)]),
+        "geometry": np_geom,
+        "flux_labels": [f"{f}_s{s}" for s in range(n_species) for f in FLUX_NAMES],
+        "timesteps": np.asarray(times),
+        "solver_steps": np.asarray(solver_steps),
+        "flux": np.stack(fluxes),
+        "kyspec": np.stack(kyspecs),
+        "kxspec": np.stack(kxspecs),
+        "growth": np.stack(growth),
+        "df_stats_agg_axes": df_axes,
+        **_stats_dict("df", df_stats, np.float32),
+        **_stats_dict("phi", phi_stats, np.float32),
+    }
+    if first_index and not append:
+        # a trajectory continued in a separate folder: its first frame index
+        metadata["index_offset"] = first_index
+    if append:
+        per_frame = ("timesteps", "solver_steps", "flux", "kyspec", "kxspec", "growth")
+        metadata = {
+            **old,
+            **{k: np.concatenate([np.asarray(old[k]), metadata[k]]) for k in per_frame},
+            "appended_from": np.append(np.asarray(old.get("appended_from", []), int), first_index),
+        }
+    write_metadata(out_path, metadata)
+    # the gyaradax config of the run, for completeness
+    shutil.copyfile(config_path, os.path.join(out_path, "config.yaml"))
     return out_path
 
 

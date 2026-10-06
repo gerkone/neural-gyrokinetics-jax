@@ -12,6 +12,7 @@ backend (host numpy, or device jax for ``KvikIOBackend``), the scalars are numpy
 from __future__ import annotations
 
 import copy
+import itertools
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -30,10 +31,30 @@ FLUX_AVG_WINDOW = 80
 # condition names of the scalar trajectory parameters -> their metadata keys
 COND_META_KEYS = {"itg": "ion_temp_grad", "dg": "density_grad", "s_hat": "s_hat", "q": "q"}
 DEFAULT_CONDITIONS = tuple(COND_META_KEYS)
+# kinetic-electron conditions -> (metadata key, value of an adiabatic-electron trajectory)
+KINETIC_COND_KEYS = {"etg": ("electron_temp_grad", 0.0), "temp_ratio": ("temp_ratio", 1.0)}
+# 1 for kinetic-electron trajectories, 0 for adiabatic ones
+KINETIC_FLAG = "kinetic"
 
 
-def avg_flux(flux) -> float:
-    return float(np.mean(np.asarray(flux)[1:][-FLUX_AVG_WINDOW:]))
+def avg_flux(flux):
+    flux = np.asarray(flux)
+    # a single-snapshot trajectory averages its only frame
+    return np.mean(flux[1:][-FLUX_AVG_WINDOW:] if len(flux) > 1 else flux, axis=0)
+
+
+def n_species(meta: dict) -> int:
+    return int(meta.get("n_species", 1))
+
+
+def heat_flux(meta: dict) -> np.ndarray:
+    """Heat flux per timestep, ``(T,)`` for one species and ``(T, species)`` for several."""
+    flux = np.asarray(meta["flux"], dtype=np.float64)
+    ns = n_species(meta)
+    if ns == 1:
+        return flux
+    # kinetic metadata: (T, species * (pflux, eflux, vflux))
+    return flux.reshape(len(flux), ns, -1)[..., 1]
 
 
 def _f32(x):
@@ -63,6 +84,10 @@ class CycloneSample:
     y_phi: np.ndarray | None = None
     y_flux: np.ndarray | None = None
     y_fluxavg: np.ndarray | None = None
+    # data type of the sample (its dataset's index in a mix) and its number of species
+    data_type: np.ndarray | None = None
+    n_species: np.ndarray | None = None
+    loss_weight: np.ndarray | None = None
 
 
 class CycloneDataset:
@@ -94,7 +119,24 @@ class CycloneDataset:
     bundle_seq_length
         Time-bundling stride. Default ``1`` (one timestep per sample).
     offset
-        Number of leading timesteps to skip per trajectory.
+        Number of leading timesteps to skip per trajectory; at least the ``first_frame``
+        (first stored frame) of every trajectory.
+    species_axis
+        Serve df as ``(C, species, vpar, mu, s, x, y)`` (adiabatic trajectories get a
+        unit species axis) and the flux per species. Required for kinetic trajectories.
+    kx_crop
+        Number of central kx modes kept of trajectories with more (df and phi are cropped
+        in Fourier space on read).
+    data_type
+        Data type id served with every sample (the dataset's index in a mix).
+    loss_weight
+        Weight of this dataset's samples in the training loss, served with every sample
+        (set from ``dataset.mixing`` by a mix).
+    augment
+        Random symmetries applied to the raw df of every training sample, all off unless
+        given: ``roll_y`` (a random roll along y, an exact symmetry of the flux tube) and
+        ``amplitude: [lo, hi]`` (a log-uniform rescaling, exact for linear states only; it
+        scales the fluxes by its square).
     """
 
     def __init__(
@@ -116,6 +158,11 @@ class CycloneDataset:
         tail_offset: int = 0,
         subsample: int = 1,
         separate_zf: bool = False,
+        species_axis: bool = False,
+        kx_crop: Optional[int] = None,
+        data_type: int = 0,
+        loss_weight: float = 1.0,
+        augment: Optional[dict] = None,
         rank: int = 0,
     ):
         assert split in ("train", "val")
@@ -137,6 +184,15 @@ class CycloneDataset:
         self.tail_offset = tail_offset
         self.subsample = subsample
         self.separate_zf = separate_zf
+        self.species_axis = species_axis
+        self.kx_crop = kx_crop
+        self.data_type = data_type
+        self.loss_weight = float(loss_weight)
+        self.augment = {k: v for k, v in (augment or {}).items() if v}
+        self._augment_calls = itertools.count()
+        # model stem decoding this dataset (set by a mix)
+        self.stem = None
+        self._batch_transform = False
         self.backend = backend
         self.rank = rank
 
@@ -160,7 +216,8 @@ class CycloneDataset:
         kept_files = []
         # metadata keys every sample needs, plus any other conditioning field
         required = {*COND_META_KEYS.values(), "flux", "timesteps"}
-        required |= {c for c in self.conditions if c not in COND_META_KEYS and c != "timestep"}
+        optional = {*KINETIC_COND_KEYS, KINETIC_FLAG, "timestep"}
+        required |= {c for c in self.conditions if c not in COND_META_KEYS and c not in optional}
         for fp, meta in zip(self.files, metas):
             if not self._passes_cond_filter(meta):
                 continue
@@ -170,6 +227,10 @@ class CycloneDataset:
                 if self.rank == 0:
                     warnings.warn(f"{fp}: missing metadata {missing}; excluding trajectory")
                 continue
+            if offset < int(meta.get("first_frame", 0)):
+                raise ValueError(f"{fp}: frames before {meta['first_frame']} are not stored (offset={offset})")
+            if n_species(meta) > 1 and not species_axis:
+                raise ValueError(f"{fp}: {n_species(meta)} species need species_axis=True")
             fid = len(kept_files)
             kept_files.append(fp)
             self.metadata[fid] = meta
@@ -184,23 +245,43 @@ class CycloneDataset:
             if tail_offset > 0:
                 timesteps = timesteps[:-tail_offset]
             n = len(timesteps[::subsample]) - bundle_seq_length * 2 + 1
+            # a single-snapshot trajectory still serves its frame unless a next-step target is needed
+            if mode != "next" and len(timesteps) == 1:
+                n = 1
             for t_idx in range(max(0, n)):
                 self.flat_index_to_file_and_tstep[flat] = (fid, t_idx * subsample)
                 flat += 1
         self.length = flat
 
         # resolution: assume same across files
-        self.resolution = tuple(self.metadata[0]["resolution"])
-        self.df_shape = (2, *self.resolution)
+        meta0 = self.metadata[0]
+        self.n_species = n_species(meta0)
+        stored = tuple(meta0["resolution"])
+        self.stored_df_shape = tuple(meta0.get("df_shape", (2, *stored)))
+        self.stored_phi_shape = (stored[3], stored[2], stored[4])
+        nx = stored[3] if kx_crop is None else min(stored[3], int(kx_crop))
+        self.resolution = (*stored[:3], nx, stored[4])
+        self.df_shape = (2, self.n_species, *self.resolution) if species_axis else (2, *self.resolution)
         self.phi_resolution = (self.resolution[3], self.resolution[2], self.resolution[4])
 
-        # normalization_stats when given, else the per-trajectory metadata moments
+        # normalization_stats when given, else metadata moments (direct construction only, build_dataset resolves data stats)
+        insert = species_axis and len(self.stored_df_shape) == 6
+        if isinstance(normalization_stats, (str, os.PathLike)) and not os.path.exists(normalization_stats):
+            raise FileNotFoundError(f"normalization_stats {normalization_stats} does not exist")
         if isinstance(normalization_stats, (str, os.PathLike)):
             self.stats = load_stats(normalization_stats, normalization)
         elif normalization_stats is not None:
             self.stats = normalization_stats
+        elif normalization:
+            self.stats = metadata_stats(self.metadata, self.fields_to_load, normalization, insert)
         else:
-            self.stats = metadata_stats(self.metadata, self.fields_to_load) if normalization else {}
+            self.stats = {}
+        if insert and "df" in self.stats:
+            # single-species stats still without it get the unit species axis of the served df
+            self.stats = {**self.stats, "df": {
+                k: {n: np.expand_dims(a, 1) if np.ndim(a) == 6 else a for n, a in v.items()}
+                for k, v in self.stats["df"].items()
+            }}
         ndims = {"df": len(self.df_shape), "phi": len(self.phi_resolution), "flux": 0, "fluxavg": 0}
         self.norm = NormTable.from_stats(
             self.stats, normalization, normalization_scope, len(self.files), ndims
@@ -218,6 +299,9 @@ class CycloneDataset:
                 cond_range = [cond_range]
             if cond_name == "flux":
                 bound = self.offset if self.offset > 0 else FLUX_AVG_WINDOW
+                # ion heat flux
+                cond = heat_flux(meta)
+                cond = cond if cond.ndim == 1 else cond[:, 0]
                 cond = float(np.mean(cond[:bound] if where == "first" else cond[-bound:]))
             if not any(lo <= cond <= hi for lo, hi in cond_range):
                 return False
@@ -236,21 +320,77 @@ class CycloneDataset:
 
     def _frames(self, handle, fid: int, t: int) -> dict:
         """Normalized float32 ``df``/``phi`` frames (those loaded) at raw frame index ``t``."""
-        out = {}
+        out, raw = {}, {}
         if "df" in self.fields_to_load:
-            df = self.backend.read_df(handle, t, self.df_shape)
-            out["df"] = separate_zf_fn(df, axis=0) if self.separate_zf else df
+            df = self.backend.read_df(handle, t, self.stored_df_shape)
+            if self.batch_transform:
+                raw["df"] = df
+            else:
+                out["df"] = self.transform(df[None], np.asarray([fid]), normalize=False)[0]
         if "phi" in self.fields_to_load:
-            out["phi"] = self.backend.read_phi(handle, t, self.phi_resolution)
-        return {k: _f32(self.norm.normalize(k, v, fid)) for k, v in out.items()}
+            phi = self.backend.read_phi(handle, t, self.stored_phi_shape)
+            if phi.shape[0] != self.resolution[3]:
+                from neugk_jax.evaluate.fourier import crop_kx_phi
+
+                phi = crop_kx_phi(phi, self.resolution[3])
+            out["phi"] = phi
+        return {**raw, **{k: _f32(self.norm.normalize(k, v, fid)) for k, v in out.items()}}
+
+    @property
+    def batch_transform(self) -> bool:
+        """Serve raw df frames (16-bit shards as stored); :meth:`transform` runs per batch."""
+        return self._batch_transform
+
+    @batch_transform.setter
+    def batch_transform(self, on: bool) -> None:
+        self._batch_transform = bool(on)
+        if hasattr(self.backend, "keep_half"):
+            self.backend.keep_half = self._batch_transform
+
+    def transform(self, df, fids, normalize: bool = True):
+        """The df frame transform on a raw batch ``(B, 2, ...)``.
+
+        float32, kx crop, unit species axis, zonal-flow split and (with ``normalize``)
+        normalization.
+        """
+        x = df.astype(np.float32)
+        if x.shape[-2] != self.resolution[3]:
+            from neugk_jax.evaluate.fourier import crop_kx_df
+
+            x = crop_kx_df(x, self.resolution[3], reim_axis=1)
+        if self.species_axis and x.ndim == 7:
+            x = x[:, :, None]
+        if self.augment:
+            x = self._augmented(x)
+        x = separate_zf_fn(x, axis=1) if self.separate_zf else x
+        return self.norm.normalize("df", x, fids).astype(np.float32) if normalize else x
+
+    def _augmented(self, x):
+        """``augment`` on a raw df batch ``(B, 2, ..., x, y)``, independently per sample."""
+        rng = np.random.default_rng([self.rank, next(self._augment_calls)])
+        xp = x.__array_namespace__() if hasattr(x, "__array_namespace__") else np
+        rows = []
+        for row in x:
+            if self.augment.get("roll_y"):
+                row = xp.roll(row, int(rng.integers(row.shape[-1])), axis=-1)
+            if self.augment.get("amplitude"):
+                lo, hi = (float(v) for v in self.augment["amplitude"])
+                row = row * float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+            rows.append(row)
+        return xp.stack(rows)
+
+    def read_frame(self, fid: int, t: int) -> dict:
+        """The loaded fields of trajectory ``fid`` at raw frame index ``t``, normalized."""
+        with self.backend.open(self.files[int(fid)]) as handle:
+            return self._frames(handle, int(fid), int(t))
 
     def _targets(self, handle, fid: int, t_idx: int) -> dict:
         """Normalized next-step targets (frames, ``flux``, ``fluxavg``) of sample ``(fid, t_idx)``."""
         t = t_idx + self.offset + self.bundle_seq_length
-        flux = self.metadata[fid]["flux"]
+        flux = self.flux(fid)
         out = self._frames(handle, fid, t)
         out["flux"] = np.asarray(flux[t], dtype=np.float32)
-        out["fluxavg"] = np.float32(avg_flux(flux))
+        out["fluxavg"] = np.asarray(avg_flux(flux), dtype=np.float32)
         for k in ("flux", "fluxavg"):
             out[k] = np.asarray(self.norm.normalize(k, out[k], fid), np.float32)
         return out
@@ -263,7 +403,7 @@ class CycloneDataset:
     def sample(self, fid: int, t_idx: int) -> CycloneSample:
         """The sample of trajectory ``fid`` at timestep index ``t_idx`` in the current mode."""
         meta, t = self.metadata[fid], t_idx + self.offset
-        flux, timestep = meta["flux"][t], meta["timesteps"][t]
+        flux, timestep = self.flux(fid)[t], meta["timesteps"][t]
         targets = {}
         if self.mode == "diff" and self.precomputed_latents is not None:
             cached = self.precomputed_latents[(fid, t_idx)]
@@ -279,7 +419,7 @@ class CycloneDataset:
             df=frames.get("df"),
             phi=frames.get("phi"),
             flux=np.asarray(flux, dtype=np.float32),
-            avg_flux=np.float32(self.get_avg_flux(fid)),
+            avg_flux=np.asarray(self.get_avg_flux(fid), dtype=np.float32),
             timestep=timestep,
             file_index=np.int64(fid),
             timestep_index=np.int64(t_idx),
@@ -289,6 +429,9 @@ class CycloneDataset:
                 for k, v in COND_META_KEYS.items()
             },
             **{f"y_{k}": v for k, v in targets.items()},
+            data_type=np.int64(self.data_type),
+            n_species=np.int64(self.n_species),
+            loss_weight=np.float32(self.loss_weight),
         )
 
     def conditioning(self, fid: int, timestep) -> Optional[np.ndarray]:
@@ -296,11 +439,26 @@ class CycloneDataset:
         if not self.conditions:
             return None
         meta = self.metadata[fid]
-        vals = [
-            timestep if k == "timestep" else np.squeeze(meta[COND_META_KEYS.get(k, k)])
-            for k in self.conditions
-        ]
-        return np.concatenate([np.atleast_1d(np.asarray(v, np.float32)) for v in vals])
+        return np.concatenate(
+            [np.atleast_1d(np.asarray(self.condition_value(meta, k, timestep), np.float32)) for k in self.conditions]
+        )
+
+    @staticmethod
+    def condition_value(meta: dict, name: str, timestep=None):
+        """Value of condition ``name`` of a trajectory; adiabatic ones take the kinetic defaults."""
+        if name == "timestep":
+            return timestep
+        if name == KINETIC_FLAG:
+            return float(n_species(meta) > 1)
+        if name in KINETIC_COND_KEYS:
+            key, default = KINETIC_COND_KEYS[name]
+            return np.squeeze(meta[key]) if key in meta else default
+        return np.squeeze(meta[COND_META_KEYS.get(name, name)])
+
+    def flux(self, fid: int) -> np.ndarray:
+        """Heat flux of trajectory ``fid`` per timestep, ``(T, species)`` with ``species_axis``."""
+        flux = heat_flux(self.metadata[fid])
+        return flux[:, None] if self.species_axis and flux.ndim == 1 else flux
 
     def num_ts(self, fid: int) -> int:
         """Raw timesteps of trajectory ``fid`` after ``offset``, tail and subsampled ones included.
@@ -315,11 +473,35 @@ class CycloneDataset:
             self.metadata[int(fid)]["timesteps"][int(t_idx) + self.offset], dtype=np.float32
         )
 
-    def get_avg_flux(self, fid: int) -> float:
-        return avg_flux(self.metadata[fid]["flux"])
+    def get_avg_flux(self, fid: int):
+        return avg_flux(self.flux(fid))
+
+    def geometry(self, fid: int) -> Optional[dict]:
+        """Geometry of trajectory ``fid`` on the served kx grid.
+
+        Kinetic runs without a stored geometry take it (and ``ds``) from their source config.
+        """
+        meta = self.metadata[int(fid)]
+        if "source_config" in meta:
+            # gyaradax runs preprocessed before the geometry / ds were stored
+            if "geometry" not in meta:
+                from omegaconf import OmegaConf
+
+                from neugk_jax.dataset.preprocess import kinetic_geometry
+
+                meta["geometry"] = kinetic_geometry(OmegaConf.load(meta["source_config"]))
+            meta.setdefault("ds", float(np.asarray(meta["geometry"]["ints"]).ravel()[0]))
+        geom = meta.get("geometry")
+        if geom is None or len(geom["kxrh"]) == self.resolution[3]:
+            return geom
+        # central kx modes, as kept by kx_crop
+        i0 = (len(geom["kxrh"]) - self.resolution[3]) // 2
+        return {**geom, "kxrh": np.asarray(geom["kxrh"])[i0 : i0 + self.resolution[3]]}
 
     def get_ds(self, fid: int) -> float | None:
         # parallel (s) grid spacing; None when the trajectory metadata doesn't carry it
+        if "source_config" in self.metadata[fid]:
+            self.geometry(fid)
         ds = self.metadata[fid].get("ds")
         return None if ds is None else float(ds)
 

@@ -38,22 +38,74 @@ def load_stats(path, normalization: Optional[Mapping] = None) -> dict[str, dict]
     return out
 
 
-def metadata_stats(metadata: Mapping[int, dict], fields: Sequence[str]) -> dict[str, dict]:
-    """``stats[field][fid]`` and their pooled ``stats[field]["full"]`` from metadata moments."""
+def metadata_stats(
+    metadata: Mapping[int, dict],
+    fields: Sequence[str],
+    normalization: Optional[Mapping] = None,
+    insert_species: bool = False,
+) -> dict[str, dict]:
+    """``stats[field][fid]`` and their pooled ``stats[field]["full"]`` from metadata moments.
+
+    Both are pooled over the field's ``normalization[field]["agg_axes"]`` (keepdims);
+    ``insert_species`` first gives single-species df moments the unit species axis.
+    """
     out: dict[str, dict] = {}
     for k in fields:
         out[k] = {}
+        agg = ((normalization or {}).get(k) or {}).get("agg_axes")
+        axes = tuple(int(a) for a in agg) if agg else None
         pooled = RunningStats(prior_count=0.0)
         for fid, meta in metadata.items():
             if f"{k}_mean" not in meta:
                 continue
             mean, std = meta[f"{k}_mean"], meta[f"{k}_std"]
             mn, mx = meta.get(f"{k}_min", mean), meta.get(f"{k}_max", mean)
-            out[k][fid] = {"mean": mean, "std": std, "min": mn, "max": mx}
+            if insert_species and k == "df":
+                mean, std, mn, mx = (np.expand_dims(a, 1) for a in (mean, std, mn, mx))
+            one = RunningStats(prior_count=0.0)
+            one.merge(mean, std**2, mn, mx, count=len(meta["timesteps"]))
+            out[k][fid] = {n: one.moments(np.float32, axes=axes)[n] for n in ("mean", "std", "min", "max")}
             pooled.merge(mean, std**2, mn, mx, count=len(meta["timesteps"]))
         if pooled.count:
-            out[k]["full"] = pooled.moments(np.float32)
+            out[k]["full"] = pooled.moments(np.float32, axes=axes)
     return out
+
+
+def stream_stats(ds, normalization: Optional[Mapping], stride: int = 1, workers: int = 8):
+    """Pooled statistics of the unnormalized samples of ``ds`` (every ``stride``-th index).
+
+    Every sample is reduced over the field's ``agg_axes`` (in the served layout) and merged
+    exactly; returns ``stats[field]["full"]``.
+    """
+    import copy
+    from concurrent.futures import ThreadPoolExecutor
+
+    from neugk_jax.utils import progress
+
+    raw = copy.copy(ds)
+    raw.norm = NormTable({}, {}, False, ())
+    fields = list(ds.fields_to_load)
+    axes = {}
+    for k in fields:
+        agg = ((normalization or {}).get(k) or {}).get("agg_axes")
+        axes[k] = tuple(int(a) for a in agg) if agg else ()
+    pooled = {k: RunningStats(prior_count=0.0) for k in fields}
+    indices = range(0, len(raw), max(1, int(stride)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for sample in progress(ex.map(raw.__getitem__, indices), True, total=len(indices), desc="stats"):
+            for k in fields:
+                x = np.asarray(getattr(sample, k), np.float64)
+                ax = axes[k]
+                count = float(np.prod([x.shape[a] for a in ax])) if ax else 1.0
+                red = lambda f: f(x, axis=ax, keepdims=True) if ax else x
+                pooled[k].merge(red(np.mean), red(np.var), red(np.min), red(np.max), count)
+    return {k: {"full": rms.moments(np.float32)} for k, rms in pooled.items()}
+
+
+def save_stats(path, stats: Mapping[str, Mapping]) -> None:
+    """Write the pooled ``stats[field]["full"]`` as a stats pickle :func:`load_stats` reads."""
+    with open(path, "wb") as f:
+        pickle.dump({k: {"full": v["full"]} for k, v in stats.items() if "full" in v}, f)
 
 
 def _scale_shift(spec: Mapping, stats: Mapping) -> tuple[np.ndarray, np.ndarray]:

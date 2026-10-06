@@ -205,7 +205,7 @@ def test_field_solver_spectrum_sums_to_flux_and_matches_flux_integral():
     np.testing.assert_allclose(solver.flux_spectrum(df).sum(), eflux, rtol=1e-10)
     phi32, (_, ef32, _) = jax.jit(flux_integral)(precompute_geometry(geom), jnp.asarray(df))
     np.testing.assert_allclose(phi, np.asarray(phi32), rtol=1e-4, atol=1e-5 * np.abs(phi).max())
-    np.testing.assert_allclose(eflux, float(ef32), rtol=1e-4)
+    np.testing.assert_allclose(eflux, float(ef32[0]), rtol=1e-4)
 
 
 def _synthetic_traj(root, n=3):

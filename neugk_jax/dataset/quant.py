@@ -36,11 +36,19 @@ def sibling(fp32_path: str, bits: str) -> str:
 
 
 def resolve(fp32_path: str, prefer: str) -> tuple[str, str]:
-    """``(path, bits)`` to read: the ``prefer`` sibling when it exists, else the fp32 shard."""
+    """``(path, bits)`` to read: the ``prefer`` sibling when it exists, else the fp32 shard.
+
+    Without an fp32 shard the first existing quantized sibling is read.
+    """
     if prefer != "fp32":
         cand = sibling(fp32_path, prefer)
         if os.path.exists(cand):
             return cand, prefer
+    if not os.path.exists(fp32_path):
+        for bits in ("bf16", "fp16", "i8", "i4"):
+            cand = sibling(fp32_path, bits)
+            if os.path.exists(cand):
+                return cand, bits
     return fp32_path, "fp32"
 
 
