@@ -9,9 +9,11 @@ sorted union of both key sets.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+import math
+from typing import Callable, Mapping, Optional, Sequence
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 
@@ -19,7 +21,7 @@ from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet
 from neugk_jax.models.patching import PatchExpand
 from neugk_jax.models.swin import BlockStack
-from neugk_jax.models.utils import LayerNorm, Linear, gelu, split_key
+from neugk_jax.models.utils import LayerNorm, Linear, gelu, split_key, trainable_mask
 from neugk_jax.models.vit import vit_layer
 
 
@@ -49,6 +51,7 @@ class Swin5DAE(eqx.Module):
         *,
         space: int = 5,
         decouple_mu: bool = False,
+        mu_axis: int = 1,
         dim: int,
         base_resolution: Sequence[int],
         in_channels: int,
@@ -82,6 +85,7 @@ class Swin5DAE(eqx.Module):
         encoder_conditioning: Sequence[str] = (),
         decoder_conditioning: Sequence[str] = (),
         cond_embed_dim: int = 32,
+        merge_mask: Optional[Sequence[bool]] = None,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -104,6 +108,7 @@ class Swin5DAE(eqx.Module):
         self.backbone = Swin5DUnet(
             space=space,
             decouple_mu=decouple_mu,
+            mu_axis=mu_axis,
             dim=dim,
             base_resolution=base_resolution,
             in_channels=in_channels,
@@ -132,6 +137,7 @@ class Swin5DAE(eqx.Module):
             decoder_rms_norm=decoder_rms_norm,
             enc_cond_dim=enc_cdim,
             dec_cond_dim=dec_cdim,
+            merge_mask=merge_mask,
             # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
             build_middle=False,
@@ -234,3 +240,182 @@ class Swin5DAE(eqx.Module):
         if return_latent:
             out["latent"] = z
         return out
+
+
+def _is_none(x):
+    return x is None
+
+
+def _trunk(backbone):
+    return backbone.down_blocks, backbone.up_blocks
+
+
+def _trunk_param_index(backbone) -> tuple[int, ...]:
+    # positions of the trainable trunk arrays among the trunk leaves (None nodes counted)
+    trunk = _trunk(backbone)
+    arrays = jax.tree_util.tree_leaves(trunk)
+    params = {id(a) for a, m in zip(arrays, jax.tree_util.tree_leaves(trainable_mask(trunk))) if m}
+    leaves = jax.tree_util.tree_leaves(trunk, is_leaf=_is_none)
+    return tuple(i for i, leaf in enumerate(leaves) if id(leaf) in params)
+
+
+def _trunk_params(backbone, index):
+    leaves = jax.tree_util.tree_leaves(_trunk(backbone), is_leaf=_is_none)
+    return [leaves[i] for i in index]
+
+
+class KineticSwin5DAE(Swin5DAE):
+    """Swin5DAE over ``(C, species, vpar, mu, s, x, y)`` df with one stem per data grid.
+
+    Species is an unpatched spatial axis with full-axis windows, identified by a learned
+    ``species_embed``; with ``decouple_mu`` every stem folds its own mu axis into the channels.
+    Every stem (``stems[name]``: ``resolution`` (vpar, mu, s, x, y),
+    ``n_species``, ``patch_size``, optional ``window_size`` / ``in_channels`` /
+    ``out_channels``) has its own patch embedding, ``vel_pe`` and unpatch, and its own window
+    layout buffers; the trunk weights are those of the primary stem (the one with the most
+    species, whatever the order of ``stems``), and every stem must give them the same shapes
+    and reach the same latent grid apart from the species extent. A call runs the stem named
+    by ``stem``, else the one whose input shape matches the df; ``decode`` defaults to the
+    primary stem.
+    """
+
+    species_embed: jax.Array
+    stem_backbones: dict
+    primary_stem: str = eqx.field(static=True)
+    trunk_index: tuple[int, ...] = eqx.field(static=True)
+    stem_inputs: dict = eqx.field(static=True)
+
+    def __init__(
+        self,
+        *,
+        stems: Mapping[str, Mapping],
+        in_channels: int,
+        out_channels: int,
+        window_size,
+        n_species: int = 2,
+        key,
+        **kwargs,
+    ):
+        # the primary stem (shared layers, upscale target, DiT grid) has the most species
+        names = sorted(stems, key=lambda n: -int(stems[n].get("n_species", n_species)))
+
+        def stem_kwargs(spec):
+            ns = int(spec.get("n_species", n_species))
+            # species: unpatched, full attention (an infinite window is never partitioned or shifted)
+            return dict(
+                space=6,
+                mu_axis=2,
+                base_resolution=[ns, *spec["resolution"]],
+                patch_size=[1, *spec["patch_size"]],
+                window_size=[math.inf, *spec.get("window_size", window_size)],
+                # species tokens are never merged (with each other or downsampled)
+                merge_mask=[False, *[True] * len(spec["patch_size"])],
+                in_channels=int(spec.get("in_channels", in_channels)),
+                out_channels=int(spec.get("out_channels", out_channels)),
+            )
+
+        k_ae, k_sp = jr.split(key)
+        super().__init__(key=k_ae, **stem_kwargs(stems[names[0]]), **kwargs)
+        self.stem_inputs = {}
+        for name in names:
+            kw = stem_kwargs(stems[name])
+            self.stem_inputs[name] = (kw["in_channels"], *kw["base_resolution"])
+        self.primary_stem = names[0]
+        self.trunk_index = _trunk_param_index(self.backbone)
+        shared = _trunk_params(self.backbone, self.trunk_index)
+        self.stem_backbones = {}
+        for i, name in enumerate(names[1:], 1):
+            variant = Swin5DAE(key=jr.fold_in(k_ae, i), **stem_kwargs(stems[name]), **kwargs)
+            bb = variant.backbone
+            if _trunk_param_index(bb) != self.trunk_index:
+                raise ValueError(f"stem {name!r}: trunk structure differs from stem {names[0]!r}")
+            for a, b in zip(shared, _trunk_params(bb, self.trunk_index)):
+                if a.shape != b.shape:
+                    raise ValueError(f"stem {name!r}: trunk weight {b.shape} != {a.shape}")
+            if bb.grid_sizes[-1][1:] != self.backbone.grid_sizes[-1][1:]:
+                raise ValueError(
+                    f"stem {name!r}: latent grid {bb.grid_sizes[-1]} != {self.backbone.grid_sizes[-1]}"
+                )
+            # trunk weights are taken from the primary backbone at call time
+            self.stem_backbones[name] = eqx.tree_at(
+                lambda t: _trunk_params(t, self.trunk_index),
+                bb,
+                replace=[None] * len(self.trunk_index),
+                is_leaf=_is_none,
+            )
+        self.species_embed = 0.02 * jr.normal(k_sp, (n_species, self.backbone.down_dims[0]))
+
+    def stem_for(self, shape) -> str:
+        """The stem whose input shape ``(C, species, vpar, mu, s, x, y)`` is ``shape``."""
+        hits = [n for n, s in self.stem_inputs.items() if tuple(s) == tuple(shape)]
+        if len(hits) != 1:
+            raise ValueError(f"input {tuple(shape)} matches stems {hits}; inputs: {self.stem_inputs}")
+        return hits[0]
+
+    def stem_backbone(self, stem: Optional[str] = None):
+        """The backbone of ``stem``: its own patching and window layout, the shared trunk weights."""
+        if stem is None or stem == self.primary_stem:
+            return self.backbone
+        if stem not in self.stem_backbones:
+            raise KeyError(f"unknown stem {stem!r}; one of {[self.primary_stem, *self.stem_backbones]}")
+        return eqx.tree_at(
+            lambda t: _trunk_params(t, self.trunk_index),
+            self.stem_backbones[stem],
+            replace=_trunk_params(self.backbone, self.trunk_index),
+            is_leaf=_is_none,
+        )
+
+    def encode(self, df, condition=None, *, stem=None, key=None, inference: bool = True):
+        bb = self.stem_backbone(stem or self.stem_for(df.shape))
+        cond = self._embed(self.enc_cond_embed, condition, self.enc_indices)
+        keys = split_key(key, len(bb.down_blocks) + 1)
+        z = bb.patch_encode(df)
+        z = z + self.species_embed[: z.shape[0]].reshape(-1, *(1,) * (z.ndim - 2), z.shape[-1])
+        for blk, k in zip(bb.down_blocks, keys):
+            z = blk(z, cond, return_skip=False, key=k, inference=inference)
+        z = self.middle_downproj(self.middle_pre(z, cond, key=keys[-1], inference=inference))
+        return self.pre_z_norm(z) if self.normalized_latent else z
+
+    def decode(self, z, condition=None, *, stem=None, key=None, inference: bool = True):
+        bb = self.stem_backbone(stem)
+        cond = self._embed(self.dec_cond_embed, condition, self.dec_indices)
+        keys = split_key(key, len(bb.up_blocks) + 1)
+        if self.normalized_latent:
+            z = self.post_z_norm(z)
+        z = self.middle_post(self.middle_upproj(z), cond, key=keys[0], inference=inference)
+        z = self.middle_upscale(z)
+        for blk, k in zip(bb.up_blocks, keys[1:]):
+            z = blk(z, None, cond, key=k, inference=inference)
+        return {"df": bb.patch_decode(z, cond)}
+
+    def __call__(
+        self,
+        df,
+        condition=None,
+        return_latent: bool = False,
+        *,
+        stem=None,
+        key=None,
+        inference: bool = True,
+    ):
+        k_enc, k_dec = split_key(key, 2)
+        stem = stem or self.stem_for(df.shape)
+        z = self.encode(df, condition, stem=stem, key=k_enc, inference=inference)
+        z, extra = self.bottleneck(z, inference=inference)
+        out = self.decode(z, condition, stem=stem, key=k_dec, inference=inference)
+        out.update(extra)
+        if return_latent:
+            out["latent"] = z
+        return out
+
+
+class StemView(eqx.Module):
+    """A ``KineticSwin5DAE`` bound to one stem, callable like a plain autoencoder."""
+
+    model: KineticSwin5DAE
+    stem: str = eqx.field(static=True)
+
+    def __call__(self, df, condition=None, return_latent: bool = False, *, key=None, inference=True):
+        return self.model(
+            df, condition, return_latent, stem=self.stem, key=key, inference=inference
+        )

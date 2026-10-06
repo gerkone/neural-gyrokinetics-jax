@@ -77,6 +77,14 @@ _AE_PATCH_KEYS = {
     "c_multiplier",
 }
 _AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable"}
+_AE_STEM_KEYS = {
+    "resolution",
+    "n_species",
+    "patch_size",
+    "window_size",
+    "in_channels",
+    "out_channels",
+}
 _NO_PE = {"use_abs_pe": False, "use_rope": False}
 
 
@@ -119,7 +127,7 @@ def build_ae_from_config(
     ``legacy_double_shortcut`` (the doubled swin residual) defaults to
     ``model.legacy_swin_shortcut``, else False.
     """
-    from neugk_jax.pinc import Swin5DAE, Swin5DVQVAE
+    from neugk_jax.pinc import KineticSwin5DAE, Swin5DAE, Swin5DVQVAE
 
     cfg = to_dict(cfg_path)
     mcfg = cfg["model"]
@@ -132,16 +140,33 @@ def build_ae_from_config(
     validate_keys("model.bottleneck", bn, _AE_BOTTLENECK_KEYS)
     dataset = cfg.get("dataset", {})
     depth = vit["depth"]
-    cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
+    stems = mcfg.get("stems")
+    if stems:
+        if vq:
+            raise NotImplementedError("model.stems with model_type vqvae")
+        for name, spec in stems.items():
+            validate_keys(f"model.stems.{name}", spec, _AE_STEM_KEYS)
+        # species-axis autoencoder: per-stem grids, the patch / window defaults from model.patch
+        cls = partial(
+            KineticSwin5DAE,
+            stems={n: {"patch_size": patch["patch_size"], **s} for n, s in stems.items()},
+            n_species=max(int(s.get("n_species", 1)) for s in stems.values()),
+        )
+        grid = {}
+    else:
+        cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
+        grid = dict(
+            space=5,
+            base_resolution=list(resolution or dataset.get("resolution") or RESOLUTION),
+            patch_size=patch["patch_size"],
+        )
     return force_f32(
         cls(
-            space=5,
+            **grid,
             decouple_mu=mcfg.get("decouple_mu", True),
             dim=mcfg["latent_dim"],
-            base_resolution=list(resolution or dataset.get("resolution") or RESOLUTION),
             in_channels=dataset.get("in_channels", _df_channels(dataset)),
             out_channels=dataset.get("out_channels", _df_channels(dataset)),
-            patch_size=patch["patch_size"],
             window_size=patch["window_size"],
             depth=depth,
             num_heads=vit["num_heads"],
@@ -175,13 +200,18 @@ def build_ae_from_config(
 
 
 def build_dit_from_config(cfg_path, ae, *, key):
-    """``DiT`` of a config whose latent grid and width match the AE bottleneck."""
-    from neugk_jax.diffusion.dit import DiT
+    """``DiT`` of a config whose latent grid and width match the AE bottleneck.
+
+    A species-axis AE (``KineticSwin5DAE``) gets a ``KineticDiT``.
+    """
+    from neugk_jax.diffusion.dit import DiT, KineticDiT
+    from neugk_jax.pinc import KineticSwin5DAE
 
     mcfg = to_dict(cfg_path)["model"]
     vit = mcfg["vit"]
+    cls = KineticDiT if isinstance(ae, KineticSwin5DAE) else DiT
     return force_f32(
-        DiT(
+        cls(
             z_dim=int(ae.bottleneck_dim),
             dim=mcfg["latent_dim"],
             grid_size=tuple(ae.bottleneck_grid_size),
@@ -352,11 +382,24 @@ def build_release_gyroswin(cfg_path, *, key, resolution: Optional[Sequence[int]]
 
 
 def run_config(cfg, ds=None) -> dict:
-    """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf."""
+    """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf.
+
+    ``model.stems`` take their resolution, species and channels from the dataset part of the
+    same name (the dataset itself for a single stem).
+    """
     out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
         out["dataset"]["resolution"] = [int(r) for r in ds.resolution]
         out["dataset"]["separate_zf"] = bool(ds.separate_zf)
+        parts = getattr(ds, "parts", None) or {}
+        for name, spec in (out["model"].get("stems") or {}).items():
+            part = parts.get(name, ds if len(out["model"]["stems"]) == 1 else None)
+            if part is None:
+                raise KeyError(f"model.stems.{name} has no dataset part {name!r}")
+            spec.setdefault("resolution", [int(r) for r in part.resolution])
+            spec.setdefault("n_species", int(part.n_species))
+            spec.setdefault("in_channels", _df_channels({"separate_zf": part.separate_zf}))
+            spec.setdefault("out_channels", spec["in_channels"])
     return out
 
 

@@ -10,7 +10,6 @@ from typing import Callable, Optional, Sequence
 import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
-from einops import rearrange
 
 from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
 from neugk_jax.models.patching import (
@@ -52,6 +51,7 @@ class SwinBlockDown(eqx.Module):
         key,
         c_multiplier: int = 2,
         rms_norm: bool = False,
+        merge_mask: Optional[Sequence[bool]] = None,
         **layer_kw,
     ):
         k1, k2 = jr.split(key)
@@ -59,7 +59,7 @@ class SwinBlockDown(eqx.Module):
             dim, depth, num_heads, grid_size, window_size, key=k1, rms_norm=rms_norm, **layer_kw
         )
         self.downsample = PatchMerge(
-            dim, grid_size, key=k2, c_multiplier=c_multiplier, rms_norm=rms_norm
+            dim, grid_size, key=k2, c_multiplier=c_multiplier, rms_norm=rms_norm, merge_mask=merge_mask
         )
         self.resampled_grid_size = self.downsample.target_grid_size
         self.out_dim = self.downsample.out_dim
@@ -199,6 +199,7 @@ class SwinNDUnet(eqx.Module):
         cond_embed_dim: int = 128,
         build_down: bool = True,
         build_middle: bool = True,
+        merge_mask: Optional[Sequence[bool]] = None,
         conv_patch: bool = False,
         unpatch_patch_skip: bool = False,
         key,
@@ -264,11 +265,12 @@ class SwinNDUnet(eqx.Module):
                     key=keys[1 + i],
                     c_multiplier=c_multiplier,
                     rms_norm=rms_norm,
+                    merge_mask=merge_mask,
                     **{**layer_kw, "cond_dim": down_cond},
                 )
                 self.down_blocks.append(blk)
             down_dims.append(down_dims[i] * c_multiplier)
-            grid_sizes.append(merge_grid(grid_sizes[i]))
+            grid_sizes.append(merge_grid(grid_sizes[i], merge_mask))
         self.grid_sizes = tuple(grid_sizes)
         self.down_dims = tuple(down_dims)
 
@@ -354,13 +356,14 @@ class SwinNDUnet(eqx.Module):
 class Swin5DUnet(SwinNDUnet):
     """5D wrapper with optional ``decouple_mu`` collapse.
 
-    When ``decouple_mu=True`` the mu axis (index 1 after channels) is folded
+    When ``decouple_mu=True`` the mu axis (spatial index ``mu_axis``) is folded
     into the channel dimension and a learned ``vel_pe`` is added to provide
     velocity-space positional information.
     """
 
     decouple_mu: bool = eqx.field(static=True)
     decoupled_dim: int = eqx.field(static=True)
+    mu_axis: int = eqx.field(static=True)
     vel_pe: Optional[APE]
 
     def __init__(
@@ -368,6 +371,7 @@ class Swin5DUnet(SwinNDUnet):
         *,
         space: int = 5,
         decouple_mu: bool = False,
+        mu_axis: int = 1,
         base_resolution: Sequence[int],
         in_channels: int,
         out_channels: int,
@@ -378,13 +382,17 @@ class Swin5DUnet(SwinNDUnet):
     ):
         full_in = in_channels
         decoupled_dim = 0
+        full_space = space
         if decouple_mu:
-            # drop the mu axis (index 1) from the spatial, patch and window specs
-            space = 4
-            decoupled_dim = base_resolution[1]
-            base_resolution = [base_resolution[0], *base_resolution[2:]]
-            patch_size = [patch_size[0], *patch_size[2:]]
-            window_size = [window_size[0], *window_size[2:]]
+            # drop the mu axis from the spatial, patch and window specs
+            space -= 1
+            decoupled_dim = base_resolution[mu_axis]
+            drop = lambda seq: [v for i, v in enumerate(seq) if i != mu_axis]
+            base_resolution = drop(base_resolution)
+            patch_size = drop(_as_seq(patch_size, full_space))
+            window_size = drop(_as_seq(window_size, full_space))
+            if kwargs.get("merge_mask") is not None:
+                kwargs["merge_mask"] = drop(kwargs["merge_mask"])
             in_channels *= decoupled_dim
             out_channels *= decoupled_dim
         k_unet, k_vel = jr.split(key)
@@ -400,17 +408,21 @@ class Swin5DUnet(SwinNDUnet):
         )
         self.decouple_mu = decouple_mu
         self.decoupled_dim = decoupled_dim
-        self.vel_pe = APE(full_in, (1, decoupled_dim, 1, 1, 1), key=k_vel) if decouple_mu else None
+        self.mu_axis = mu_axis
+        pe_grid = tuple(decoupled_dim if i == mu_axis else 1 for i in range(full_space))
+        self.vel_pe = APE(full_in, pe_grid, key=k_vel) if decouple_mu else None
 
     def patch_encode(self, df: jnp.ndarray) -> jnp.ndarray:
-        # (C, vp, mu, s, x, y) → channel last → vel_pe → mu folded into channels
+        # (C, *spatial) → channel last → vel_pe → mu folded into channels as (c mu)
         df = jnp.moveaxis(df, 0, -1)
         if self.decouple_mu:
-            df = rearrange(self.vel_pe(df), "vp mu s x y c -> vp s x y (c mu)")
+            df = jnp.moveaxis(self.vel_pe(df), self.mu_axis, -1)
+            df = df.reshape(*df.shape[:-2], -1)
         return self.patch_embed(pad_to_blocks(df, self.patch_size))
 
     def patch_decode(self, z: jnp.ndarray, condition=None) -> jnp.ndarray:
         df = unpad(self.unpatch(z, condition), self.base_resolution)
         if self.decouple_mu:
-            return rearrange(df, "vp s x y (c mu) -> c vp mu s x y", mu=self.decoupled_dim)
+            df = df.reshape(*df.shape[:-1], -1, self.decoupled_dim)
+            return jnp.moveaxis(jnp.moveaxis(df, -1, self.mu_axis), -1, 0)
         return jnp.moveaxis(df, -1, 0)
