@@ -14,7 +14,6 @@ from typing import Mapping, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from neugk_jax.models.utils import init_linears, zero_init_output
 from neugk_jax.utils import to_dict
@@ -77,8 +76,6 @@ _AE_PATCH_KEYS = {
     "merging_hidden_ratio",
     "unmerging_hidden_ratio",
     "c_multiplier",
-    "embedding",
-    "field",
 }
 _AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable"}
 _AE_STEM_KEYS = {
@@ -88,7 +85,6 @@ _AE_STEM_KEYS = {
     "window_size",
     "in_channels",
     "out_channels",
-    "grid",
 }
 _NO_PE = {"use_abs_pe": False, "use_rope": False}
 
@@ -157,10 +153,8 @@ def build_ae_from_config(
             stems={n: {"patch_size": patch["patch_size"], **s} for n, s in stems.items()},
             n_species=max(int(s.get("n_species", 1)) for s in stems.values()),
         )
-        grid = {"field": patch.get("field")} if patch.get("embedding", "linear") == "field" else {}
+        grid = {}
     else:
-        if patch.get("embedding", "linear") != "linear":
-            raise NotImplementedError("model.patch.embedding field needs model.stems")
         cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
         grid = dict(
             space=5,
@@ -407,25 +401,7 @@ def run_config(cfg, ds=None) -> dict:
             spec.setdefault("n_species", int(part.n_species))
             spec.setdefault("in_channels", _df_channels({"separate_zf": part.separate_zf}))
             spec.setdefault("out_channels", spec["in_channels"])
-            if (out["model"].get("patch") or {}).get("embedding") == "field":
-                spec.setdefault("grid", field_grid(part))
     return out
-
-
-def field_grid(ds) -> dict:
-    """Physical grid of a dataset (first trajectory): vpar / mu nodes and weights, (ds, dx, dy)."""
-    g = ds.geometry(0)
-    nx, ny = (int(r) for r in ds.resolution[3:])
-    # box lengths from the wavenumber spacings; x, y are the real-space grids of those modes
-    lx, ly = (2 * np.pi / np.diff(np.unique(np.asarray(g[k], np.float64))).min() for k in ("kxrh", "krho"))
-    as_list = lambda k: [float(v) for v in np.asarray(g[k], np.float64).ravel()]
-    return {
-        "vpar": as_list("vpgr"),
-        "mu": as_list("mugr"),
-        "intvp": as_list("intvp"),
-        "intmu": as_list("intmu"),
-        "spacing": [float(np.asarray(g["ints"]).ravel()[0]), float(lx / nx), float(ly / ny)],
-    }
 
 
 def build_ae(cfg, ds, *, key):

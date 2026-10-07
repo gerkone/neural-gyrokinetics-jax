@@ -272,26 +272,3 @@ def test_muon_updates_hidden_matrices_only():
         sv = jnp.linalg.svd(u / 0.02, compute_uv=False)
         assert 0.3 < float(sv.min()) and float(sv.max()) < 2.0 * max(1.0, u.shape[0] / u.shape[1]) ** 0.5
     assert all(float(jnp.abs(u).max()) < 2e-3 for u in stem)
-
-
-def test_field_patching_swaps_in(mix_root):
-    from neugk_jax.models.field_patching import FieldPatchEmbed, FieldUnpatch
-
-    cfg = mix_cfg(mix_root)
-    cfg.model.patch.embedding = "field"
-    cfg.model.patch.field = {"hidden": 16, "depth": 2, "rank": 8}
-    cfg.model.zero_init_output = True
-    train, _ = build_splits(cfg.dataset)
-    model = build_ae(cfg, train, key=jr.PRNGKey(0))
-    linear = build_ae(mix_cfg(mix_root), train, key=jr.PRNGKey(0))
-    for name in ("adiabatic", "kinetic"):
-        bb = model.stem_backbone(name)
-        assert isinstance(bb.patch_embed, FieldPatchEmbed) and isinstance(bb.unpatch, FieldUnpatch)
-        sample = train.parts[name][0]
-        df, cond = jnp.asarray(sample.df), jnp.asarray(sample.conditioning)[jnp.arange(7)]
-        z = bb.patch_encode(df)
-        assert z.shape == linear.stem_backbone(name).patch_encode(df).shape
-        # the physical spacing enters the weights: another (ds, dx, dy) gives other tokens
-        sp = jnp.asarray(bb.patch_embed.grid.spacing) * 2.0
-        assert float(jnp.abs(bb.patch_encode(df, sp) - z).max()) > 0
-        assert float(jnp.abs(model(df, cond)["df"]).max()) == 0.0

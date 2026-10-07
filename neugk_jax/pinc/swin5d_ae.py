@@ -86,8 +86,6 @@ class Swin5DAE(eqx.Module):
         decoder_conditioning: Sequence[str] = (),
         cond_embed_dim: int = 32,
         merge_mask: Optional[Sequence[bool]] = None,
-        field_grid: Optional[Mapping] = None,
-        field: Optional[Mapping] = None,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -140,8 +138,6 @@ class Swin5DAE(eqx.Module):
             enc_cond_dim=enc_cdim,
             dec_cond_dim=dec_cdim,
             merge_mask=merge_mask,
-            field_grid=field_grid,
-            field=field,
             # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
             build_middle=False,
@@ -316,7 +312,6 @@ class KineticSwin5DAE(Swin5DAE):
                 merge_mask=[False, *[True] * len(spec["patch_size"])],
                 in_channels=int(spec.get("in_channels", in_channels)),
                 out_channels=int(spec.get("out_channels", out_channels)),
-                field_grid=spec.get("grid"),
             )
 
         k_ae, k_sp = jr.split(key)
@@ -370,18 +365,18 @@ class KineticSwin5DAE(Swin5DAE):
             is_leaf=_is_none,
         )
 
-    def encode(self, df, condition=None, *, stem=None, spacing=None, key=None, inference: bool = True):
+    def encode(self, df, condition=None, *, stem=None, key=None, inference: bool = True):
         bb = self.stem_backbone(stem or self.stem_for(df.shape))
         cond = self._embed(self.enc_cond_embed, condition, self.enc_indices)
         keys = split_key(key, len(bb.down_blocks) + 1)
-        z = bb.patch_encode(df, spacing)
+        z = bb.patch_encode(df)
         z = z + self.species_embed[: z.shape[0]].reshape(-1, *(1,) * (z.ndim - 2), z.shape[-1])
         for blk, k in zip(bb.down_blocks, keys):
             z = blk(z, cond, return_skip=False, key=k, inference=inference)
         z = self.middle_downproj(self.middle_pre(z, cond, key=keys[-1], inference=inference))
         return self.pre_z_norm(z) if self.normalized_latent else z
 
-    def decode(self, z, condition=None, *, stem=None, spacing=None, key=None, inference: bool = True):
+    def decode(self, z, condition=None, *, stem=None, key=None, inference: bool = True):
         bb = self.stem_backbone(stem)
         cond = self._embed(self.dec_cond_embed, condition, self.dec_indices)
         keys = split_key(key, len(bb.up_blocks) + 1)
@@ -391,7 +386,7 @@ class KineticSwin5DAE(Swin5DAE):
         z = self.middle_upscale(z)
         for blk, k in zip(bb.up_blocks, keys[1:]):
             z = blk(z, None, cond, key=k, inference=inference)
-        return {"df": bb.patch_decode(z, cond, spacing)}
+        return {"df": bb.patch_decode(z, cond)}
 
     def __call__(
         self,
@@ -400,15 +395,14 @@ class KineticSwin5DAE(Swin5DAE):
         return_latent: bool = False,
         *,
         stem=None,
-        spacing=None,
         key=None,
         inference: bool = True,
     ):
         k_enc, k_dec = split_key(key, 2)
         stem = stem or self.stem_for(df.shape)
-        z = self.encode(df, condition, stem=stem, spacing=spacing, key=k_enc, inference=inference)
+        z = self.encode(df, condition, stem=stem, key=k_enc, inference=inference)
         z, extra = self.bottleneck(z, inference=inference)
-        out = self.decode(z, condition, stem=stem, spacing=spacing, key=k_dec, inference=inference)
+        out = self.decode(z, condition, stem=stem, key=k_dec, inference=inference)
         out.update(extra)
         if return_latent:
             out["latent"] = z
