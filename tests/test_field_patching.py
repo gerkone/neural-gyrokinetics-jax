@@ -16,8 +16,11 @@ from neugk_jax.models.patching import (
     FieldUnpatch,
     PatchEmbed,
     PatchExpand,
+    PointGrid,
     field_options,
+    fold_patches,
 )
+from neugk_jax.models.patching.field import AxisBases, tucker_project, tucker_synthesize
 from neugk_jax.pinc import Swin5DAE
 
 BASE = (8, 4, 4, 8, 4)
@@ -99,17 +102,32 @@ def test_generic_nd_swap(decoder):
 
 
 @pytest.mark.parametrize(
-    "decoder,encoding", [("deeponet", "fourier"), ("hier", "fourier"), ("hier", "cosine")]
+    "encoder,decoder,encoding",
+    [
+        ("kernel", "deeponet", "fourier"),
+        ("kernel", "hier", "fourier"),
+        ("kernel", "hier", "cosine"),
+        ("kernel", "smooth", "ipe"),
+        ("tucker", "tucker", "cosine"),
+        ("kernel", "tucker", "ipe"),
+        ("kernel", "hier_field", "cosine"),
+        ("smooth", "smooth", "cosine"),
+    ],
 )
-def test_adiabatic_5d_grid(decoder, encoding):
+def test_adiabatic_5d_grid(encoder, decoder, encoding):
+    local = {"local": "field", "local_width": 8} if decoder == "hier_field" else {}
+    decoder = decoder.split("_")[0]
     opts = dict(
+        encoder=encoder,
         decoder=decoder,
         encoding=encoding,
         rank=16,
         hidden=16,
         code_rank=8,
         branch=32,
+        axis_hidden=8,
         grid=grid_5d(),
+        **local,
     )
     ae = small_ae(patching="field", patching_kwargs=opts)
     x = jr.normal(jr.PRNGKey(1), (2, *BASE))
@@ -126,6 +144,68 @@ def test_adiabatic_5d_grid(decoder, encoding):
     leaves = [g for g in jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))]
     assert all(bool(jnp.isfinite(g).all()) for g in leaves)
     assert float(jnp.abs(grads.backbone.unpatch.expansion.layers[-1].weight).max()) > 0
+
+
+def test_cell_centred_coordinates_keep_physical_positions():
+    # a patch of 10 cells at spacing 1 and of 5 cells at spacing 2 cover the same interval
+    fine = PointGrid((10,), (10,), 1, {"axes": [{"kind": "relative", "spacing": 1.0}]})
+    coarse = PointGrid((5,), (5,), 1, {"axes": [{"kind": "relative", "spacing": 2.0}]})
+    x_fine = np.asarray(fine.offsets[:, 0]) * fine.half[0] * fine.spacing[0]
+    x_coarse = np.asarray(coarse.offsets[:, 0]) * coarse.half[0] * coarse.spacing[0]
+    np.testing.assert_allclose(x_coarse, (x_fine[0::2] + x_fine[1::2]) / 2, atol=1e-6)
+    np.testing.assert_allclose(fine.scale(), coarse.scale(), atol=1e-6)
+
+
+def test_tucker_cosine_full_rank_is_exact():
+    # orthonormal cosines at full rank: projection then synthesis is the identity on every patch
+    spec = {"axes": [{"kind": "relative"}] * 3}
+    grid = PointGrid((6, 4, 10), (3, 2, 5), 2, spec)
+    ranks = grid.patch
+    bases = AxisBases(
+        grid, ranks, key=jr.PRNGKey(0), basis="cosine", hidden=8, encoding=("cosine", 5, 16)
+    )(grid)
+    p = fold_patches(jr.normal(jr.PRNGKey(1), (6, 4, 10, 2)), grid.patch)
+    with jax.default_matmul_precision("highest"):
+        back = tucker_synthesize(tucker_project(p, grid, bases), grid, bases, ranks)
+    np.testing.assert_allclose(back, p, atol=1e-5)
+
+
+@pytest.mark.parametrize("decoder", ["smooth", "tucker"])
+def test_one_set_of_weights_on_two_resolutions(decoder):
+    # x refined by 2 with the same physical patch: the weights of one grid run on the other
+    spec = lambda dx: {
+        "axes": [
+            {"kind": "relative", "spacing": 0.1},
+            {"kind": "relative", "spacing": dx, "reference": 0.5},
+        ]
+    }
+    opts = dict(
+        decoder=decoder,
+        encoder="tucker",
+        rank=8,
+        hidden=8,
+        code_rank=4,
+        branch=16,
+        ranks=[2, 10],
+        axis_hidden=8,
+        code_modes=[1, 2],
+    )
+    embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), grid=spec(0.2), **opts)
+    unpatch = FieldUnpatch(
+        8,
+        (2, 2),
+        key=jr.PRNGKey(1),
+        expand_by=(2, 5),
+        out_channels=3,
+        grid=spec(0.2),
+        zero_init=False,
+        **opts,
+    )
+    fine = PointGrid((4, 20), (2, 10), 3, spec(0.1))
+    x = jr.normal(jr.PRNGKey(2), (4, 20, 3))
+    z = embed.with_grid(fine)(x)
+    assert z.shape == (2, 2, 8)
+    assert unpatch.with_grid(fine)(z).shape == x.shape
 
 
 def test_build_from_config():
@@ -158,4 +238,29 @@ def test_build_from_config():
 
 def test_unknown_option_raises():
     with pytest.raises(ValueError, match="unknown field patching options"):
-        field_options({"ranks": 4})
+        field_options({"rnk": 4})
+
+
+@pytest.mark.parametrize("encoder,decoder", [("kernel", "hier"), ("tucker", "tucker")])
+def test_point_conditioning_enters_the_filters(encoder, decoder):
+    opts = dict(
+        encoder=encoder,
+        decoder=decoder,
+        rank=8,
+        hidden=8,
+        code_rank=4,
+        branch=16,
+        axis_hidden=8,
+        cond_features=3,
+        zero_init=False,
+    )
+    embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), **opts)
+    unpatch = FieldUnpatch(8, (2, 2), key=jr.PRNGKey(1), expand_by=(2, 5), out_channels=3, **opts)
+    x = jr.normal(jr.PRNGKey(2), (4, 10, 3))
+    ion, electron = jnp.asarray([1.0, 0.0, 0.0]), jnp.asarray([-1.0, -1.0, 0.3])
+    z_ion, z_el = embed(x, point_cond=ion), embed(x, point_cond=electron)
+    assert float(jnp.abs(z_ion - z_el).max()) > 0
+    assert (
+        float(jnp.abs(unpatch(z_ion, point_cond=ion) - unpatch(z_ion, point_cond=electron)).max())
+        > 0
+    )

@@ -1,12 +1,15 @@
 """Patch embedding / unpatch layers.
 
 ``ops``: N-D fold / unfold and block padding. ``linear``: ``PatchEmbed`` / ``PatchMerge`` / ``PatchExpand``
-with weights tied to the patch size. ``field``: ``FieldPatchEmbed`` / ``FieldUnpatch``, whose weights are
+with weights tied to the patch size. ``points``: patch point coordinates (``PointGrid``). ``field``: ``FieldPatchEmbed`` / ``FieldUnpatch``, whose weights are
 functions of the point coordinates.
 """
 
 from neugk_jax.models.patching.field import (
+    DECODERS,
+    ENCODERS,
     FIELD_OPTIONS,
+    AxisBases,
     FieldPatchEmbed,
     FieldUnpatch,
     field_options,
@@ -26,8 +29,14 @@ from neugk_jax.models.patching.ops import (
     unfold_patches,
     unpad,
 )
+from neugk_jax.models.patching.points import AxisPoints, PointGrid
 
 __all__ = [
+    "DECODERS",
+    "ENCODERS",
+    "AxisBases",
+    "AxisPoints",
+    "PointGrid",
     "FIELD_OPTIONS",
     "FieldPatchEmbed",
     "FieldUnpatch",
