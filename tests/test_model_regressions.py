@@ -178,5 +178,5 @@ def test_builders_default_to_the_single_swin_residual():
         for legacy in (None, True):
             if legacy:
                 cfg["model"]["legacy_swin_shortcut"] = True
-            blk = block(build(cfg, key=jr.PRNGKey(0))).swin.blocks[0]
+            blk = block(build(cfg, key=jr.PRNGKey(0))).mixer.blocks[0]
             assert blk.legacy_double_shortcut is bool(legacy), build.__name__

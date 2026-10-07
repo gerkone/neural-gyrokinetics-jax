@@ -80,7 +80,7 @@ _AE_PATCH_KEYS = {
     "field",
     "grid",
 }
-_AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable"}
+_AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable", "layer"}
 _NO_PE = {"use_abs_pe": False, "use_rope": False}
 
 
@@ -121,7 +121,8 @@ def build_ae_from_config(
     ``model.encoder_conditioning`` / ``model.decoder_conditioning`` condition each path; an
     absent ``model.norm_fn`` is RMSNorm for the AE and LayerNorm for the VQ-VAE.
     ``legacy_double_shortcut`` (the doubled swin residual) defaults to
-    ``model.legacy_swin_shortcut``, else False.
+    ``model.legacy_swin_shortcut``, else False. ``model.layer`` / ``model.bottleneck.layer`` /
+    ``model.token_pe`` are component specs (a kind or a ``{kind, **options}`` mapping).
     """
     from neugk_jax.pinc import Swin5DAE, Swin5DVQVAE
 
@@ -178,6 +179,10 @@ def build_ae_from_config(
             decoder_conditioning=dec_cond,
             patching=patching,
             patching_kwargs=patching_kwargs,
+            # component specs (a kind or {kind, **options}), validated by their factories
+            layer=mcfg.get("layer", "swin"),
+            bottleneck_layer=bn.get("layer", "vit"),
+            token_pe=mcfg.get("token_pe"),
             key=key,
         )
     )

@@ -163,7 +163,7 @@ class GyroSwinMultitask(eqx.Module):
         mix_kw = dict(num_heads=8, attn_drop=attn_drop)
         self.df_mix_middle = MixingBlock(bottleneck_dim, bottleneck_dim, key=keys[5], **mix_kw)
         self.phi_mix_middle = MixingBlock(bottleneck_dim, bottleneck_dim, key=keys[6], **mix_kw)
-        # up-path mixing: dims match the inputs to each SwinBlockUp (post middle_upscale)
+        # up-path mixing: dims match the inputs to each UpStage (post middle_upscale)
         df_up, phi_up = df_dims[::-1][1:], phi_dims[::-1][1:]
         phi_up = [phi_up[i] if i < len(phi_up) else d for i, d in enumerate(df_up)]
         self.df_mix_up = [

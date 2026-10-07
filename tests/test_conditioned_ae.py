@@ -33,7 +33,7 @@ def test_encoder_conditioning_picks_its_slots():
 def test_translation_names_and_unported_options():
     from neugk_jax.translate import _ae_name_map
 
-    name = "backbone.up_blocks.0.swin.blocks.0.mod.proj.inner.weight"
+    name = "backbone.up_blocks.0.mixer.blocks.0.mod.proj.inner.weight"
     assert "up_blocks.0.swin_att.blocks.0.dit.modulation.weight" in _ae_name_map(name)
     with pytest.raises(NotImplementedError):
         tiny_ae(vit=dict(tiny_ae_model_cfg()["vit"], modulation="film"))

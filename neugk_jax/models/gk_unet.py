@@ -12,7 +12,10 @@ import jax.numpy as jnp
 import jax.random as jr
 from einops import rearrange
 
+from neugk_jax.models.base import GridDecoderBase, GridEncoderBase, TokenLayerBase
 from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
+from neugk_jax.models.embeddings import token_pe as token_pe_of
+from neugk_jax.models.layers import token_layer
 from neugk_jax.models.patching import (
     FieldPatchEmbed,
     FieldUnpatch,
@@ -23,11 +26,11 @@ from neugk_jax.models.patching import (
     pad_to_blocks,
     unpad,
 )
-from neugk_jax.models.swin import BlockStack, swin_layer
+from neugk_jax.models.spec import Spec, parse_spec
 from neugk_jax.models.tokens import TokenExpand, TokenMerge, merge_grid
 from neugk_jax.models.utils import Linear, gelu
 
-# patch embedding and unpatch classes per patching type
+# patch embedding and unpatch classes per patching kind
 PATCHINGS = {"linear": (PatchEmbed, LinearUnpatch), "field": (FieldPatchEmbed, FieldUnpatch)}
 
 
@@ -37,10 +40,10 @@ def _as_seq(x, n):
     return list(x)
 
 
-class SwinBlockDown(eqx.Module):
-    """Encoder stage: Swin layer (plain, FiLM- or DiT-conditioned) → TokenMerge."""
+class DownStage(eqx.Module):
+    """Encoder stage: token layer of the ``layer`` spec (plain, FiLM- or DiT-conditioned) → TokenMerge."""
 
-    swin: BlockStack
+    mixer: TokenLayerBase
     downsample: TokenMerge
     resampled_grid_size: tuple[int, ...] = eqx.field(static=True)
     out_dim: int = eqx.field(static=True)
@@ -54,13 +57,22 @@ class SwinBlockDown(eqx.Module):
         depth: int,
         *,
         key,
+        layer: Spec = "swin",
         c_multiplier: int = 2,
         rms_norm: bool = False,
         **layer_kw,
     ):
         k1, k2 = jr.split(key)
-        self.swin = swin_layer(
-            dim, depth, num_heads, grid_size, window_size, key=k1, rms_norm=rms_norm, **layer_kw
+        self.mixer = token_layer(
+            layer,
+            dim,
+            depth,
+            num_heads,
+            key=k1,
+            grid_size=grid_size,
+            window_size=window_size,
+            rms_norm=rms_norm,
+            **layer_kw,
         )
         self.downsample = TokenMerge(
             dim, grid_size, key=k2, c_multiplier=c_multiplier, rms_norm=rms_norm
@@ -69,19 +81,19 @@ class SwinBlockDown(eqx.Module):
         self.out_dim = self.downsample.out_dim
 
     def __call__(self, x, condition=None, *, key=None, inference=True, return_skip: bool = True):
-        x = self.swin(x, condition, key=key, inference=inference)
+        x = self.mixer(x, condition, key=key, inference=inference)
         merged = self.downsample(x)
         return (merged, x) if return_skip else merged
 
 
-class SwinBlockUp(eqx.Module):
-    """Decoder stage: optional skip-concat → Swin layer → optional TokenExpand.
+class UpStage(eqx.Module):
+    """Decoder stage: optional skip-concat → token layer of the ``layer`` spec → optional TokenExpand.
 
-    The Swin layer uses ``decoder_rms_norm`` for its norms, the upsample ``rms_norm``.
+    The token layer uses ``decoder_rms_norm`` for its norms, the upsample ``rms_norm``.
     """
 
     proj_concat: Optional[Linear]
-    swin: BlockStack
+    mixer: TokenLayerBase
     upsample: Optional[TokenExpand]
     act_fn: Callable = eqx.field(static=True)
 
@@ -94,6 +106,7 @@ class SwinBlockUp(eqx.Module):
         num_heads: int,
         *,
         key,
+        layer: Spec = "swin",
         target_grid_size: Optional[Sequence[int]] = None,
         c_multiplier: int = 2,
         act_fn: Callable = gelu,
@@ -106,13 +119,14 @@ class SwinBlockUp(eqx.Module):
         k1, k2, k3 = jr.split(key, 3)
         self.act_fn = act_fn
         self.proj_concat = Linear(2 * dim, dim, key=k1) if use_skip else None
-        self.swin = swin_layer(
+        self.mixer = token_layer(
+            layer,
             dim,
             depth,
             num_heads,
-            grid_size,
-            window_size,
             key=k2,
+            grid_size=grid_size,
+            window_size=window_size,
             act_fn=act_fn,
             rms_norm=decoder_rms_norm,
             **layer_kw,
@@ -133,10 +147,14 @@ class SwinBlockUp(eqx.Module):
     def __call__(self, x, s=None, condition=None, *, key=None, inference=True):
         if self.proj_concat is not None and s is not None:
             x = self.act_fn(self.proj_concat(jnp.concatenate([x, s], axis=-1)))
-        x = self.swin(x, condition, key=key, inference=inference)
+        x = self.mixer(x, condition, key=key, inference=inference)
         if self.upsample is not None:
             x = self.upsample(x)
         return x
+
+
+# the stage names before the token layers became swappable
+SwinBlockDown, SwinBlockUp = DownStage, UpStage
 
 
 class SwinNDUnet(eqx.Module):
@@ -148,17 +166,22 @@ class SwinNDUnet(eqx.Module):
     ``decoder_rms_norm`` selects the norm of the decoder Swin layers and the bottleneck
     upscale, independently of ``rms_norm``. ``enc_cond_dim`` / ``dec_cond_dim`` set the
     condition width of the encoder / decoder stages (0: unconditioned), else ``n_cond`` sets both.
-    ``patching`` selects the patch embedding / unpatch pair of :data:`PATCHINGS`, built with
-    ``patching_kwargs`` on top of the shared patch arguments.
+    ``patching`` (a spec of :data:`PATCHINGS`, options merged with ``patching_kwargs``) selects the
+    patch embedding / unpatch pair, built on top of the shared patch arguments. ``layer`` and
+    ``middle_layer`` are token-layer specs of the encoder / decoder stages and of the bottleneck
+    (``"swin"``: windows, ``"vit"`` / ``"transolver"``: global); ``token_pe`` a positional embedding
+    of the patch tokens (``"ape"``, ``"sincos"``), required when the first token layer does not
+    locate its tokens.
     """
 
-    patch_embed: Optional[eqx.Module]
+    patch_embed: Optional[GridEncoderBase]
+    token_pe: Optional[eqx.Module]
     cond_embed: Optional[ContinuousConditionEmbed]
-    down_blocks: list[SwinBlockDown]
-    middle: Optional[BlockStack]
+    down_blocks: list[DownStage]
+    middle: Optional[TokenLayerBase]
     middle_upscale: Optional[TokenExpand]
-    up_blocks: list[SwinBlockUp]
-    unpatch: eqx.Module
+    up_blocks: list[UpStage]
+    unpatch: GridDecoderBase
 
     base_resolution: tuple[int, ...] = eqx.field(static=True)
     patch_size: tuple[int, ...] = eqx.field(static=True)
@@ -207,14 +230,16 @@ class SwinNDUnet(eqx.Module):
         build_middle: bool = True,
         conv_patch: bool = False,
         unpatch_patch_skip: bool = False,
-        patching: str = "linear",
+        patching: Spec = "linear",
         patching_kwargs: Optional[Mapping] = None,
+        layer: Spec = "swin",
+        middle_layer: Spec = "swin",
+        token_pe: Optional[Spec] = None,
         key,
     ):
-        if patching not in PATCHINGS:
-            raise ValueError(f"patching={patching!r}; one of {sorted(PATCHINGS)}")
-        embed_cls, unpatch_cls = PATCHINGS[patching]
-        patching_kwargs = dict(patching_kwargs or {})
+        kind, patch_options = parse_spec(patching, PATCHINGS)
+        embed_cls, unpatch_cls = PATCHINGS[kind]
+        patching_kwargs = {**patch_options, **(patching_kwargs or {})}
         patch_size = _as_seq(patch_size, space)
         window_size = _as_seq(window_size, space)
         depth = _as_seq(depth, num_layers)
@@ -239,6 +264,10 @@ class SwinNDUnet(eqx.Module):
                 act_fn=act_fn,
                 **patching_kwargs,
             )
+        grid0 = tuple(s // p for s, p in zip(padded_base, _normalize_patch(patch_size)))
+        self.token_pe = (
+            token_pe_of(token_pe, dim, grid0, key=jr.fold_in(key, 7)) if build_down else None
+        )
         # per-u-net conditioning embed: raw scalars to the cond_dim of every conditioned block
         self.cond_embed = None
         cond_dim = None
@@ -268,13 +297,14 @@ class SwinNDUnet(eqx.Module):
         self.down_blocks = []
         for i in range(num_layers):
             if build_down:
-                blk = SwinBlockDown(
+                blk = DownStage(
                     down_dims[i],
                     grid_sizes[i],
                     window_size,
                     num_heads[i],
                     depth[i],
                     key=keys[1 + i],
+                    layer=layer,
                     c_multiplier=c_multiplier,
                     rms_norm=rms_norm,
                     **{**layer_kw, "cond_dim": down_cond},
@@ -284,17 +314,22 @@ class SwinNDUnet(eqx.Module):
             grid_sizes.append(merge_grid(grid_sizes[i]))
         self.grid_sizes = tuple(grid_sizes)
         self.down_dims = tuple(down_dims)
+        if self.down_blocks and self.down_blocks[0].mixer.needs_pos_embed and self.token_pe is None:
+            raise ValueError(
+                f"the first token layer ({layer!r}) does not locate its tokens; set token_pe"
+            )
 
-        # global attention at the deepest grid: a swin layer whose window is the whole grid
+        # global attention at the deepest grid: a swin layer's window is the whole grid
         self.middle = self.middle_upscale = None
         if build_middle:
-            self.middle = swin_layer(
+            self.middle = token_layer(
+                middle_layer,
                 down_dims[-1],
                 middle_depth,
                 middle_num_heads,
-                grid_sizes[-1],
-                grid_sizes[-1],
                 key=keys[num_layers + 1],
+                grid_size=grid_sizes[-1],
+                window_size=grid_sizes[-1],
                 rms_norm=rms_norm,
                 **layer_kw,
             )
@@ -316,13 +351,14 @@ class SwinNDUnet(eqx.Module):
         for i in range(num_layers):
             last = i == num_layers - 1
             self.up_blocks.append(
-                SwinBlockUp(
+                UpStage(
                     up_dims[i],
                     up_grid_sizes[i],
                     window_size,
                     depth[::-1][i],
                     num_heads[::-1][i],
                     key=keys[num_layers + 3 + i],
+                    layer=layer,
                     target_grid_size=None if last else up_grid_sizes[i + 1],
                     c_multiplier=c_multiplier,
                     upsample=not last,
@@ -357,12 +393,11 @@ class SwinNDUnet(eqx.Module):
         return self.cond_embed(cond)
 
     def _embed(self, x: jnp.ndarray, geometry=None) -> jnp.ndarray:
-        x = pad_to_blocks(x, self.patch_size)
-        return self.patch_embed(x) if geometry is None else self.patch_embed(x, geometry)
+        z = self.patch_embed(pad_to_blocks(x, self.patch_size), geometry)
+        return z if self.token_pe is None else self.token_pe(z)
 
     def _unpatch(self, z: jnp.ndarray, condition=None, geometry=None) -> jnp.ndarray:
-        x = self.unpatch(z, condition) if geometry is None else self.unpatch(z, condition, geometry)
-        return unpad(x, self.base_resolution)
+        return unpad(self.unpatch(z, condition, geometry), self.base_resolution)
 
     def patch_encode(self, x: jnp.ndarray, geometry=None) -> jnp.ndarray:
         # (C, *spatial) → (*spatial, C) → pad → patch_embed

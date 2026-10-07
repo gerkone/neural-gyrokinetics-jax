@@ -15,22 +15,27 @@ import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
 
+from neugk_jax.models.base import TokenLayerBase
 from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet
-from neugk_jax.models.swin import BlockStack
+from neugk_jax.models.layers import token_layer
+from neugk_jax.models.spec import Spec
 from neugk_jax.models.tokens import TokenExpand
 from neugk_jax.models.utils import LayerNorm, Linear, gelu, split_key
-from neugk_jax.models.vit import vit_layer
 
 
 class Swin5DAE(eqx.Module):
-    """Wraps Swin5DUnet with a bottleneck projection."""
+    """Wraps Swin5DUnet with a bottleneck projection.
+
+    ``layer`` / ``bottleneck_layer`` are the token-layer specs of the U-Net stages and of the two
+    bottleneck stages; ``patching`` and ``token_pe`` as for :class:`SwinNDUnet`.
+    """
 
     backbone: Swin5DUnet
     enc_cond_embed: Optional[ContinuousConditionEmbed]
     dec_cond_embed: Optional[ContinuousConditionEmbed]
-    middle_pre: BlockStack
-    middle_post: BlockStack
+    middle_pre: TokenLayerBase
+    middle_post: TokenLayerBase
     middle_downproj: Linear
     middle_upproj: Linear
     middle_upscale: TokenExpand
@@ -82,8 +87,11 @@ class Swin5DAE(eqx.Module):
         encoder_conditioning: Sequence[str] = (),
         decoder_conditioning: Sequence[str] = (),
         cond_embed_dim: int = 32,
-        patching: str = "linear",
+        patching: Spec = "linear",
         patching_kwargs: Optional[Mapping] = None,
+        layer: Spec = "swin",
+        bottleneck_layer: Spec = "vit",
+        token_pe: Optional[Spec] = None,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -136,6 +144,8 @@ class Swin5DAE(eqx.Module):
             dec_cond_dim=dec_cdim,
             patching=patching,
             patching_kwargs=patching_kwargs,
+            layer=layer,
+            token_pe=token_pe,
             # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
             build_middle=False,
@@ -161,11 +171,27 @@ class Swin5DAE(eqx.Module):
             norm_affine=True,
             rms_norm=rms_norm,
         )
-        self.middle_pre = vit_layer(
-            mid_dim, bottleneck_depth, bottleneck_num_heads, key=k1, cond_dim=enc_cdim, **vit_kw
+        # a windowed bottleneck layer takes the whole grid as its window
+        grid_kw = dict(grid_size=mid_grid, window_size=mid_grid)
+        self.middle_pre = token_layer(
+            bottleneck_layer,
+            mid_dim,
+            bottleneck_depth,
+            bottleneck_num_heads,
+            key=k1,
+            cond_dim=enc_cdim,
+            **grid_kw,
+            **vit_kw,
         )
-        self.middle_post = vit_layer(
-            mid_dim, bottleneck_depth, bottleneck_num_heads, key=k2, cond_dim=dec_cdim, **vit_kw
+        self.middle_post = token_layer(
+            bottleneck_layer,
+            mid_dim,
+            bottleneck_depth,
+            bottleneck_num_heads,
+            key=k2,
+            cond_dim=dec_cdim,
+            **grid_kw,
+            **vit_kw,
         )
         self.middle_downproj = Linear(mid_dim, bd, key=k3)
         self.middle_upproj = Linear(bd, mid_dim, key=k4)

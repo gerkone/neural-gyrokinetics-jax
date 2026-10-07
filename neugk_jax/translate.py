@@ -115,7 +115,7 @@ def _is_non_persistent(name: str) -> bool:
 # jax -> torch renames: equinox's wrapped Linear/LayerNorm, the u-net modules, DiT modulation
 _INNER = ((".inner.", "."),)
 _UNET = (
-    (".swin.", ".swin_att."),
+    (".mixer.", ".swin_att."),
     (".downsample.proj.", ".downsample.reduction."),
     (".gate.proj.", ".gate.gate.1."),
 )
