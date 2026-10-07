@@ -20,7 +20,13 @@ from neugk_jax.models.patching import (
     field_options,
     fold_patches,
 )
-from neugk_jax.models.patching.field import AxisBases, tucker_project, tucker_synthesize
+from neugk_jax.models.patching.field import (
+    AxisBases,
+    ProductFilter,
+    tucker_project,
+    tucker_selection,
+    tucker_synthesize,
+)
 from neugk_jax.pinc import Swin5DAE
 
 BASE = (8, 4, 4, 8, 4)
@@ -302,3 +308,50 @@ def test_bernstein_modulation_is_a_partition_of_unity():
 
     pos = jnp.linspace(-0.9, 0.9, 7)[:, None]
     np.testing.assert_allclose(cosine_basis(pos, (3,), "bernstein").sum(-1), 1.0, atol=1e-6)
+
+
+def test_total_degree_cut_keeps_the_low_cosine_tuples():
+    spec = {"axes": [{"kind": "relative"}] * 2}
+    grid = PointGrid((4, 8), (4, 8), 2, spec)
+    keep = np.asarray(tucker_selection(grid, (4, 8), 1.0))
+    i, j, c = np.unravel_index(keep, (4, 8, 2))
+    assert np.all(i / 4 + j / 8 <= 1.0) and keep.size < 4 * 8 * 2
+    opts = dict(
+        encoder="tucker",
+        decoder="tucker",
+        axis_basis="cosine",
+        degree=1.0,
+        branch=16,
+        zero_init=False,
+    )
+    embed = FieldPatchEmbed((4, 8), (4, 8), 2, 8, key=jr.PRNGKey(0), grid=spec, **opts)
+    unpatch = FieldUnpatch(
+        8, (1, 1), key=jr.PRNGKey(1), expand_by=(4, 8), out_channels=2, grid=spec, **opts
+    )
+    assert embed.mix.layers[0].inner.weight.shape[1] == keep.size
+    x = jr.normal(jr.PRNGKey(2), (4, 8, 2))
+    assert unpatch(embed(x)).shape == x.shape
+
+
+@pytest.mark.parametrize("encoding", ["cosine", "fourier"])
+def test_product_filter_splits_configuration_and_velocity_space(encoding):
+    opts = dict(
+        encoder="smooth",
+        decoder="smooth",
+        encoding=encoding,
+        filter="product",
+        rank=8,
+        hidden=8,
+        code_rank=4,
+        branch=16,
+        cond_features=3,
+        grid=grid_5d(),
+        zero_init=False,
+    )
+    ae = small_ae(patching="field", patching_kwargs=opts)
+    embed = ae.backbone.patch_embed
+    assert isinstance(embed.filters, ProductFilter)
+    n = len(embed.filters.space_index) + len(embed.filters.velocity_index)
+    assert n == embed.grid.features(None, *embed.encoding).shape[-1] + 3
+    x = jr.normal(jr.PRNGKey(1), (2, *BASE))
+    assert ae(x)["df"].shape == x.shape
