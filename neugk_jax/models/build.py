@@ -79,7 +79,7 @@ _AE_PATCH_KEYS = {
     "unmerging_hidden_ratio",
     "c_multiplier",
 }
-_AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable"}
+_AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable", "input_norm"}
 _AE_STEM_KEYS = {
     "resolution",
     "n_species",
@@ -199,6 +199,7 @@ def build_ae_from_config(
         c_multiplier=int(patch.get("c_multiplier", 2)),
         drop_path=float(vit.get("drop_path", 0.1)),
         normalized_latent=bn.get("normalized_latent", False),
+        input_norm=bool(bn.get("input_norm", False)),
         qkv_bias=vit.get("qkv_bias", False),
         qk_norm=vit.get("qk_norm", True),
         use_rpb=vit.get("use_rpb", True),

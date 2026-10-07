@@ -21,7 +21,7 @@ from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet
 from neugk_jax.models.patching import PatchExpand
 from neugk_jax.models.swin import BlockStack
-from neugk_jax.models.utils import LayerNorm, Linear, gelu, split_key, trainable_mask
+from neugk_jax.models.utils import LayerNorm, Linear, gelu, make_norm, split_key, trainable_mask
 from neugk_jax.models.vit import vit_layer
 
 
@@ -38,6 +38,7 @@ class Swin5DAE(eqx.Module):
     middle_upscale: PatchExpand
     pre_z_norm: Optional[LayerNorm]
     post_z_norm: Optional[LayerNorm]
+    input_norm: object | None
 
     bottleneck_dim: int = eqx.field(static=True)
     bottleneck_grid_size: tuple[int, ...] = eqx.field(static=True)
@@ -65,6 +66,7 @@ class Swin5DAE(eqx.Module):
         bottleneck_depth: int = 2,
         bottleneck_num_heads: int = 2,
         normalized_latent: bool = False,
+        input_norm: bool = False,
         c_multiplier: int = 2,
         drop_path: float = 0.1,
         hidden_mlp_ratio: float = 2.0,
@@ -174,6 +176,8 @@ class Swin5DAE(eqx.Module):
         self.middle_post = vit_layer(
             mid_dim, bottleneck_depth, bottleneck_num_heads, key=k2, cond_dim=dec_cdim, **vit_kw
         )
+        # norm of the merged tokens entering the bottleneck
+        self.input_norm = make_norm(mid_dim, rms=rms_norm) if input_norm else None
         self.middle_downproj = Linear(mid_dim, bd, key=k3)
         self.middle_upproj = Linear(bd, mid_dim, key=k4)
         self.middle_upscale = PatchExpand(
@@ -202,6 +206,9 @@ class Swin5DAE(eqx.Module):
             raise ValueError("this autoencoder is conditioned; pass `condition`")
         return embed(condition[jnp.asarray(indices)])
 
+    def bottleneck_input(self, z: jnp.ndarray) -> jnp.ndarray:
+        return z if self.input_norm is None else self.input_norm(z)
+
     def bottleneck(self, z: jnp.ndarray, *, inference: bool = True) -> tuple[jnp.ndarray, dict]:
         return z, {}
 
@@ -213,7 +220,7 @@ class Swin5DAE(eqx.Module):
         z = self.backbone.patch_encode(df)
         for blk, k in zip(self.backbone.down_blocks, keys):
             z = blk(z, cond, return_skip=False, key=k, inference=inference)
-        z = self.middle_downproj(self.middle_pre(z, cond, key=keys[-1], inference=inference))
+        z = self.middle_downproj(self.middle_pre(self.bottleneck_input(z), cond, key=keys[-1], inference=inference))
         return self.pre_z_norm(z) if self.normalized_latent else z
 
     def decode(self, z: jnp.ndarray, condition=None, *, key=None, inference: bool = True):
@@ -378,7 +385,7 @@ class KineticSwin5DAE(Swin5DAE):
         z = z + self.species_embed[: z.shape[0]].reshape(-1, *(1,) * (z.ndim - 2), z.shape[-1])
         for blk, k in zip(bb.down_blocks, keys):
             z = blk(z, cond, return_skip=False, key=k, inference=inference)
-        z = self.middle_downproj(self.middle_pre(z, cond, key=keys[-1], inference=inference))
+        z = self.middle_downproj(self.middle_pre(self.bottleneck_input(z), cond, key=keys[-1], inference=inference))
         return self.pre_z_norm(z) if self.normalized_latent else z
 
     def decode(self, z, condition=None, *, stem=None, key=None, inference: bool = True):

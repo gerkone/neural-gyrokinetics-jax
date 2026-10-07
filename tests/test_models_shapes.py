@@ -169,6 +169,25 @@ def test_swin5d_ae_decouple_mu():
     assert out["df"].shape == x.shape
 
 
+def test_swin5d_ae_bottleneck_input_norm():
+    base = (4, 4, 4, 16, 8)
+    kw = dict(
+        space=5, decouple_mu=True, dim=16, base_resolution=base, in_channels=2, out_channels=2,
+        patch_size=(2, 0, 2, 4, 2), window_size=(2, 0, 2, 2, 2), depth=1, num_heads=2, num_layers=1,
+        bottleneck_dim=8, bottleneck_depth=1, bottleneck_num_heads=2, merging_depth=1, unmerging_depth=1,
+        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0, key=jr.PRNGKey(0),
+    )
+    plain, normed = Swin5DAE(**kw), Swin5DAE(**kw, input_norm=True)
+    assert plain.input_norm is None and normed.input_norm is not None
+    # the merged tokens enter the bottleneck at unit rms
+    z = jr.normal(jr.PRNGKey(2), (*plain.bottleneck_grid_size, plain.backbone.down_dims[-1])) * 7.0
+    rms = jnp.sqrt(jnp.mean(normed.bottleneck_input(z) ** 2, axis=-1))
+    assert jnp.allclose(rms, 1.0, atol=1e-3)
+    x = jr.normal(jr.PRNGKey(1), (2, *base))
+    assert normed(x)["df"].shape == x.shape
+    assert not jnp.allclose(normed.encode(x), plain.encode(x))
+
+
 def test_dit_forward():
     grid = (2, 4, 2)
     z_dim = 16
