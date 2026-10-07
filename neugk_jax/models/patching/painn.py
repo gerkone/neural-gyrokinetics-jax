@@ -147,8 +147,10 @@ class PaiNNEncoder(eqx.Module):
             return dq, dmu
 
         if abs_first and n_tok >= 1:
-            dq, dmu = jax.vmap(lambda x, sp, qw: _chunked(lambda xx: messages(xx, sp, qw), x))(
-                patches, species, quad
+            # one absolute-axis row at a time (a vmap would batch the chunks of all rows)
+            dq, dmu = jax.lax.map(
+                lambda r: _chunked(lambda xx: messages(xx, r[1], r[2]), r[0]),
+                (patches, species, quad),
             )
         else:
             dq, dmu = _chunked(lambda xx: messages(xx, species, quad), patches)
@@ -196,7 +198,7 @@ class PaiNNDecoder(eqx.Module):
             return self.readout(q)[..., 0]
 
         if abs_first and q_t.ndim >= 2:
-            return jax.vmap(lambda a, b, c: _chunked(lambda x, y: points(x, y, c), a, b))(
-                q_t, mu_t, q0
+            return jax.lax.map(
+                lambda r: _chunked(lambda x, y: points(x, y, r[2]), r[0], r[1]), (q_t, mu_t, q0)
             )
         return _chunked(lambda x, y: points(x, y, q0), q_t, mu_t)
