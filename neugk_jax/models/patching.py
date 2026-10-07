@@ -196,6 +196,7 @@ class PatchExpand(eqx.Module):
     expand_by: tuple[int, ...] = eqx.field(static=True)
     out_dim: int = eqx.field(static=True)
     use_conv: bool = eqx.field(static=True)
+    in_mult: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -214,6 +215,7 @@ class PatchExpand(eqx.Module):
         use_conv: bool = False,
         patch_skip: bool = False,
         cond_dim: Optional[int] = None,
+        in_mult: float = 1.0,
     ):
         gs = tuple(grid_size)
         if isinstance(expand_by, int):
@@ -235,6 +237,8 @@ class PatchExpand(eqx.Module):
             self.out_dim = max(1, dim // c_multiplier)
 
         self.use_conv = use_conv
+        # input scale of the expansion (muP readout multiplier)
+        self.in_mult = float(in_mult)
         kexp, kpc, kmod = jr.split(key, 3)
         if use_conv:
             self.expansion = StridedConvTranspose(dim, self.out_dim, eb, key=kexp)
@@ -260,7 +264,7 @@ class PatchExpand(eqx.Module):
             x = leaky_relu(self.proj_concat(x))
         if self.modulation is not None:
             x = self.modulation(x, cond)
-        x = self.expansion(x)
+        x = self.expansion(x if self.in_mult == 1.0 else x * self.in_mult)
         if not self.use_conv:
             x = unfold_patches(x, self.expand_by, out_channels=self.out_dim)
         # crop any overshoot from ceiling the expand factor

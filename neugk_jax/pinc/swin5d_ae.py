@@ -86,6 +86,7 @@ class Swin5DAE(eqx.Module):
         decoder_conditioning: Sequence[str] = (),
         cond_embed_dim: int = 32,
         merge_mask: Optional[Sequence[bool]] = None,
+        readout_mult: float = 1.0,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -138,6 +139,7 @@ class Swin5DAE(eqx.Module):
             enc_cond_dim=enc_cdim,
             dec_cond_dim=dec_cdim,
             merge_mask=merge_mask,
+            readout_mult=readout_mult,
             # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
             build_middle=False,

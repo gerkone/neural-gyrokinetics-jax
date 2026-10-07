@@ -13,7 +13,7 @@ import numpy as np
 import jax.random as jr
 
 from neugk_jax.losses import df_loss, part_weight, recon_loss
-from neugk_jax.models.build import ae_conditioning, build_ae
+from neugk_jax.models.build import ae_conditioning, build_ae, mup_multipliers
 from neugk_jax.pinc.eval import AEEvaluator, VQVAEEvaluator, reconstruct, select_conditions
 from neugk_jax.pinc.quantizers import VectorQuantizer
 from neugk_jax.pinc.vqvae import Swin5DVQVAE
@@ -90,6 +90,12 @@ class AERunner(BaseRunner):
         if isinstance(model, Swin5DVQVAE) and not self.accepts_vq:
             raise ValueError(f"{type(self).__name__} cannot train a vq-vae; use workflow=vqvae")
         return model
+
+    def optimizer_multipliers(self):
+        # model.mup: per-leaf lr / weight decay of the muP adam
+        if not (self.cfg.model.get("mup") or {}).get("enable"):
+            return None
+        return mup_multipliers(self.cfg, self.train_ds, self.model, self.trainable)
 
     def load_batch(self, ds, indices, read) -> dict:
         fields = ("df", "file_index", "conditioning")

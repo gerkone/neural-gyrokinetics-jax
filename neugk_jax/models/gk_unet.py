@@ -202,6 +202,7 @@ class SwinNDUnet(eqx.Module):
         merge_mask: Optional[Sequence[bool]] = None,
         conv_patch: bool = False,
         unpatch_patch_skip: bool = False,
+        readout_mult: float = 1.0,
         key,
     ):
         patch_size = _as_seq(patch_size, space)
@@ -335,6 +336,7 @@ class SwinNDUnet(eqx.Module):
             use_conv=conv_patch,
             patch_skip=unpatch_patch_skip,
             cond_dim=up_cond,
+            in_mult=readout_mult,
         )
         self.base_resolution = tuple(base_resolution)
         self.patch_size = tuple(patch_size)

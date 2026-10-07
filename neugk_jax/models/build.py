@@ -15,6 +15,7 @@ from typing import Mapping, Optional, Sequence
 import jax
 import jax.numpy as jnp
 
+from neugk_jax.models.mup import build_multipliers, width_dims
 from neugk_jax.models.utils import init_linears, zero_init_output
 from neugk_jax.utils import to_dict
 
@@ -120,13 +121,16 @@ def build_ae_from_config(
     key,
     resolution: Optional[Sequence[int]] = None,
     legacy_double_shortcut: Optional[bool] = None,
+    width: Optional[int] = None,
 ):
     """``Swin5DAE`` (``Swin5DVQVAE`` for ``model.model_type: vqvae``) of a config.
 
     ``model.encoder_conditioning`` / ``model.decoder_conditioning`` condition each path; an
     absent ``model.norm_fn`` is RMSNorm for the AE and LayerNorm for the VQ-VAE.
     ``legacy_double_shortcut`` (the doubled swin residual) defaults to
-    ``model.legacy_swin_shortcut``, else False.
+    ``model.legacy_swin_shortcut``, else False. With ``model.mup.enable`` the heads and the
+    bottleneck follow the width (``width``, default ``model.latent_dim``) and the unpatch readout
+    gets the muP multiplier and zero init.
     """
     from neugk_jax.pinc import KineticSwin5DAE, Swin5DAE, Swin5DVQVAE
 
@@ -136,6 +140,16 @@ def build_ae_from_config(
     enc_cond, dec_cond = ae_conditioning(mcfg)
     _check_ae(mcfg, bool(enc_cond or dec_cond))
     vit, patch, bn = mcfg.get("vit", {}), mcfg.get("patch", {}), mcfg.get("bottleneck", {})
+    mup = mcfg.get("mup") or {}
+    dims = {"latent_dim": mcfg["latent_dim"], "num_heads": vit["num_heads"], "bottleneck_dim": bn.get("dim"), "bottleneck_num_heads": bn.get("num_heads", 2)}
+    readout_mult = 1.0
+    if mup.get("enable"):
+        if mcfg.get("zero_init_output"):
+            raise ValueError("model.zero_init_output with muP: the muP readout is zero-initialized instead")
+        dims = width_dims(width or mcfg["latent_dim"], mup.get("head_dim", 64), mup.get("bottleneck_ratio", 2))
+        n_layers = mcfg.get("num_layers", len(vit["depth"]) if isinstance(vit["depth"], (list, tuple)) else 4)
+        dims["num_heads"] = [dims["num_heads"]] * int(n_layers)
+        readout_mult = float(mup.get("output_mult", 1.0)) * mup.get("base_width", 128) / dims["latent_dim"]
     validate_keys("model.vit", vit, _AE_VIT_KEYS, _NO_PE)
     validate_keys("model.patch", patch, _AE_PATCH_KEYS)
     validate_keys("model.bottleneck", bn, _AE_BOTTLENECK_KEYS)
@@ -164,18 +178,18 @@ def build_ae_from_config(
     model = cls(
         **grid,
         decouple_mu=mcfg.get("decouple_mu", True),
-        dim=mcfg["latent_dim"],
+        dim=dims["latent_dim"],
         in_channels=dataset.get("in_channels", _df_channels(dataset)),
         out_channels=dataset.get("out_channels", _df_channels(dataset)),
         window_size=patch["window_size"],
         depth=depth,
-        num_heads=vit["num_heads"],
+        num_heads=dims["num_heads"],
         num_layers=mcfg.get(
             "num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4
         ),
-        bottleneck_dim=bn.get("dim"),
+        bottleneck_dim=dims["bottleneck_dim"],
         bottleneck_depth=bn.get("depth", 2),
-        bottleneck_num_heads=bn.get("num_heads", 2),
+        bottleneck_num_heads=dims["bottleneck_num_heads"],
         hidden_mlp_ratio=mcfg.get("hidden_mlp_ratio", 2.0),
         merging_hidden_ratio=patch.get("merging_hidden_ratio", 8.0),
         unmerging_hidden_ratio=patch.get("unmerging_hidden_ratio", 8.0),
@@ -194,10 +208,21 @@ def build_ae_from_config(
         use_checkpoint=bool(vit.get("gradient_checkpoint", False)),
         encoder_conditioning=enc_cond,
         decoder_conditioning=dec_cond,
+        readout_mult=readout_mult,
         key=key,
     )
     model = init_linears(model, mcfg.get("init_weights"), key=jax.random.fold_in(key, 1))
+    if mup.get("enable") and mup.get("readout_zero_init", True):
+        model = zero_init_output(model, layer=0)
     return force_f32(zero_init_output(model) if mcfg.get("zero_init_output") else model)
+
+
+def mup_multipliers(cfg, ds, model, mask) -> tuple:
+    """muP ``(lr_mult, wd_mult)`` pytrees of the AE ``model`` of a run config (``model.mup``)."""
+    rc = run_config(cfg, ds)
+    mup = rc["model"]["mup"]
+    build = lambda w: build_ae_from_config(rc, key=jax.random.PRNGKey(0), width=w)
+    return build_multipliers(build, model, mask, int(mup.get("base_width", 128)), int(mup.get("delta_width", 256)))
 
 
 def build_dit_from_config(cfg_path, ae, *, key):

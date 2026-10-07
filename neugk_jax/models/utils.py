@@ -104,17 +104,18 @@ def init_linears(model, scheme, *, key):
     return eqx.tree_at(linears, model, new)
 
 
-def zero_init_output(model):
-    """Zero the last ``Linear`` of every ``unpatch`` expansion: the autoencoder starts at a zero output."""
+def zero_init_output(model, layer: int = -1):
+    """Zero one ``Linear`` of every ``unpatch`` expansion (the last by default; ``0`` is the muP
+    readout): the autoencoder starts at a zero output."""
 
     def outputs(m):
-        last = {}
+        found = {}
         is_lin = lambda x: isinstance(x, Linear)
         for path, node in jax.tree_util.tree_flatten_with_path(m, is_leaf=is_lin)[0]:
             name = jax.tree_util.keystr(path)
             if is_lin(node) and node.weight is not None and ".unpatch.expansion." in name:
-                last[name.split(".unpatch.")[0]] = node
-        return list(last.values())
+                found.setdefault(name.split(".unpatch.")[0], []).append(node)
+        return [nodes[layer] for nodes in found.values()]
 
     new = []
     for lin in outputs(model):

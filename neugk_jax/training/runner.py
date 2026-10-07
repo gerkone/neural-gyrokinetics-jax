@@ -62,11 +62,13 @@ def is_hidden_matrix(path, leaf) -> bool:
     return leaf.ndim == 2 and min(leaf.shape) >= 16 and hidden
 
 
-def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999, mask=None):
+def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999, mask=None, multipliers=None):
     """Clip + Adam chain over the ``mask`` leaves (default ``trainable_mask``).
 
     ``decoupled`` selects AdamW, else Adam with coupled L2 decay. ``training.optimizer: muon``
     updates the hidden weight matrices with Muon at ``muon_learning_rate`` (same schedule shape).
+    ``multipliers`` (muP ``(lr_mult, wd_mult)`` pytrees over the trainable leaves) scale the
+    learning rate and the coupled decay of every leaf.
     """
     wd = tcfg.get("weight_decay", 0.0)
     params = eqx.filter(model, trainable_mask(model) if mask is None else mask)
@@ -84,6 +86,18 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
             lambda c: ratio * schedule(c), adam_learning_rate=schedule, adam_b2=b2, weight_decay=wd,
             adam_weight_decay=wd, muon_weight_dimension_numbers=dims,
         ))
+    if multipliers is not None:
+        if tcfg.get("optimizer", "adam") != "adam" or decoupled:
+            raise NotImplementedError("muP multipliers need optimizer adam with coupled weight decay")
+        lr_mult, wd_mult = multipliers
+        decay = lambda g, p: jax.tree_util.tree_map(lambda gi, pi, m, k: gi + wd * m * pi if k else gi, g, p, wd_mult, mask)
+        return optax.chain(
+            clip,
+            optax.stateless(decay),
+            optax.scale_by_adam(b1=float(tcfg.get("adam_b1", 0.9)), b2=b2),
+            optax.scale_by_learning_rate(schedule),
+            optax.stateless(lambda u, p: jax.tree_util.tree_map(lambda ui, m: ui * m, u, lr_mult)),
+        )
     if wd <= 0:
         return optax.chain(clip, optax.adam(schedule, b2=b2))
     if decoupled:
@@ -317,10 +331,14 @@ class BaseRunner:
             decoupled=self.decoupled_wd,
             b2=float(tcfg.get("adam_b2") or self.adam_b2),
             mask=self.trainable,
+            multipliers=self.optimizer_multipliers(),
         )
         self.opt_state = self.optimizer.init(eqx.filter(self.model, self.trainable))
         self.model = replicate(self.dist, self.model)
         self.opt_state = replicate(self.dist, self.opt_state)
+
+    def optimizer_multipliers(self):
+        return None
 
     def _maybe_resume(self) -> None:
         ckpt = self.output_path / "ckp.eqx"
