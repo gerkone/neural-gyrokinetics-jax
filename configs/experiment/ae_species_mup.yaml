@@ -1,0 +1,24 @@
+# @package _global_
+# ae_species on all the data with the muP adam of the torch reference ae_w1024: python main.py experiment=ae_species_mup
+defaults:
+  - ae_species
+
+dataset:
+  # per-part statistics from every stats_stride-th training sample of this run
+  normalization_stats: null
+  stats_stride: 8
+training:
+  optimizer: adam
+  learning_rate: 2.4e-3
+  adam_b2: 0.95
+  final_learning_rate: 1.0e-6
+  weight_decay: 1.0e-6
+  lr_schedule: warmup_cosine
+  n_epochs: 200
+model:
+  zero_init_output: false
+  vit: {attention: cudnn}
+  # heads and bottleneck follow the width, per-layer muP lr / weight decay, zero-initialized readout with the 1/width multiplier
+  mup: {enable: true, head_dim: 64, bottleneck_ratio: 2, base_width: 128, delta_width: 256, output_mult: 1.0, readout_zero_init: true}
+validation:
+  validate_every_n_epochs: 10
