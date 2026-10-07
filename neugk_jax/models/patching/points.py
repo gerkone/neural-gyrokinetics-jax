@@ -6,6 +6,8 @@ or ``absolute`` (node values mapped to [-1, 1] by ``range`` or the node extent, 
 ``weights``); absolute axes may be folded into the channels as ``(c, *folded)``. Without a spec every
 axis is relative with unit spacing. A point at cell ``j`` of a block of ``q`` cells sits at
 ``(2 j + 1) / q - 1``, so the same physical position keeps its coordinate when the resolution changes.
+A relative axis may give its ``band``, the number of modes the data resolves per patch (default: the
+patch's point count); cosines are cut there, so a finer sampling of the same data adds no modes.
 """
 
 from __future__ import annotations
@@ -127,6 +129,7 @@ class PointGrid(eqx.Module):
         first = np.array([np.flatnonzero(anchor == k)[0] for k in range(math.prod(anchors))])
 
         rel = [i for i, a in enumerate(axes) if a.get("kind", "relative") == "relative"]
+        band = [min(patch[i], int(axes[i].get("band", patch[i]))) for i in range(n)]
         self.rel_axes = tuple(rel)
         self.abs_axes = tuple(i for i in range(n) if i not in rel)
         tokens = [padded[i] // patch[i] for i in self.abs_axes]
@@ -140,7 +143,7 @@ class PointGrid(eqx.Module):
                         np.ones(patch[i]),
                         np.full(patch[i], 2.0 / patch[i]),
                         "relative",
-                        patch[i],
+                        band[i],
                     )
                 )
                 continue
@@ -191,7 +194,7 @@ class PointGrid(eqx.Module):
         self.n_fold = n_fold
         self.half = tuple(sub[i] / 2 for i in rel)
         self.caps = (
-            tuple(sub[i] for i in rel)
+            tuple(max(1, -(-band[i] * sub[i] // patch[i])) for i in rel)
             + tuple(len(axes[i]["nodes"]) for i in self.abs_axes)
             + n_fold
         )

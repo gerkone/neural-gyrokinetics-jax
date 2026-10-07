@@ -31,6 +31,7 @@ from neugk_jax.models.utils import MLP, Linear, leaky_relu, silu
 
 ENCODERS = ("kernel", "smooth", "tucker")
 DECODERS = ("deeponet", "hier", "smooth", "tucker")
+MODULATIONS = ("cosine", "legendre", "bernstein")
 
 FIELD_OPTIONS = {
     # point encoding: fourier (n_freq octaves), cosine (modes, cut at the resolution) or ipe (cell-averaged cosines)
@@ -48,6 +49,8 @@ FIELD_OPTIONS = {
     "anchors": None,
     "code_modes": None,
     "code_rank": 128,
+    # smooth: basis of the position in the patch, cosine, legendre or bernstein (a partition of unity)
+    "modulation": "cosine",
     # hier block decoder: deeponet (linear in the code) or field (shift-modulated mlp of block-local coordinates)
     "local": "deeponet",
     "local_width": 64,
@@ -73,6 +76,8 @@ def field_options(options: Mapping) -> dict:
         raise ValueError(f"encoder={opts['encoder']!r}; one of {ENCODERS}")
     if opts["decoder"] not in DECODERS:
         raise ValueError(f"decoder={opts['decoder']!r}; one of {DECODERS}")
+    if opts["modulation"] not in MODULATIONS:
+        raise ValueError(f"modulation={opts['modulation']!r}; one of {MODULATIONS}")
     if opts["local"] not in ("deeponet", "field"):
         raise ValueError(f"local={opts['local']!r}; one of deeponet, field")
     return opts
@@ -127,11 +132,32 @@ def _zero_last(mlp: MLP) -> MLP:
     )
 
 
-def cosine_basis(pos: jnp.ndarray, modes: Sequence[int]) -> jnp.ndarray:
-    """``(..., prod(modes))`` separable cosine basis of the cell-centred positions ``pos`` ``(..., n)``."""
+def _legendre(u: jnp.ndarray, m: int) -> jnp.ndarray:
+    p = [jnp.ones_like(u), u]
+    for k in range(1, m - 1):
+        p.append(((2 * k + 1) * u * p[k] - k * p[k - 1]) / (k + 1))
+    return jnp.concatenate(p[:m], -1)
+
+
+def _bernstein(u: jnp.ndarray, m: int) -> jnp.ndarray:
+    t = (u + 1) / 2
+    k = jnp.arange(m)
+    return jnp.asarray([math.comb(m - 1, j) for j in range(m)]) * t**k * (1 - t) ** (m - 1 - k)
+
+
+def cosine_basis(pos: jnp.ndarray, modes: Sequence[int], kind: str = "cosine") -> jnp.ndarray:
+    """``(..., prod(modes))`` separable cosine, legendre or bernstein basis of the cell-centred positions ``pos`` ``(..., n)``."""
     phi = jnp.ones((*pos.shape[:-1], 1))
     for i, m in enumerate(modes):
-        b = jnp.cos(jnp.arange(m) * jnp.pi * (pos[..., i : i + 1] + 1) / 2)
+        u = pos[..., i : i + 1]
+        if kind == "legendre":
+            b = _legendre(u, m)
+        elif kind == "bernstein":
+            b = _bernstein(u, m)
+        elif kind == "cosine":
+            b = jnp.cos(jnp.arange(m) * jnp.pi * (u + 1) / 2)
+        else:
+            raise ValueError(f"modulation={kind!r}; one of {MODULATIONS}")
         phi = (phi[..., :, None] * b[..., None, :]).reshape(*pos.shape[:-1], -1)
     return phi
 
@@ -268,6 +294,7 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
     encoding: tuple = eqx.field(static=True)
     n_cond: int = eqx.field(static=True)
     code_modes: tuple[int, ...] = eqx.field(static=True)
+    modulation_basis: str = eqx.field(static=True)
 
     def __init__(
         self,
@@ -291,6 +318,7 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
         self.encoding = (opts["encoding"], opts["n_freq"], opts["modes"])
         self.encoder = opts["encoder"]
         self.n_cond = opts["cond_features"]
+        self.modulation_basis = opts["modulation"]
         self.code_modes = (
             tuple(opts["code_modes"] or _default_modes(self.patch_size))
             if self.encoder == "smooth"
@@ -332,7 +360,7 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
         )
         g, a = _letters(len(self.grid.patch), self.grid.abs_axes)
         if self.encoder == "smooth":
-            phi = cosine_basis(self.grid.pos, self.code_modes)
+            phi = cosine_basis(self.grid.pos, self.code_modes, self.modulation_basis)
             h = jnp.einsum(f"{g}p,{a}pr,pk->{g}kr", p, w, phi, optimize="optimal") / p.shape[-1]
             h = h.reshape(*h.shape[:-2], -1)
         else:
@@ -364,6 +392,7 @@ class FieldUnpatch(_Field, GridDecoderBase):
     target_grid_size: tuple[int, ...] = eqx.field(static=True)
     decoder: str = eqx.field(static=True)
     code_modes: tuple[int, ...] = eqx.field(static=True)
+    modulation_basis: str = eqx.field(static=True)
     ranks: tuple[int, ...] = eqx.field(static=True)
     encoding: tuple = eqx.field(static=True)
     n_cond: int = eqx.field(static=True)
@@ -397,6 +426,7 @@ class FieldUnpatch(_Field, GridDecoderBase):
         self.grid = PointGrid(self.target_grid_size, self.expand_by, out_channels, grid, anchors)
         self.encoding = (opts["encoding"], opts["n_freq"], opts["modes"])
         self.n_cond = opts["cond_features"]
+        self.modulation_basis = opts["modulation"]
         self.code_modes = ()
         self.ranks = ()
         self.local = None
@@ -490,7 +520,7 @@ class FieldUnpatch(_Field, GridDecoderBase):
             out = jnp.einsum(f"{g}r,{a}pr->{g}p", self.expansion(z), psi) / psi.shape[-1]
         elif self.decoder == "smooth":
             h = self.expansion(z).reshape(*z.shape[:-1], math.prod(self.code_modes), -1)
-            phi = cosine_basis(grid.pos, self.code_modes)
+            phi = cosine_basis(grid.pos, self.code_modes, self.modulation_basis)
             out = (
                 jnp.einsum(f"{g}kr,{a}pr,pk->{g}p", h, psi, phi, optimize="optimal") / psi.shape[-1]
             )

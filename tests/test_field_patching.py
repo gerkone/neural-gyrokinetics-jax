@@ -264,3 +264,41 @@ def test_point_conditioning_enters_the_filters(encoder, decoder):
         float(jnp.abs(unpatch(z_ion, point_cond=ion) - unpatch(z_ion, point_cond=electron)).max())
         > 0
     )
+
+
+def test_band_limit_keeps_the_trained_modes_on_a_finer_grid():
+    # data resolving 5 modes per patch, sampled on 10 points: cosines above the band are cut
+    spec = {"axes": [{"kind": "relative", "band": 5}]}
+    fine = PointGrid((10,), (10,), 1, spec)
+    assert fine.axes[0].cap == 5 and fine.caps[0] == 5
+    bases = AxisBases(
+        fine, (10,), key=jr.PRNGKey(0), basis="cosine", hidden=8, encoding=("cosine", 5, 16)
+    )(fine)
+    assert (
+        float(jnp.abs(bases[0][:, 5:]).max()) == 0.0 and float(jnp.abs(bases[0][:, :5]).max()) > 0
+    )
+
+
+@pytest.mark.parametrize("modulation", ["cosine", "legendre", "bernstein"])
+def test_smooth_modulation_bases(modulation):
+    opts = dict(
+        encoder="smooth",
+        decoder="smooth",
+        rank=8,
+        hidden=8,
+        code_rank=4,
+        branch=16,
+        modulation=modulation,
+        zero_init=False,
+    )
+    embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), **opts)
+    unpatch = FieldUnpatch(8, (2, 2), key=jr.PRNGKey(1), expand_by=(2, 5), out_channels=3, **opts)
+    x = jr.normal(jr.PRNGKey(2), (4, 10, 3))
+    assert unpatch(embed(x)).shape == x.shape
+
+
+def test_bernstein_modulation_is_a_partition_of_unity():
+    from neugk_jax.models.patching.field import cosine_basis
+
+    pos = jnp.linspace(-0.9, 0.9, 7)[:, None]
+    np.testing.assert_allclose(cosine_basis(pos, (3,), "bernstein").sum(-1), 1.0, atol=1e-6)
