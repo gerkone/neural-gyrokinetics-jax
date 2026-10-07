@@ -14,6 +14,7 @@ from typing import Mapping, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from neugk_jax.utils import to_dict
 
@@ -75,6 +76,9 @@ _AE_PATCH_KEYS = {
     "merging_hidden_ratio",
     "unmerging_hidden_ratio",
     "c_multiplier",
+    "type",
+    "field",
+    "grid",
 }
 _AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable"}
 _NO_PE = {"use_abs_pe": False, "use_rope": False}
@@ -133,6 +137,9 @@ def build_ae_from_config(
     dataset = cfg.get("dataset", {})
     depth = vit["depth"]
     cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
+    patching = patch.get("type", "linear")
+    # field patching: options from model.patch.field, coordinates from model.patch.grid (set by run_config)
+    patching_kwargs = {**(patch.get("field") or {}), "grid": patch.get("grid")} if patching == "field" else {}
     return force_f32(
         cls(
             space=5,
@@ -169,6 +176,8 @@ def build_ae_from_config(
             use_checkpoint=bool(vit.get("gradient_checkpoint", False)),
             encoder_conditioning=enc_cond,
             decoder_conditioning=dec_cond,
+            patching=patching,
+            patching_kwargs=patching_kwargs,
             key=key,
         )
     )
@@ -352,12 +361,36 @@ def build_release_gyroswin(cfg_path, *, key, resolution: Optional[Sequence[int]]
 
 
 def run_config(cfg, ds=None) -> dict:
-    """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf."""
+    """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf.
+
+    With ``model.patch.type: field`` the patch coordinates come from ``ds`` (:func:`field_grid`).
+    """
     out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
         out["dataset"]["resolution"] = [int(r) for r in ds.resolution]
         out["dataset"]["separate_zf"] = bool(ds.separate_zf)
+        patch = (out["model"] or {}).get("patch") or {}
+        if patch.get("type") == "field":
+            patch.setdefault("grid", field_grid(ds, fold_mu=out["model"].get("decouple_mu", True)))
     return out
+
+
+def field_grid(ds, fold_mu: bool = True) -> dict:
+    """Field patching grid of a ``(vp, mu, s, x, y)`` dataset (its first trajectory).
+
+    vpar and mu are absolute (nodes and quadrature weights, mu folded into the channels with
+    ``fold_mu``), s, x and y relative with their grid spacings (x, y from the box lengths).
+    """
+    g = ds.metadata[0]["geometry"]
+    nx, ny = (int(r) for r in ds.resolution[3:])
+    lx, ly = (2 * np.pi / np.diff(np.unique(np.asarray(g[k], np.float64))).min() for k in ("kxrh", "krho"))
+    nodes = lambda k: [float(v) for v in np.asarray(g[k], np.float64).ravel()]
+    vpar = {"kind": "absolute", "nodes": nodes("vpgr"), "weights": nodes("intvp")}
+    mu = {"kind": "absolute", "nodes": nodes("mugr"), "weights": nodes("intmu")}
+    rel = [{"kind": "relative", "spacing": s} for s in (float(np.asarray(g["ints"]).ravel()[0]), lx / nx, ly / ny)]
+    if fold_mu:
+        return {"axes": [vpar, *rel], "folded": [mu]}
+    return {"axes": [vpar, mu, *rel]}
 
 
 def build_ae(cfg, ds, *, key):

@@ -9,7 +9,7 @@ sorted union of both key sets.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -82,6 +82,8 @@ class Swin5DAE(eqx.Module):
         encoder_conditioning: Sequence[str] = (),
         decoder_conditioning: Sequence[str] = (),
         cond_embed_dim: int = 32,
+        patching: str = "linear",
+        patching_kwargs: Optional[Mapping] = None,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -132,6 +134,8 @@ class Swin5DAE(eqx.Module):
             decoder_rms_norm=decoder_rms_norm,
             enc_cond_dim=enc_cdim,
             dec_cond_dim=dec_cdim,
+            patching=patching,
+            patching_kwargs=patching_kwargs,
             # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
             build_middle=False,
@@ -195,17 +199,17 @@ class Swin5DAE(eqx.Module):
         return z, {}
 
     def encode(
-        self, df: jnp.ndarray, condition=None, *, key=None, inference: bool = True
+        self, df: jnp.ndarray, condition=None, *, geometry=None, key=None, inference: bool = True
     ) -> jnp.ndarray:
         cond = self._embed(self.enc_cond_embed, condition, self.enc_indices)
         keys = split_key(key, len(self.backbone.down_blocks) + 1)
-        z = self.backbone.patch_encode(df)
+        z = self.backbone.patch_encode(df, geometry)
         for blk, k in zip(self.backbone.down_blocks, keys):
             z = blk(z, cond, return_skip=False, key=k, inference=inference)
         z = self.middle_downproj(self.middle_pre(z, cond, key=keys[-1], inference=inference))
         return self.pre_z_norm(z) if self.normalized_latent else z
 
-    def decode(self, z: jnp.ndarray, condition=None, *, key=None, inference: bool = True):
+    def decode(self, z: jnp.ndarray, condition=None, *, geometry=None, key=None, inference: bool = True):
         cond = self._embed(self.dec_cond_embed, condition, self.dec_indices)
         keys = split_key(key, len(self.backbone.up_blocks) + 1)
         if self.normalized_latent:
@@ -215,7 +219,7 @@ class Swin5DAE(eqx.Module):
         # no skip connections in the ae decoder
         for blk, k in zip(self.backbone.up_blocks, keys[1:]):
             z = blk(z, None, cond, key=k, inference=inference)
-        return {"df": self.backbone.patch_decode(z, cond)}
+        return {"df": self.backbone.patch_decode(z, cond, geometry)}
 
     def __call__(
         self,
@@ -223,13 +227,14 @@ class Swin5DAE(eqx.Module):
         condition=None,
         return_latent: bool = False,
         *,
+        geometry=None,
         key=None,
         inference: bool = True,
     ):
         k_enc, k_dec = split_key(key, 2)
-        z = self.encode(df, condition, key=k_enc, inference=inference)
+        z = self.encode(df, condition, geometry=geometry, key=k_enc, inference=inference)
         z, extra = self.bottleneck(z, inference=inference)
-        out = self.decode(z, condition, key=k_dec, inference=inference)
+        out = self.decode(z, condition, geometry=geometry, key=k_dec, inference=inference)
         out.update(extra)
         if return_latent:
             out["latent"] = z

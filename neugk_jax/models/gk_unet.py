@@ -5,7 +5,7 @@ Drops the PINC-only branches (flux head, simsiam, mask augmentation).
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -13,6 +13,7 @@ import jax.random as jr
 from einops import rearrange
 
 from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
+from neugk_jax.models.field_patching import FieldPatchEmbed, FieldUnpatch
 from neugk_jax.models.patching import (
     PatchEmbed,
     PatchExpand,
@@ -25,6 +26,10 @@ from neugk_jax.models.patching import (
 )
 from neugk_jax.models.swin import BlockStack, swin_layer
 from neugk_jax.models.utils import Linear, gelu
+
+
+# patch embedding and unpatch classes per patching type
+PATCHINGS = {"linear": (PatchEmbed, PatchExpand), "field": (FieldPatchEmbed, FieldUnpatch)}
 
 
 def _as_seq(x, n):
@@ -144,15 +149,17 @@ class SwinNDUnet(eqx.Module):
     ``decoder_rms_norm`` selects the norm of the decoder Swin layers and the bottleneck
     upscale, independently of ``rms_norm``. ``enc_cond_dim`` / ``dec_cond_dim`` set the
     condition width of the encoder / decoder stages (0: unconditioned), else ``n_cond`` sets both.
+    ``patching`` selects the patch embedding / unpatch pair of :data:`PATCHINGS`, built with
+    ``patching_kwargs`` on top of the shared patch arguments.
     """
 
-    patch_embed: Optional[PatchEmbed]
+    patch_embed: Optional[eqx.Module]
     cond_embed: Optional[ContinuousConditionEmbed]
     down_blocks: list[SwinBlockDown]
     middle: Optional[BlockStack]
     middle_upscale: Optional[PatchExpand]
     up_blocks: list[SwinBlockUp]
-    unpatch: PatchExpand
+    unpatch: eqx.Module
 
     base_resolution: tuple[int, ...] = eqx.field(static=True)
     patch_size: tuple[int, ...] = eqx.field(static=True)
@@ -201,8 +208,14 @@ class SwinNDUnet(eqx.Module):
         build_middle: bool = True,
         conv_patch: bool = False,
         unpatch_patch_skip: bool = False,
+        patching: str = "linear",
+        patching_kwargs: Optional[Mapping] = None,
         key,
     ):
+        if patching not in PATCHINGS:
+            raise ValueError(f"patching={patching!r}; one of {sorted(PATCHINGS)}")
+        embed_cls, unpatch_cls = PATCHINGS[patching]
+        patching_kwargs = dict(patching_kwargs or {})
         patch_size = _as_seq(patch_size, space)
         window_size = _as_seq(window_size, space)
         depth = _as_seq(depth, num_layers)
@@ -216,7 +229,7 @@ class SwinNDUnet(eqx.Module):
 
         self.patch_embed = None
         if build_down:
-            self.patch_embed = PatchEmbed(
+            self.patch_embed = embed_cls(
                 padded_base,
                 patch_size,
                 in_channels=in_channels,
@@ -225,6 +238,7 @@ class SwinNDUnet(eqx.Module):
                 mlp_depth=merging_depth,
                 mlp_ratio=merging_hidden_ratio,
                 act_fn=act_fn,
+                **patching_kwargs,
             )
         # per-u-net conditioning embed: raw scalars to the cond_dim of every conditioned block
         self.cond_embed = None
@@ -321,7 +335,7 @@ class SwinNDUnet(eqx.Module):
             )
 
         # unpatch: expand back to padded base resolution (norm=False)
-        self.unpatch = PatchExpand(
+        self.unpatch = unpatch_cls(
             up_dims[-1],
             up_grid_sizes[-1],
             key=keys[2 * num_layers + 3],
@@ -333,6 +347,7 @@ class SwinNDUnet(eqx.Module):
             use_conv=conv_patch,
             patch_skip=unpatch_patch_skip,
             cond_dim=up_cond,
+            **patching_kwargs,
         )
         self.base_resolution = tuple(base_resolution)
         self.patch_size = tuple(patch_size)
@@ -342,13 +357,20 @@ class SwinNDUnet(eqx.Module):
             return None
         return self.cond_embed(cond)
 
-    def patch_encode(self, x: jnp.ndarray) -> jnp.ndarray:
-        # (C, *spatial) → (*spatial, C) → pad → patch_embed
-        return self.patch_embed(pad_to_blocks(jnp.moveaxis(x, 0, -1), self.patch_size))
+    def _embed(self, x: jnp.ndarray, geometry=None) -> jnp.ndarray:
+        x = pad_to_blocks(x, self.patch_size)
+        return self.patch_embed(x) if geometry is None else self.patch_embed(x, geometry)
 
-    def patch_decode(self, z: jnp.ndarray, condition=None) -> jnp.ndarray:
-        x = unpad(self.unpatch(z, condition), self.base_resolution)
-        return jnp.moveaxis(x, -1, 0)
+    def _unpatch(self, z: jnp.ndarray, condition=None, geometry=None) -> jnp.ndarray:
+        x = self.unpatch(z, condition) if geometry is None else self.unpatch(z, condition, geometry)
+        return unpad(x, self.base_resolution)
+
+    def patch_encode(self, x: jnp.ndarray, geometry=None) -> jnp.ndarray:
+        # (C, *spatial) → (*spatial, C) → pad → patch_embed
+        return self._embed(jnp.moveaxis(x, 0, -1), geometry)
+
+    def patch_decode(self, z: jnp.ndarray, condition=None, geometry=None) -> jnp.ndarray:
+        return jnp.moveaxis(self._unpatch(z, condition, geometry), -1, 0)
 
 
 class Swin5DUnet(SwinNDUnet):
@@ -402,15 +424,15 @@ class Swin5DUnet(SwinNDUnet):
         self.decoupled_dim = decoupled_dim
         self.vel_pe = APE(full_in, (1, decoupled_dim, 1, 1, 1), key=k_vel) if decouple_mu else None
 
-    def patch_encode(self, df: jnp.ndarray) -> jnp.ndarray:
+    def patch_encode(self, df: jnp.ndarray, geometry=None) -> jnp.ndarray:
         # (C, vp, mu, s, x, y) → channel last → vel_pe → mu folded into channels
         df = jnp.moveaxis(df, 0, -1)
         if self.decouple_mu:
             df = rearrange(self.vel_pe(df), "vp mu s x y c -> vp s x y (c mu)")
-        return self.patch_embed(pad_to_blocks(df, self.patch_size))
+        return self._embed(df, geometry)
 
-    def patch_decode(self, z: jnp.ndarray, condition=None) -> jnp.ndarray:
-        df = unpad(self.unpatch(z, condition), self.base_resolution)
+    def patch_decode(self, z: jnp.ndarray, condition=None, geometry=None) -> jnp.ndarray:
+        df = self._unpatch(z, condition, geometry)
         if self.decouple_mu:
             return rearrange(df, "vp s x y (c mu) -> c vp mu s x y", mu=self.decoupled_dim)
         return jnp.moveaxis(df, -1, 0)
