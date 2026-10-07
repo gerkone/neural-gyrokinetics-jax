@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
+from neugk_jax.models.base import GridDecoderBase, GridEncoderBase
 from neugk_jax.models.patching.ops import _normalize_patch, fold_patches, unfold_patches
 from neugk_jax.models.patching.points import PointGrid, n_encoded
 from neugk_jax.models.utils import MLP, Linear, leaky_relu, silu
@@ -249,7 +250,7 @@ class _Field(eqx.Module):
         return out
 
 
-class FieldPatchEmbed(_Field):
+class FieldPatchEmbed(_Field, GridEncoderBase):
     """``PatchEmbed`` whose per-point weights come from the point coordinates.
 
     ``kernel``: ``h = mean_p w_p K(features_p) x_p`` (rank R), then the channel MLP. ``smooth``:
@@ -339,7 +340,7 @@ class FieldPatchEmbed(_Field):
         return self.mix(self.act(h))
 
 
-class FieldUnpatch(_Field):
+class FieldUnpatch(_Field, GridDecoderBase):
     """``PatchExpand`` (unpatch) rebuilding every patch from per-token codes.
 
     ``deeponet``: ``f(p) = <branch(z), basis(p)>`` over the whole patch.

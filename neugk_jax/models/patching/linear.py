@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
+from neugk_jax.models.base import GridDecoderBase, GridEncoderBase
 from neugk_jax.models.patching.ops import (
     _normalize_patch,
     fold_patches,
@@ -32,7 +33,7 @@ from neugk_jax.models.patching.ops import (
 from neugk_jax.models.utils import MLP, Linear, leaky_relu, make_norm
 
 
-class PatchEmbed(eqx.Module):
+class PatchEmbed(GridEncoderBase):
     """Fold + MLP channel mixer.
 
     Input  ``(*spatial, in_channels)`` → output ``(*grid, embed_dim)``.
@@ -63,7 +64,7 @@ class PatchEmbed(eqx.Module):
         dims = [math.prod(ps) * in_channels] + [hidden] * (mlp_depth - 1) + [embed_dim]
         self.patch = MLP(dims, key=key, act_fn=act_fn, use_bias=False)
 
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, geometry=None) -> jnp.ndarray:
         return self.patch(fold_patches(x, self.patch_size))
 
 
@@ -132,7 +133,7 @@ class StridedConvTranspose(eqx.Module):
         return y + self.bias
 
 
-class PatchExpand(eqx.Module):
+class PatchExpand(GridDecoderBase):
     """MLP channel mixer + unfold + optional crop.
 
     Upsamples spatial axes by ``expand_by`` and reduces channels by
@@ -206,7 +207,9 @@ class PatchExpand(eqx.Module):
         # norm runs over out_dim channels after unfold
         self.norm = make_norm(self.out_dim, rms=rms_norm) if norm else None
 
-    def __call__(self, x: jnp.ndarray, cond: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+    def __call__(
+        self, x: jnp.ndarray, cond: Optional[jnp.ndarray] = None, geometry=None
+    ) -> jnp.ndarray:
         # order: proj_concat (skip residual) -> film -> expansion -> crop -> norm
         if self.proj_concat is not None:
             x = leaky_relu(self.proj_concat(x))

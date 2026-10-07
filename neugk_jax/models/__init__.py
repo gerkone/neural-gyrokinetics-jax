@@ -5,6 +5,12 @@ there directly — re-exporting it here would create a circular import via
 ``embeddings``/``vit``.
 """
 
+from neugk_jax.models.base import (
+    AttentionBlockBase,
+    GridDecoderBase,
+    GridEncoderBase,
+    TokenLayerBase,
+)
 from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet, SwinNDUnet
 from neugk_jax.models.patching import PatchEmbed, PatchExpand, PatchMerge, pad_to_blocks, unpad
@@ -13,6 +19,10 @@ from neugk_jax.models.utils import MLP, DiTModulation, LayerNorm, Linear
 from neugk_jax.models.vit import vit_layer
 
 __all__ = [
+    "AttentionBlockBase",
+    "GridDecoderBase",
+    "GridEncoderBase",
+    "TokenLayerBase",
     "MLP",
     "Film",
     "DiTModulation",
