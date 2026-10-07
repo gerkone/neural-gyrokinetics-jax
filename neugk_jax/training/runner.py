@@ -68,7 +68,7 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
     ``decoupled`` selects AdamW, else Adam with coupled L2 decay. ``training.optimizer: muon``
     updates the hidden weight matrices with Muon at ``muon_learning_rate`` (same schedule shape).
     ``multipliers`` (muP ``(lr_mult, wd_mult)`` pytrees over the trainable leaves) scale the
-    learning rate and the coupled decay of every leaf.
+    learning rate and the coupled decay of every leaf; with muon only the lr of its adam leaves.
     """
     wd = tcfg.get("weight_decay", 0.0)
     params = eqx.filter(model, trainable_mask(model) if mask is None else mask)
@@ -82,13 +82,18 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
         ratio = float(tcfg.muon_learning_rate) / float(tcfg.learning_rate)
         out_in = MuonDimensionNumbers(reduction_axis=1, output_axis=0)
         dims = lambda p: jax.tree_util.tree_map_with_path(lambda k, x: out_in if is_hidden_matrix(k, x) else None, p)
-        return optax.chain(clip, muon(
+        opt = muon(
             lambda c: ratio * schedule(c), adam_learning_rate=schedule, adam_b2=b2, weight_decay=wd,
             adam_weight_decay=wd, muon_weight_dimension_numbers=dims,
-        ))
+        )
+        if multipliers is None:
+            return optax.chain(clip, opt)
+        # muon's shape scaling transfers the hidden matrices; the adam leaves keep their muP lr
+        adam_mult = jax.tree_util.tree_map_with_path(lambda k, x, m: 1.0 if is_hidden_matrix(k, x) else m, params, multipliers[0])
+        return optax.chain(clip, opt, optax.stateless(lambda u, p: jax.tree_util.tree_map(lambda ui, m: ui * m, u, adam_mult)))
     if multipliers is not None:
         if tcfg.get("optimizer", "adam") != "adam" or decoupled:
-            raise NotImplementedError("muP multipliers need optimizer adam with coupled weight decay")
+            raise NotImplementedError("muP multipliers need optimizer adam or muon, adam with coupled weight decay")
         lr_mult, wd_mult = multipliers
         decay = lambda g, p: jax.tree_util.tree_map(lambda gi, pi, m, k: gi + wd * m * pi if k else gi, g, p, wd_mult, mask)
         return optax.chain(

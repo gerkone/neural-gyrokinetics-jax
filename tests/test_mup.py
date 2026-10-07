@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from neugk_jax.models.build import build_ae_from_config
 from neugk_jax.models.mup import build_multipliers
 from neugk_jax.models.utils import trainable_mask
-from neugk_jax.training.runner import build_optimizer
+from neugk_jax.training.runner import build_optimizer, is_hidden_matrix
 
 BASE = (8, 4, 4, 8, 4)
 
@@ -78,3 +78,26 @@ def test_mup_adam_step():
     qkv = lambda t: t.backbone.down_blocks[0].swin.blocks[0].attn.qkv.weight
     readout = lambda t: t.backbone.unpatch.expansion.layers[0].weight
     assert float(jnp.abs(qkv(updates)).max()) < 0.6 * float(jnp.abs(readout(updates)).max())
+
+
+def test_mup_muon_step():
+    c = cfg()
+    build = lambda w: build_ae_from_config(c, key=jr.PRNGKey(0), width=w)
+    model = build(64)
+    mask = trainable_mask(model)
+    mults = build_multipliers(build, model, mask, 32, 48)
+    tcfg = OmegaConf.create({**c["training"], "optimizer": "muon", "muon_learning_rate": 0.02})
+    make = lambda m: build_optimizer(optax.constant_schedule(2.4e-3), tcfg, model, decoupled=False, b2=0.95, mask=mask, multipliers=m)
+    params = eqx.filter(model, mask)
+    grads = jax.tree_util.tree_map(lambda p: jr.normal(jr.PRNGKey(1), p.shape), params)
+    plain, _ = make(None).update(grads, make(None).init(params), params)
+    scaled, _ = make(mults).update(grads, make(mults).init(params), params)
+    flat = jax.tree_util.tree_flatten_with_path(plain)[0]
+    lr = jax.tree_util.tree_leaves(mults[0])
+    seen = set()
+    # hidden matrices take the plain muon step, every adam leaf its muP lr multiplier
+    for (path, u), v, m in zip(flat, jax.tree_util.tree_leaves(scaled), lr):
+        expect = u if is_hidden_matrix(path, u) else u * m
+        assert jnp.allclose(v, expect, rtol=1e-5, atol=1e-9), jax.tree_util.keystr(path)
+        seen.add((is_hidden_matrix(path, u), m))
+    assert (True, 0.5) in seen and (False, 0.5) in seen and (False, 1.0) in seen
