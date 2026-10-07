@@ -13,13 +13,7 @@ import numpy as np
 
 from neugk_jax.models.attention.mha import MultiHeadSelfAttention
 from neugk_jax.models.base import AttentionBlockBase
-from neugk_jax.models.patching.ops import (
-    fold_patches,
-    pad_amounts,
-    pad_to_blocks,
-    unfold_patches,
-    unpad,
-)
+from neugk_jax.models.ops import fold_patches, pad_amounts, pad_to_blocks, unfold_patches, unpad
 from neugk_jax.models.utils import MLP, DiTModulation, DropPath, gelu, make_norm, split_key
 
 

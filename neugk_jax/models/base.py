@@ -5,6 +5,7 @@ A U-Net or autoencoder is built from
 * a :class:`GridEncoderBase` (patch embedding, ``(*spatial, C) -> (*grid, dim)``),
 * :class:`TokenLayerBase` stages (``(*grid, dim) -> (*grid, dim)``, stacks of
   :class:`AttentionBlockBase` blocks, e.g. Swin, ViT or Transolver),
+* :class:`TokenResamplerBase` steps between stages (token merging / expansion, token space only),
 * a :class:`GridDecoderBase` (unpatch, ``(*grid, dim) -> (*spatial, C)``),
 
 and any implementation of an interface can replace another. All inputs are unbatched and channel-last.
@@ -46,6 +47,17 @@ class GridDecoderBase(eqx.Module):
     def __call__(
         self, z: jnp.ndarray, cond: Optional[jnp.ndarray] = None, geometry=None
     ) -> jnp.ndarray:
+        raise NotImplementedError
+
+
+class TokenResamplerBase(eqx.Module):
+    """Tokens ``(*grid, dim)`` to tokens ``(*target_grid_size, out_dim)`` (merging or expansion)."""
+
+    target_grid_size: eqx.AbstractVar[tuple[int, ...]]
+    out_dim: eqx.AbstractVar[int]
+
+    @abc.abstractmethod
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         raise NotImplementedError
 
 

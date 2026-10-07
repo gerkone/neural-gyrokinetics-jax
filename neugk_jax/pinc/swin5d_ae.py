@@ -17,8 +17,8 @@ import jax.random as jr
 
 from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet
-from neugk_jax.models.patching import PatchExpand
 from neugk_jax.models.swin import BlockStack
+from neugk_jax.models.tokens import TokenExpand
 from neugk_jax.models.utils import LayerNorm, Linear, gelu, split_key
 from neugk_jax.models.vit import vit_layer
 
@@ -33,7 +33,7 @@ class Swin5DAE(eqx.Module):
     middle_post: BlockStack
     middle_downproj: Linear
     middle_upproj: Linear
-    middle_upscale: PatchExpand
+    middle_upscale: TokenExpand
     pre_z_norm: Optional[LayerNorm]
     post_z_norm: Optional[LayerNorm]
 
@@ -169,7 +169,7 @@ class Swin5DAE(eqx.Module):
         )
         self.middle_downproj = Linear(mid_dim, bd, key=k3)
         self.middle_upproj = Linear(bd, mid_dim, key=k4)
-        self.middle_upscale = PatchExpand(
+        self.middle_upscale = TokenExpand(
             mid_dim,
             mid_grid,
             key=k5,
@@ -209,7 +209,9 @@ class Swin5DAE(eqx.Module):
         z = self.middle_downproj(self.middle_pre(z, cond, key=keys[-1], inference=inference))
         return self.pre_z_norm(z) if self.normalized_latent else z
 
-    def decode(self, z: jnp.ndarray, condition=None, *, geometry=None, key=None, inference: bool = True):
+    def decode(
+        self, z: jnp.ndarray, condition=None, *, geometry=None, key=None, inference: bool = True
+    ):
         cond = self._embed(self.dec_cond_embed, condition, self.dec_indices)
         keys = split_key(key, len(self.backbone.up_blocks) + 1)
         if self.normalized_latent:

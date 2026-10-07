@@ -1,4 +1,7 @@
-"""N-dimensional fold / unfold (im2col / col2im) and block padding on channel-last ``(*spatial, C)`` inputs."""
+"""N-dimensional fold / unfold (im2col / col2im) and block padding on channel-last ``(*spatial, C)`` inputs.
+
+Shared by the patch embeddings, the token resamplers and the window partition of Swin blocks.
+"""
 
 from __future__ import annotations
 

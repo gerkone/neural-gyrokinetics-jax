@@ -11,15 +11,17 @@ from neugk_jax.models.base import (
     GridDecoderBase,
     GridEncoderBase,
     TokenLayerBase,
+    TokenResamplerBase,
 )
-from neugk_jax.models.patching import FieldPatchEmbed, FieldUnpatch, PatchEmbed, PatchExpand
+from neugk_jax.models.patching import FieldPatchEmbed, FieldUnpatch, LinearUnpatch, PatchEmbed
 from neugk_jax.models.swin import swin_layer
+from neugk_jax.models.tokens import TokenExpand, TokenMerge
 from neugk_jax.models.vit import vit_layer
 
 
 def test_patching_interfaces():
     assert issubclass(PatchEmbed, GridEncoderBase) and issubclass(FieldPatchEmbed, GridEncoderBase)
-    assert issubclass(PatchExpand, GridDecoderBase) and issubclass(FieldUnpatch, GridDecoderBase)
+    assert issubclass(LinearUnpatch, GridDecoderBase) and issubclass(FieldUnpatch, GridDecoderBase)
     with pytest.raises(TypeError):
         GridEncoderBase()
 
@@ -37,3 +39,10 @@ def test_layers_need_a_position_embedding_without_windows():
     vit = vit_layer(16, 2, 2, key=jr.PRNGKey(0))
     assert isinstance(swin, TokenLayerBase) and isinstance(vit, TokenLayerBase)
     assert not swin.needs_pos_embed and vit.needs_pos_embed
+
+
+def test_token_resamplers_are_token_space():
+    assert issubclass(TokenMerge, TokenResamplerBase) and issubclass(
+        TokenExpand, TokenResamplerBase
+    )
+    assert issubclass(LinearUnpatch, TokenExpand) and not issubclass(TokenExpand, GridDecoderBase)

@@ -16,20 +16,19 @@ from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
 from neugk_jax.models.patching import (
     FieldPatchEmbed,
     FieldUnpatch,
+    LinearUnpatch,
     PatchEmbed,
-    PatchExpand,
-    PatchMerge,
     _normalize_patch,
-    merge_grid,
     pad_amounts,
     pad_to_blocks,
     unpad,
 )
 from neugk_jax.models.swin import BlockStack, swin_layer
+from neugk_jax.models.tokens import TokenExpand, TokenMerge, merge_grid
 from neugk_jax.models.utils import Linear, gelu
 
 # patch embedding and unpatch classes per patching type
-PATCHINGS = {"linear": (PatchEmbed, PatchExpand), "field": (FieldPatchEmbed, FieldUnpatch)}
+PATCHINGS = {"linear": (PatchEmbed, LinearUnpatch), "field": (FieldPatchEmbed, FieldUnpatch)}
 
 
 def _as_seq(x, n):
@@ -39,10 +38,10 @@ def _as_seq(x, n):
 
 
 class SwinBlockDown(eqx.Module):
-    """Encoder stage: Swin layer (plain, FiLM- or DiT-conditioned) → PatchMerge."""
+    """Encoder stage: Swin layer (plain, FiLM- or DiT-conditioned) → TokenMerge."""
 
     swin: BlockStack
-    downsample: PatchMerge
+    downsample: TokenMerge
     resampled_grid_size: tuple[int, ...] = eqx.field(static=True)
     out_dim: int = eqx.field(static=True)
 
@@ -63,7 +62,7 @@ class SwinBlockDown(eqx.Module):
         self.swin = swin_layer(
             dim, depth, num_heads, grid_size, window_size, key=k1, rms_norm=rms_norm, **layer_kw
         )
-        self.downsample = PatchMerge(
+        self.downsample = TokenMerge(
             dim, grid_size, key=k2, c_multiplier=c_multiplier, rms_norm=rms_norm
         )
         self.resampled_grid_size = self.downsample.target_grid_size
@@ -76,14 +75,14 @@ class SwinBlockDown(eqx.Module):
 
 
 class SwinBlockUp(eqx.Module):
-    """Decoder stage: optional skip-concat → Swin layer → optional PatchExpand.
+    """Decoder stage: optional skip-concat → Swin layer → optional TokenExpand.
 
     The Swin layer uses ``decoder_rms_norm`` for its norms, the upsample ``rms_norm``.
     """
 
     proj_concat: Optional[Linear]
     swin: BlockStack
-    upsample: Optional[PatchExpand]
+    upsample: Optional[TokenExpand]
     act_fn: Callable = eqx.field(static=True)
 
     def __init__(
@@ -120,7 +119,7 @@ class SwinBlockUp(eqx.Module):
         )
         self.upsample = None
         if upsample:
-            self.upsample = PatchExpand(
+            self.upsample = TokenExpand(
                 dim,
                 grid_size,
                 key=k3,
@@ -157,7 +156,7 @@ class SwinNDUnet(eqx.Module):
     cond_embed: Optional[ContinuousConditionEmbed]
     down_blocks: list[SwinBlockDown]
     middle: Optional[BlockStack]
-    middle_upscale: Optional[PatchExpand]
+    middle_upscale: Optional[TokenExpand]
     up_blocks: list[SwinBlockUp]
     unpatch: eqx.Module
 
@@ -299,7 +298,7 @@ class SwinNDUnet(eqx.Module):
                 rms_norm=rms_norm,
                 **layer_kw,
             )
-            self.middle_upscale = PatchExpand(
+            self.middle_upscale = TokenExpand(
                 down_dims[-1],
                 grid_sizes[-1],
                 key=keys[num_layers + 2],

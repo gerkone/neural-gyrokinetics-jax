@@ -14,8 +14,8 @@ from neugk_jax.models.gk_unet import SwinNDUnet
 from neugk_jax.models.patching import (
     FieldPatchEmbed,
     FieldUnpatch,
+    LinearUnpatch,
     PatchEmbed,
-    PatchExpand,
     PointGrid,
     field_options,
     fold_patches,
@@ -83,7 +83,7 @@ def unet(patching, **kw):
 
 def test_linear_is_the_default():
     model = unet("linear")
-    assert type(model.patch_embed) is PatchEmbed and type(model.unpatch) is PatchExpand
+    assert type(model.patch_embed) is PatchEmbed and type(model.unpatch) is LinearUnpatch
 
 
 @pytest.mark.parametrize("decoder", ["deeponet", "hier"])

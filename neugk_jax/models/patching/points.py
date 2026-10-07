@@ -17,7 +17,7 @@ import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.models.patching.ops import _normalize_patch
+from neugk_jax.models.ops import _normalize_patch
 
 ENCODINGS = ("fourier", "cosine", "ipe")
 

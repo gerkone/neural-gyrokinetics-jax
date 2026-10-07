@@ -1,6 +1,6 @@
 """Field patching: patch embedding and unpatch whose weights are functions of the point coordinates.
 
-``FieldPatchEmbed`` / ``FieldUnpatch`` are drop-in replacements of ``PatchEmbed`` / ``PatchExpand`` on
+``FieldPatchEmbed`` / ``FieldUnpatch`` are drop-in replacements of ``PatchEmbed`` / ``LinearUnpatch`` on
 channel-last inputs ``(*spatial, C)``, with an optional per-sample ``geometry`` (the spacings of the
 relative axes) at call time. The coordinates come from a :class:`PointGrid`; ``with_grid`` swaps it, so
 one set of weights serves every grid (resolution, data type) whose feature and code shapes match.
@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import jax.random as jr
 
 from neugk_jax.models.base import GridDecoderBase, GridEncoderBase
-from neugk_jax.models.patching.ops import _normalize_patch, fold_patches, unfold_patches
+from neugk_jax.models.ops import _normalize_patch, fold_patches, unfold_patches
 from neugk_jax.models.patching.points import PointGrid, n_encoded
 from neugk_jax.models.utils import MLP, Linear, leaky_relu, silu
 
@@ -341,7 +341,7 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
 
 
 class FieldUnpatch(_Field, GridDecoderBase):
-    """``PatchExpand`` (unpatch) rebuilding every patch from per-token codes.
+    """Unpatch (as ``LinearUnpatch``) rebuilding every patch from per-token codes.
 
     ``deeponet``: ``f(p) = <branch(z), basis(p)>`` over the whole patch.
     ``hier``: the patch splits into ``anchors`` blocks per axis; the branch gives ``prod(code_modes)``
