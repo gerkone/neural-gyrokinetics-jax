@@ -280,8 +280,12 @@ class BaseRunner:
     def step_extras(self, step: int) -> dict:
         return {}
 
+    def host_batch(self, batch: dict) -> dict:
+        """A loaded training batch before sharding, in the prefetch thread (host arrays only)."""
+        return batch
+
     def place_batch(self, batch: dict) -> dict:
-        """Transform of a training batch once on its devices, in the prefetch thread."""
+        """Transform of a sharded training batch on its devices, in the main thread before the step."""
         return batch
 
     def load_batch(self, ds, indices, read) -> dict:
@@ -360,7 +364,7 @@ class BaseRunner:
             return self.load_batch(ds, indices, lambda d, i: read(d, i, devices))
 
         batches = self.loader.iterate(
-            self.train_ds, plans, load, lambda b: self.place_batch(shard_batch(self.dist, b))
+            self.train_ds, plans, load, lambda b: shard_batch(self.dist, self.host_batch(b))
         )
         show = self.dist.is_rank0 and (self.cfg.get("logging") or {}).get("tqdm", False)
         batches = progress(batches, show, total=len(plans), desc=f"epoch {epoch}")
@@ -370,6 +374,7 @@ class BaseRunner:
         for i, (_, batch, wait) in enumerate(batches):
             waits.append(wait)
             batch.pop("mask")
+            batch = self.place_batch(batch)
             batch.update(self.step_extras(step0 + i))
             self.model, self.opt_state, logs = train_step(
                 (batch, self.ctx, jr.fold_in(step_key, i)), self.model, self.opt_state, self.spec

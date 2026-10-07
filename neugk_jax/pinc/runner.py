@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import equinox as eqx
 import jax.numpy as jnp
+import numpy as np
 import jax.random as jr
 
 from neugk_jax.losses import df_loss, part_weight, recon_loss
@@ -17,6 +18,7 @@ from neugk_jax.pinc.eval import AEEvaluator, VQVAEEvaluator, reconstruct, select
 from neugk_jax.pinc.quantizers import VectorQuantizer
 from neugk_jax.pinc.vqvae import Swin5DVQVAE
 from neugk_jax.training.data import stack_fields
+from neugk_jax.training.ddp import per_shard
 from neugk_jax.training.runner import BaseRunner, conditioning_slots
 from neugk_jax.utils import to_dict
 
@@ -66,14 +68,19 @@ class AERunner(BaseRunner):
         # training.batch_transform: readers serve raw frames, normalized per batch in the step
         self.train_ds.batch_transform = bool(self.tcfg.get("batch_transform", False))
 
+    def host_batch(self, batch: dict) -> dict:
+        # data type of a one-type batch, read on the host
+        if self.train_ds.batch_transform and "data_type" in batch:
+            batch["part"] = int(np.asarray(batch.pop("data_type")).ravel()[0])
+        return batch
+
     def place_batch(self, batch: dict) -> dict:
         # eager ops, bit-identical to the per-sample transform (a jitted fusion is not)
         if not self.train_ds.batch_transform:
             return batch
-        args = (batch["df"], batch["file_index"])
-        if "data_type" in batch:
-            args += (batch.pop("data_type"),)
-        return {**batch, "df": self.train_ds.transform(*args)}
+        part = batch.pop("part", None)
+        ds = self.train_ds if part is None else list(self.train_ds.parts.values())[part]
+        return {**batch, "df": per_shard(ds.transform, batch["df"], batch["file_index"])}
 
     def checkpoint_meta(self) -> dict:
         return {"resolution": [int(r) for r in self.train_ds.resolution]}

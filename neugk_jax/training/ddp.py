@@ -161,6 +161,18 @@ def shard_local(dist: DistributedInfo, tree):
     return _put_rows(tree, dist.local_mesh, 1)
 
 
+def per_shard(fn, *arrays):
+    """``fn`` on the rows of every local device separately, reassembled with the row sharding.
+
+    Keeps ops that XLA does not partition along the rows (FFTs) on each device's own rows.
+    """
+    first = arrays[0]
+    if not isinstance(first, jax.Array) or len(first.sharding.device_set) == 1:
+        return fn(*arrays)
+    pieces = [fn(*(s.data for s in shards)) for shards in zip(*(a.addressable_shards for a in arrays))]
+    return jax.make_array_from_single_device_arrays((first.shape[0], *pieces[0].shape[1:]), first.sharding, pieces)
+
+
 def _replicated_sharding(mesh: Mesh):
     if mesh.size == 1:
         return jax.sharding.SingleDeviceSharding(mesh.devices.flat[0])
