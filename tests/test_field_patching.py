@@ -10,9 +10,14 @@ import numpy as np
 import pytest
 
 from neugk_jax.models.build import build_ae_from_config
-from neugk_jax.models.field_patching import FieldPatchEmbed, FieldUnpatch, field_options
 from neugk_jax.models.gk_unet import SwinNDUnet
-from neugk_jax.models.patching import PatchEmbed, PatchExpand
+from neugk_jax.models.patching import (
+    FieldPatchEmbed,
+    FieldUnpatch,
+    PatchEmbed,
+    PatchExpand,
+    field_options,
+)
 from neugk_jax.pinc import Swin5DAE
 
 BASE = (8, 4, 4, 8, 4)
@@ -80,17 +85,32 @@ def test_linear_is_the_default():
 
 @pytest.mark.parametrize("decoder", ["deeponet", "hier"])
 def test_generic_nd_swap(decoder):
-    linear, field = unet("linear"), unet("field", decoder=decoder, rank=16, hidden=16, code_rank=8, branch=32)
-    assert isinstance(field.patch_embed, FieldPatchEmbed) and isinstance(field.unpatch, FieldUnpatch)
+    linear, field = (
+        unet("linear"),
+        unet("field", decoder=decoder, rank=16, hidden=16, code_rank=8, branch=32),
+    )
+    assert isinstance(field.patch_embed, FieldPatchEmbed) and isinstance(
+        field.unpatch, FieldUnpatch
+    )
     x = jr.normal(jr.PRNGKey(1), (3, 8, 6, 8))
     z = field.patch_encode(x)
     assert z.shape == linear.patch_encode(x).shape
     assert field.patch_decode(z).shape == x.shape
 
 
-@pytest.mark.parametrize("decoder,encoding", [("deeponet", "fourier"), ("hier", "fourier"), ("hier", "cosine")])
+@pytest.mark.parametrize(
+    "decoder,encoding", [("deeponet", "fourier"), ("hier", "fourier"), ("hier", "cosine")]
+)
 def test_adiabatic_5d_grid(decoder, encoding):
-    opts = dict(decoder=decoder, encoding=encoding, rank=16, hidden=16, code_rank=8, branch=32, grid=grid_5d())
+    opts = dict(
+        decoder=decoder,
+        encoding=encoding,
+        rank=16,
+        hidden=16,
+        code_rank=8,
+        branch=32,
+        grid=grid_5d(),
+    )
     ae = small_ae(patching="field", patching_kwargs=opts)
     x = jr.normal(jr.PRNGKey(1), (2, *BASE))
     out = ae(x)["df"]
@@ -110,14 +130,24 @@ def test_adiabatic_5d_grid(decoder, encoding):
 
 def test_build_from_config():
     patch = dict(
-        patch_size=[2, 0, 2, 4, 2], window_size=[2, 0, 2, 2, 2], merging_depth=2, unmerging_depth=1,
-        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0, c_multiplier=2,
-        type="field", field={"rank": 16, "hidden": 16, "code_rank": 8, "branch": 32}, grid=grid_5d(),
+        patch_size=[2, 0, 2, 4, 2],
+        window_size=[2, 0, 2, 2, 2],
+        merging_depth=2,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
+        c_multiplier=2,
+        type="field",
+        field={"rank": 16, "hidden": 16, "code_rank": 8, "branch": 32},
+        grid=grid_5d(),
     )
     cfg = {
         "model": {
-            "latent_dim": 16, "num_layers": 1, "patch": patch,
-            "vit": {"num_heads": [2], "depth": [1]}, "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2},
+            "latent_dim": 16,
+            "num_layers": 1,
+            "patch": patch,
+            "vit": {"num_heads": [2], "depth": [1]},
+            "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2},
         },
         "dataset": {"resolution": list(BASE), "separate_zf": False},
     }

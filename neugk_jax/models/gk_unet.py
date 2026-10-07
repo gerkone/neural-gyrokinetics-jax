@@ -13,8 +13,9 @@ import jax.random as jr
 from einops import rearrange
 
 from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
-from neugk_jax.models.field_patching import FieldPatchEmbed, FieldUnpatch
 from neugk_jax.models.patching import (
+    FieldPatchEmbed,
+    FieldUnpatch,
     PatchEmbed,
     PatchExpand,
     PatchMerge,
@@ -26,7 +27,6 @@ from neugk_jax.models.patching import (
 )
 from neugk_jax.models.swin import BlockStack, swin_layer
 from neugk_jax.models.utils import Linear, gelu
-
 
 # patch embedding and unpatch classes per patching type
 PATCHINGS = {"linear": (PatchEmbed, PatchExpand), "field": (FieldPatchEmbed, FieldUnpatch)}

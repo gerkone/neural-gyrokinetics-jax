@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
-from neugk_jax.models.patching import _normalize_patch, fold_patches, unfold_patches
+from neugk_jax.models.patching.ops import _normalize_patch, fold_patches, unfold_patches
 from neugk_jax.models.utils import MLP, leaky_relu, silu
 
 FIELD_OPTIONS = {
@@ -45,7 +45,9 @@ FIELD_OPTIONS = {
 def field_options(options: Mapping) -> dict:
     unknown = set(options) - set(FIELD_OPTIONS)
     if unknown:
-        raise ValueError(f"unknown field patching options {sorted(unknown)}; one of {sorted(FIELD_OPTIONS)}")
+        raise ValueError(
+            f"unknown field patching options {sorted(unknown)}; one of {sorted(FIELD_OPTIONS)}"
+        )
     return {**FIELD_OPTIONS, **options}
 
 
@@ -83,7 +85,14 @@ class PointGrid(eqx.Module):
     reference: tuple[float, ...] = eqx.field(static=True)
     n_anchor: int = eqx.field(static=True)
 
-    def __init__(self, padded: Sequence[int], patch: Sequence[int], channels: int, spec: Optional[Mapping], anchors: Sequence[int]):
+    def __init__(
+        self,
+        padded: Sequence[int],
+        patch: Sequence[int],
+        channels: int,
+        spec: Optional[Mapping],
+        anchors: Sequence[int],
+    ):
         patch = _normalize_patch(patch)
         n = len(patch)
         spec = dict(spec or {})
@@ -121,22 +130,35 @@ class PointGrid(eqx.Module):
             pos = np.arange(tokens[j])[:, None] * patch[i] + offs[i][None]
             shape = [1] * len(tokens) + [len(anchor)]
             shape[j] = tokens[j]
-            coords.append(np.broadcast_to(_unit(full[pos], nodes).reshape(shape), (*tokens, len(anchor))))
+            coords.append(
+                np.broadcast_to(_unit(full[pos], nodes).reshape(shape), (*tokens, len(anchor)))
+            )
             weight = weight * w[pos].reshape(shape)
         for f, i in zip(folded, ifold):
             nodes = np.asarray(f["nodes"], np.float64)
             coords.append(np.broadcast_to(_unit(nodes, nodes)[i], (*tokens, len(anchor))))
             weight = weight * np.asarray(f.get("weights", np.ones_like(nodes)), np.float64)[i]
-        self.coords = jnp.asarray(np.stack(coords, -1) if coords else np.zeros((*tokens, len(anchor), 0)), jnp.float32)
+        self.coords = jnp.asarray(
+            np.stack(coords, -1) if coords else np.zeros((*tokens, len(anchor), 0)), jnp.float32
+        )
         self.weight = jnp.asarray(weight / weight[weight > 0].mean(), jnp.float32)
-        self.offsets = jnp.asarray(np.stack([offs[i] - centre[i] for i in rel], -1) if rel else np.zeros((len(anchor), 0)), jnp.float32)
+        self.offsets = jnp.asarray(
+            np.stack([offs[i] - centre[i] for i in rel], -1) if rel else np.zeros((len(anchor), 0)),
+            jnp.float32,
+        )
         self.channel = jnp.asarray(np.eye(n_c)[ic], jnp.float32)
         self.unit = jnp.asarray(np.stack(unit, -1), jnp.float32)
         self.half = tuple(_half(sub[i]) for i in rel)
-        self.caps = tuple(sub[i] for i in rel) + tuple(len(axes[i]["nodes"]) for i in self.abs_axes) + tuple(n_fold)
+        self.caps = (
+            tuple(sub[i] for i in rel)
+            + tuple(len(axes[i]["nodes"]) for i in self.abs_axes)
+            + tuple(n_fold)
+        )
         self.spacing = tuple(float(axes[i].get("spacing", 1.0)) for i in rel)
         # physical half-width of a full patch at the nominal spacing, unless given
-        self.reference = tuple(float(axes[i].get("reference", _half(patch[i]) * s)) for i, s in zip(rel, self.spacing))
+        self.reference = tuple(
+            float(axes[i].get("reference", _half(patch[i]) * s)) for i, s in zip(rel, self.spacing)
+        )
         perm = np.argsort(anchor, kind="stable")
         self.perm, self.inv = jnp.asarray(perm), jnp.asarray(np.argsort(perm))
         self.n_anchor = len(first)
@@ -149,7 +171,9 @@ class PointGrid(eqx.Module):
         """``(*T_abs, P, F)`` encoded coordinates, channel and log physical half-width of every point."""
         sp = jnp.asarray(self.spacing if geometry is None else geometry, jnp.float32)
         lead = self.coords.shape[:-1]
-        rel = jnp.broadcast_to(self.offsets / jnp.asarray(self.half, jnp.float32), (*lead, self.offsets.shape[-1]))
+        rel = jnp.broadcast_to(
+            self.offsets / jnp.asarray(self.half, jnp.float32), (*lead, self.offsets.shape[-1])
+        )
         x = jnp.concatenate([rel, self.coords], -1)
         if encoding == "fourier":
             z = x[..., None] * (jnp.pi * 2.0 ** jnp.arange(n_freq))
@@ -161,8 +185,17 @@ class PointGrid(eqx.Module):
             enc = [(jnp.cos(k * jnp.pi * (x[..., None] + 1) / 2) * cap).reshape(*lead, -1)]
         else:
             raise ValueError(f"encoding={encoding!r}; one of fourier, cosine")
-        scale = jnp.log(jnp.asarray(self.half, jnp.float32) * sp / jnp.asarray(self.reference, jnp.float32))
-        return jnp.concatenate([*enc, jnp.broadcast_to(self.channel, (*lead, self.channel.shape[-1])), jnp.broadcast_to(scale, (*lead, scale.shape[-1]))], -1)
+        scale = jnp.log(
+            jnp.asarray(self.half, jnp.float32) * sp / jnp.asarray(self.reference, jnp.float32)
+        )
+        return jnp.concatenate(
+            [
+                *enc,
+                jnp.broadcast_to(self.channel, (*lead, self.channel.shape[-1])),
+                jnp.broadcast_to(scale, (*lead, scale.shape[-1])),
+            ],
+            -1,
+        )
 
 
 def _n_features(grid: PointGrid, opts: Mapping) -> int:
@@ -208,7 +241,9 @@ class FieldPatchEmbed(eqx.Module):
         k_kernel, k_mix = jr.split(key)
         self.patch_size = _normalize_patch(patch_size)
         self.grid_size = tuple(s // p for s, p in zip(base_resolution, self.patch_size))
-        self.grid = PointGrid(base_resolution, self.patch_size, in_channels, grid, (1,) * len(self.patch_size))
+        self.grid = PointGrid(
+            base_resolution, self.patch_size, in_channels, grid, (1,) * len(self.patch_size)
+        )
         self.encoding = (opts["encoding"], opts["n_freq"], opts["modes"])
         dims = [_n_features(self.grid, opts)] + [opts["hidden"]] * opts["depth"] + [opts["rank"]]
         self.kernel = MLP(dims, key=k_kernel, act_fn=silu)
@@ -272,7 +307,11 @@ class FieldUnpatch(eqx.Module):
         if self.decoder not in ("deeponet", "hier"):
             raise ValueError(f"decoder={self.decoder!r}; one of deeponet, hier")
         hier = self.decoder == "hier"
-        anchors = tuple(opts["anchors"] or _default_anchors(self.expand_by)) if hier else (1,) * len(self.expand_by)
+        anchors = (
+            tuple(opts["anchors"] or _default_anchors(self.expand_by))
+            if hier
+            else (1,) * len(self.expand_by)
+        )
         self.code_modes = tuple(opts["code_modes"] or anchors)
         self.grid = PointGrid(self.target_grid_size, self.expand_by, out_channels, grid, anchors)
         self.encoding = (opts["encoding"], opts["n_freq"], opts["modes"])
@@ -281,7 +320,11 @@ class FieldUnpatch(eqx.Module):
         self.expansion = MLP([dim, opts["branch"], width], key=k_exp, act_fn=leaky_relu)
         if opts["zero_init"]:
             last = self.expansion.layers[-1].inner
-            self.expansion = eqx.tree_at(lambda m: (m.layers[-1].inner.weight, m.layers[-1].inner.bias), self.expansion, (jnp.zeros_like(last.weight), jnp.zeros_like(last.bias)))
+            self.expansion = eqx.tree_at(
+                lambda m: (m.layers[-1].inner.weight, m.layers[-1].inner.bias),
+                self.expansion,
+                (jnp.zeros_like(last.weight), jnp.zeros_like(last.bias)),
+            )
         dims = [_n_features(self.grid, opts)] + [opts["hidden"]] * opts["depth"] + [rank]
         self.basis = MLP(dims, key=k_basis, act_fn=silu)
         if cond_dim:
@@ -299,7 +342,9 @@ class FieldUnpatch(eqx.Module):
             phi = (phi[:, :, None] * basis[:, None, :]).reshape(self.grid.n_anchor, -1)
         return jnp.einsum("ak,...kr->...ar", phi, h)
 
-    def __call__(self, z: jnp.ndarray, cond: Optional[jnp.ndarray] = None, geometry=None) -> jnp.ndarray:
+    def __call__(
+        self, z: jnp.ndarray, cond: Optional[jnp.ndarray] = None, geometry=None
+    ) -> jnp.ndarray:
         if self.modulation is not None:
             z = self.modulation(z, cond)
         psi = self.basis(self.grid.features(geometry, *self.encoding))
@@ -307,7 +352,9 @@ class FieldUnpatch(eqx.Module):
         if self.decoder == "deeponet":
             out = jnp.einsum(f"{g}r,{a}pr->{g}p", self.expansion(z), psi) / psi.shape[-1]
         else:
-            psi = psi[..., self.grid.perm, :].reshape(*psi.shape[:-2], self.grid.n_anchor, -1, psi.shape[-1])
+            psi = psi[..., self.grid.perm, :].reshape(
+                *psi.shape[:-2], self.grid.n_anchor, -1, psi.shape[-1]
+            )
             out = jnp.einsum(f"{g}xr,{a}xqr->{g}xq", self.codes(z), psi) / psi.shape[-1]
             out = out.reshape(*out.shape[:-2], -1)[..., self.grid.inv]
         return unfold_patches(out, self.expand_by, out_channels=self.out_dim)
