@@ -23,6 +23,7 @@ from neugk_jax.models.patching import (
 from neugk_jax.models.patching.field import (
     AxisBases,
     ProductFilter,
+    SeparableBasis,
     tucker_project,
     tucker_selection,
     tucker_synthesize,
@@ -118,6 +119,8 @@ def test_generic_nd_swap(decoder):
         ("kernel", "tucker", "ipe"),
         ("kernel", "hier_field", "cosine"),
         ("smooth", "smooth", "cosine"),
+        ("separable", "separable", "cosine"),
+        ("painn", "painn", "cosine"),
     ],
 )
 def test_adiabatic_5d_grid(encoder, decoder, encoding):
@@ -132,6 +135,8 @@ def test_adiabatic_5d_grid(encoder, decoder, encoding):
         code_rank=8,
         branch=32,
         axis_hidden=8,
+        painn_features=8,
+        n_rbf=6,
         grid=grid_5d(),
         **local,
     )
@@ -149,7 +154,9 @@ def test_adiabatic_5d_grid(encoder, decoder, encoding):
     grads = eqx.filter_grad(loss)(ae)
     leaves = [g for g in jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))]
     assert all(bool(jnp.isfinite(g).all()) for g in leaves)
-    assert float(jnp.abs(grads.backbone.unpatch.expansion.layers[-1].weight).max()) > 0
+    unpatch = grads.backbone.unpatch
+    last = unpatch.basis.readout if decoder == "painn" else unpatch.expansion.layers[-1]
+    assert float(jnp.abs(last.weight).max()) > 0
 
 
 def test_cell_centred_coordinates_keep_physical_positions():
@@ -355,3 +362,16 @@ def test_product_filter_splits_configuration_and_velocity_space(encoding):
     assert n == embed.grid.features(None, *embed.encoding).shape[-1] + 3
     x = jr.normal(jr.PRNGKey(1), (2, *BASE))
     assert ae(x)["df"].shape == x.shape
+
+
+def test_separable_cosine_trunks_and_painn_geometry():
+    from neugk_jax.models.patching.painn import cosine_cutoff, sinc_rbf
+
+    spec = {"axes": [{"kind": "relative"}] * 3}
+    grid = PointGrid((4, 6, 8), (2, 3, 4), 2, spec)
+    sep = SeparableBasis(
+        grid, 12, key=jr.PRNGKey(0), basis="cosine", hidden=8, encoding=("cosine", 5, 16)
+    )
+    assert sep(grid).shape == (2 * 3 * 4 * 2, 12)
+    d = jnp.linspace(0.0, 1.8, 5)
+    assert bool(jnp.isfinite(sinc_rbf(d, 6, 2.2)).all()) and float(cosine_cutoff(d, 2.2).min()) > 0

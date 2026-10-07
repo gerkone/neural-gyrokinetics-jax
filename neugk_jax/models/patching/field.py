@@ -27,11 +27,12 @@ import numpy as np
 
 from neugk_jax.models.base import GridDecoderBase, GridEncoderBase
 from neugk_jax.models.ops import _normalize_patch, fold_patches, unfold_patches
-from neugk_jax.models.patching.points import PointGrid, n_encoded
+from neugk_jax.models.patching.painn import PaiNNDecoder, PaiNNEncoder, token_width
+from neugk_jax.models.patching.points import PointGrid, encoded_index, n_encoded
 from neugk_jax.models.utils import MLP, Linear, leaky_relu, silu
 
-ENCODERS = ("kernel", "smooth", "tucker")
-DECODERS = ("deeponet", "hier", "smooth", "tucker")
+ENCODERS = ("kernel", "smooth", "tucker", "separable", "painn")
+DECODERS = ("deeponet", "hier", "smooth", "tucker", "separable", "painn")
 MODULATIONS = ("cosine", "legendre", "bernstein")
 
 FIELD_OPTIONS = {
@@ -66,6 +67,9 @@ FIELD_OPTIONS = {
     "axis_hidden": 64,
     # length of a per-call descriptor (e.g. of the species) fed to the filter mlps as conditioning, 0: none
     "cond_features": 0,
+    # painn: feature width of the interaction, number of sinc radial basis functions
+    "painn_features": 64,
+    "n_rbf": 20,
     "zero_init": True,
 }
 
@@ -171,16 +175,6 @@ def cosine_basis(pos: jnp.ndarray, modes: Sequence[int], kind: str = "cosine") -
     return phi
 
 
-def _encoded_index(
-    ids: Sequence[int], n_coords: int, encoding: str, n_freq: int, modes: int
-) -> list[int]:
-    # positions of the encodings of the coordinates ids in the PointGrid.features layout
-    if encoding == "fourier":
-        sin = [n_coords + c * n_freq + f for c in ids for f in range(n_freq)]
-        return [*ids, *sin, *(i + n_coords * n_freq for i in sin)]
-    return [c * modes + m for c in ids for m in range(modes)]
-
-
 class ProductFilter(eqx.Module):
     """Hadamard product of a configuration-space filter (relative offsets, block scale) and a
     velocity-space filter (absolute and folded coordinates, channel, conditioning)."""
@@ -195,12 +189,12 @@ class ProductFilter(eqx.Module):
         enc = (opts["encoding"], opts["n_freq"], opts["modes"])
         e = n_encoded(n, *enc)
         n_c = grid.n_channels
-        self.space_index = tuple(_encoded_index(range(n_rel), n, *enc)) + tuple(
+        self.space_index = tuple(encoded_index(range(n_rel), n, *enc)) + tuple(
             range(e + n_c, e + n_c + n_rel)
         )
         cond = range(e + n_c + n_rel, e + n_c + n_rel + opts["cond_features"])
         self.velocity_index = (
-            tuple(_encoded_index(range(n_rel, n), n, *enc)) + tuple(range(e, e + n_c)) + tuple(cond)
+            tuple(encoded_index(range(n_rel, n), n, *enc)) + tuple(range(e, e + n_c)) + tuple(cond)
         )
         hidden = [opts["hidden"]] * opts["depth"]
         k1, k2 = jr.split(key)
@@ -333,6 +327,66 @@ def _tucker_ranks(grid: PointGrid, ranks) -> tuple[int, ...]:
     return tuple(ranks) if ranks is not None else (*grid.patch, *grid.n_fold)
 
 
+class SeparableBasis(eqx.Module):
+    """Rank-K separable functions over the patch points, ``W[p, k] = prod_i t_i^k(p_i)`` (Separable DeepONet).
+
+    The axis trunks are learned 1D filter MLPs of rank K, or with ``basis='cosine'`` the fixed
+    cosines of the relative axes followed by a learned ``(r_i, K)`` map; the channel has a learned
+    ``(n_c, K)`` factor.
+    """
+
+    axes: AxisBases
+    maps: tuple
+    channel: jnp.ndarray
+    rank: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        grid: PointGrid,
+        rank: int,
+        *,
+        key,
+        basis: str,
+        hidden: int,
+        encoding: tuple,
+        n_cond: int = 0,
+    ):
+        ranks = [
+            ax.cap if basis == "cosine" and ax.kind == "relative" else rank for ax in grid.axes
+        ]
+        k_axes, k_maps, k_c = jr.split(key, 3)
+        self.axes = AxisBases(
+            grid, ranks, key=k_axes, basis=basis, hidden=hidden, encoding=encoding, n_cond=n_cond
+        )
+        keys = jr.split(k_maps, len(ranks))
+        self.maps = tuple(
+            jr.normal(k, (r, rank)) / math.sqrt(r)
+            if basis == "cosine" and ax.kind == "relative"
+            else None
+            for ax, r, k in zip(grid.axes, ranks, keys)
+        )
+        self.channel = jnp.ones((grid.n_channels, rank)) + 0.1 * jr.normal(
+            k_c, (grid.n_channels, rank)
+        )
+        self.rank = rank
+
+    def __call__(self, grid: PointGrid, geometry=None, cond=None) -> jnp.ndarray:
+        """``(*T_abs, P, K)`` in ``fold_patches`` point order."""
+        factors = [
+            b if m is None else b @ m for b, m in zip(self.axes(grid, geometry, cond), self.maps)
+        ]
+        n, m = len(grid.patch), len(grid.n_fold)
+        t, pts = "ABCDEFGH"[:n], "abcdefgh"[:n]
+        fold = "qstu"[:m]
+        subs = [(t[i] if i in grid.abs_axes else "") + pts[i] + "k" for i in range(n)]
+        subs += ["zk"] + [f + "k" for f in fold]
+        lead = "".join(t[i] for i in grid.abs_axes)
+        w = jnp.einsum(
+            ",".join(subs) + f"->{lead}{pts}z{fold}k", *factors[:n], self.channel, *factors[n:]
+        )
+        return w.reshape(*w.shape[: len(grid.abs_axes)], -1, self.rank)
+
+
 class _Field(eqx.Module):
     grid: PointGrid
 
@@ -396,7 +450,21 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
             else ()
         )
         self.keep = None
-        if self.encoder in ("kernel", "smooth"):
+        if self.encoder == "painn":
+            self.filters = PaiNNEncoder(self.grid, opts, key=k_kernel)
+            width = opts["painn_features"]
+        elif self.encoder == "separable":
+            self.filters = SeparableBasis(
+                self.grid,
+                opts["rank"],
+                key=k_kernel,
+                basis=opts["axis_basis"],
+                hidden=opts["axis_hidden"],
+                encoding=self.encoding,
+                n_cond=self.n_cond,
+            )
+            width = opts["rank"]
+        elif self.encoder in ("kernel", "smooth"):
             self.filters = _point_filter(self.grid, opts, opts["rank"], key=k_kernel)
             width = opts["rank"] * max(1, math.prod(self.code_modes))
         else:
@@ -423,6 +491,15 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
         if self.encoder == "tucker":
             core = tucker_project(p, self.grid, self.filters(self.grid, geometry, point_cond))
             return self.mix(core if self.keep is None else core[..., self.keep])
+        if self.encoder == "painn":
+            feats = _with_cond(
+                self.grid.features(geometry, *self.encoding), point_cond, self.n_cond
+            )
+            return self.mix(self.filters(p, self.grid, feats))
+        if self.encoder == "separable":
+            w = self.filters(self.grid, geometry, point_cond) * self.grid.weight[..., None]
+            g, a = _letters(len(self.grid.patch), self.grid.abs_axes)
+            return self.mix(jnp.einsum(f"{g}p,{a}pk->{g}k", p, w) / p.shape[-1])
         w = (
             self.filters(
                 _with_cond(self.grid.features(geometry, *self.encoding), point_cond, self.n_cond)
@@ -505,7 +582,21 @@ class FieldUnpatch(_Field, GridDecoderBase):
         self.ranks = ()
         self.local = None
         self.keep = None
-        if self.decoder == "tucker":
+        if self.decoder == "painn":
+            self.basis = PaiNNDecoder(self.grid, opts, key=k_basis)
+            width = token_width(self.grid, opts)
+        elif self.decoder == "separable":
+            self.basis = SeparableBasis(
+                self.grid,
+                opts["rank"],
+                key=k_basis,
+                basis=opts["axis_basis"],
+                hidden=opts["axis_hidden"],
+                encoding=self.encoding,
+                n_cond=self.n_cond,
+            )
+            width = opts["rank"]
+        elif self.decoder == "tucker":
             self.ranks = _tucker_ranks(self.grid, opts["ranks"])
             self.basis = AxisBases(
                 self.grid,
@@ -535,7 +626,8 @@ class FieldUnpatch(_Field, GridDecoderBase):
             width = rank * max(1, math.prod(self.code_modes))
             self.basis = _point_filter(self.grid, opts, basis_out, key=k_basis)
         self.expansion = MLP([dim, opts["branch"], width], key=k_exp, act_fn=leaky_relu)
-        if opts["zero_init"]:
+        # painn zero-initializes its own readout instead
+        if opts["zero_init"] and self.decoder != "painn":
             self.expansion = _zero_last(self.expansion)
         if cond_dim:
             from neugk_jax.models.swin import Film
@@ -590,6 +682,15 @@ class FieldUnpatch(_Field, GridDecoderBase):
                 full = (*core.shape[:-1], math.prod(self.ranks) * grid.n_channels)
                 core = jnp.zeros(full, core.dtype).at[..., self.keep].set(core)
             out = tucker_synthesize(core, grid, self.basis(grid, geometry, point_cond), self.ranks)
+            return unfold_patches(out, grid.patch, out_channels=channels)
+        if self.decoder == "painn":
+            feats = _with_cond(grid.features(geometry, *self.encoding), point_cond, self.n_cond)
+            out = self.basis(self.expansion(z), grid, feats)
+            return unfold_patches(out, grid.patch, out_channels=channels)
+        if self.decoder == "separable":
+            w = self.basis(grid, geometry, point_cond)
+            g, a = _letters(len(grid.patch), grid.abs_axes)
+            out = jnp.einsum(f"{g}k,{a}pk->{g}p", self.expansion(z), w) / w.shape[-1]
             return unfold_patches(out, grid.patch, out_channels=channels)
         psi = self.basis(
             _with_cond(grid.features(geometry, *self.encoding), point_cond, self.n_cond)

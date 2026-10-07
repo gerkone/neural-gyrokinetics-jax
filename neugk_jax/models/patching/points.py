@@ -257,6 +257,16 @@ class PointGrid(eqx.Module):
         return jnp.concatenate([enc, jnp.broadcast_to(scale, (*enc.shape[:-1], 1))], -1)
 
 
+def encoded_index(
+    ids: Sequence[int], n_coords: int, encoding: str, n_freq: int, modes: int
+) -> list[int]:
+    """Positions of the encodings of the coordinates ``ids`` in the :meth:`PointGrid.features` layout."""
+    if encoding == "fourier":
+        sin = [n_coords + c * n_freq + f for c in ids for f in range(n_freq)]
+        return [*ids, *sin, *(i + n_coords * n_freq for i in sin)]
+    return [c * modes + m for c in ids for m in range(modes)]
+
+
 def n_encoded(n_coords: int, encoding: str, n_freq: int, modes: int) -> int:
     return n_coords * (1 + 2 * n_freq if encoding == "fourier" else modes)
 
