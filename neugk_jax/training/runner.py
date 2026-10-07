@@ -327,8 +327,14 @@ class BaseRunner:
         if not ckpt.exists():
             return
         state = load_checkpoint(ckpt, self.model)
+        opt_state = state.opt_state
+        fresh = jax.tree_util.tree_structure(self.opt_state)
+        leaves = jax.tree_util.tree_leaves(opt_state)
+        if fresh.num_leaves == len(leaves):
+            # saved static metadata may differ from the current modules; the leaves line up
+            opt_state = jax.tree_util.tree_unflatten(fresh, leaves)
         self.model = replicate(self.dist, state.model)
-        self.opt_state = replicate(self.dist, state.opt_state)
+        self.opt_state = replicate(self.dist, opt_state)
         self.start_epoch = state.epoch
         self.best_val = float((state.meta or {}).get("best_val", math.inf))
         if self.dist.is_rank0:
