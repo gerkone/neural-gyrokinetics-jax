@@ -87,6 +87,7 @@ class Swin5DAE(eqx.Module):
         cond_embed_dim: int = 32,
         merge_mask: Optional[Sequence[bool]] = None,
         readout_mult: float = 1.0,
+        attention: str = "einsum",
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -140,6 +141,7 @@ class Swin5DAE(eqx.Module):
             dec_cond_dim=dec_cdim,
             merge_mask=merge_mask,
             readout_mult=readout_mult,
+            attention=attention,
             # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
             build_middle=False,
@@ -164,6 +166,7 @@ class Swin5DAE(eqx.Module):
             gated_attention=gated_attention,
             norm_affine=True,
             rms_norm=rms_norm,
+            attention=attention,
         )
         self.middle_pre = vit_layer(
             mid_dim, bottleneck_depth, bottleneck_num_heads, key=k1, cond_dim=enc_cdim, **vit_kw

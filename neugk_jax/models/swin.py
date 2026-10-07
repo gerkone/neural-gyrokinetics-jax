@@ -146,6 +146,7 @@ class SwinBlock(eqx.Module):
         qk_norm: bool = False,
         use_rpb: bool = False,
         gated_attention: bool = False,
+        attention: str = "einsum",
         norm_affine: bool = False,
         rms_norm: bool = False,
     ):
@@ -164,6 +165,7 @@ class SwinBlock(eqx.Module):
             use_rpb=use_rpb,
             gated_attention=gated_attention,
             window_size=eff_w,
+            attention=attention,
         )
         self.mlp = MLP([dim, max(int(dim * mlp_ratio), dim), dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
@@ -211,6 +213,7 @@ class DiTSwinBlock(eqx.Module):
         qk_norm: bool = False,
         use_rpb: bool = False,
         gated_attention: bool = False,
+        attention: str = "einsum",
         rms_norm: bool = False,
     ):
         eff_w = _effective_window(grid_size, window_size)
@@ -229,6 +232,7 @@ class DiTSwinBlock(eqx.Module):
             use_rpb=use_rpb,
             gated_attention=gated_attention,
             window_size=eff_w,
+            attention=attention,
         )
         self.mlp = MLP([dim, max(int(dim * mlp_ratio), dim), dim], key=kmlp, act_fn=act_fn)
         self.drop_path = _DropPath(drop_path)
@@ -354,6 +358,7 @@ def swin_layer(
     norm_affine: bool = False,
     rms_norm: bool = False,
     legacy_double_shortcut: bool = False,
+    attention: str = "einsum",
 ) -> BlockStack:
     """``depth`` Swin blocks alternating non-shifted / shifted windows."""
     common = dict(
@@ -365,6 +370,7 @@ def swin_layer(
         use_rpb=use_rpb,
         gated_attention=gated_attention,
         rms_norm=rms_norm,
+        attention=attention,
     )
 
     def plain(i, k):

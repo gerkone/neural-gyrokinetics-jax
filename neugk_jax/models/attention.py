@@ -23,6 +23,16 @@ def einsum_attention(q, k, v, scale, bias=None, attn_drop=0.0, key=None, inferen
     return jnp.einsum("...hnm,...mhd->...nhd", attn, v)
 
 
+def fused_attention(q, k, v, scale, bias=None):
+    """:func:`einsum_attention` as the cuDNN fused kernel: q / k / v / bias in bf16, the output in q's dtype."""
+    dt = jnp.bfloat16
+    b = None if bias is None else jnp.broadcast_to(bias, (q.shape[-2], q.shape[-3], k.shape[-3])).astype(dt)[None]
+    out = jax.nn.dot_product_attention(
+        q[None].astype(dt), k[None].astype(dt), v[None].astype(dt), bias=b, scale=scale, implementation="cudnn"
+    )
+    return out[0].astype(q.dtype)
+
+
 class MultiHeadSelfAttention(eqx.Module):
     """Multi-head self-attention with optional extras.
 
@@ -48,6 +58,7 @@ class MultiHeadSelfAttention(eqx.Module):
     scale: float = eqx.field(static=True)
     attn_drop: float = eqx.field(static=True)
     proj_drop: float = eqx.field(static=True)
+    attention: str = eqx.field(static=True)
 
     def __init__(
         self,
@@ -55,6 +66,7 @@ class MultiHeadSelfAttention(eqx.Module):
         num_heads: int,
         *,
         key,
+        attention: str = "einsum",
         qkv_bias: bool = True,
         qk_norm: bool = False,
         use_rpb: bool = False,
@@ -80,6 +92,9 @@ class MultiHeadSelfAttention(eqx.Module):
         self.gate = Gate(self.head_dim, key=kgate) if gated_attention else None
         self.attn_drop = attn_drop
         self.proj_drop = proj_drop
+        if attention not in ("einsum", "cudnn"):
+            raise ValueError(f"attention={attention!r}; one of einsum, cudnn")
+        self.attention = attention
 
     def __call__(
         self,
@@ -102,7 +117,10 @@ class MultiHeadSelfAttention(eqx.Module):
             rpb_bias = self.rpb()  # shape: (heads, sl, sl)
             attn_bias = rpb_bias if attn_bias is None else attn_bias + rpb_bias
         ka, kp = split_key(key, 2)
-        out = einsum_attention(q, k, v, self.scale, attn_bias, self.attn_drop, ka, inference)
+        if self.attention == "cudnn" and (inference or not self.attn_drop):
+            out = fused_attention(q, k, v, self.scale, attn_bias)
+        else:
+            out = einsum_attention(q, k, v, self.scale, attn_bias, self.attn_drop, ka, inference)
         # out: (n, H, D); apply optional headwise gate before flattening to (n, dim)
         if self.gate is not None:
             out = self.gate(out, q)

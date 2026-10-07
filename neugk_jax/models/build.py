@@ -68,6 +68,7 @@ _AE_VIT_KEYS = {
     "gated_attention",
     "modulation",
     "gradient_checkpoint",
+    "attention",
 }
 _AE_PATCH_KEYS = {
     "patch_size",
@@ -209,6 +210,7 @@ def build_ae_from_config(
         encoder_conditioning=enc_cond,
         decoder_conditioning=dec_cond,
         readout_mult=readout_mult,
+        attention=vit.get("attention", "einsum"),
         key=key,
     )
     model = init_linears(model, mcfg.get("init_weights"), key=jax.random.fold_in(key, 1))

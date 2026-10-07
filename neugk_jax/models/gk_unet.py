@@ -203,6 +203,7 @@ class SwinNDUnet(eqx.Module):
         conv_patch: bool = False,
         unpatch_patch_skip: bool = False,
         readout_mult: float = 1.0,
+        attention: str = "einsum",
         key,
     ):
         patch_size = _as_seq(patch_size, space)
@@ -250,6 +251,7 @@ class SwinNDUnet(eqx.Module):
             legacy_double_shortcut=legacy_double_shortcut,
             cond_dim=cond_dim,
             cond_mode=cond_mode,
+            attention=attention,
         )
 
         grid_sizes = [tuple(s // p for s, p in zip(padded_base, _normalize_patch(patch_size)))]
