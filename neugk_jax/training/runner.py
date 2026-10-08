@@ -448,6 +448,9 @@ class BaseRunner:
                 t_train = time.perf_counter() - t0
                 validating = epoch % val_every == 0 or epoch == 1 or epoch == n_epochs
                 val_logs, val_plots = {}, {}
+                if validating and (epoch % save_every == 0 or epoch == n_epochs):
+                    # checkpoint the epoch before validating
+                    self.save_checkpoint(epoch, last_val, "ckp.eqx")
                 if validating:
                     t0 = time.perf_counter()
                     val_logs, val_plots = self.evaluate(epoch)
