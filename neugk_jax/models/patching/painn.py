@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from neugk_jax.models.patching.points import PointGrid, encoded_index, n_encoded
+from neugk_jax.models.patching.points import PointGrid, encoded_index
 from neugk_jax.models.utils import MLP, Linear, silu
 
 
@@ -62,27 +62,26 @@ class _Geometry(eqx.Module):
     n_rbf: int = eqx.field(static=True)
     cutoff: float = eqx.field(static=True)
     species_index: tuple[int, ...] = eqx.field(static=True)
-    encoding: tuple = eqx.field(static=True)
 
     def __init__(
         self,
         grid: PointGrid,
         features: int,
         n_rbf: int,
-        encoding: tuple,
+        modes: int,
         n_cond: int,
         value_in: bool,
         *,
         key,
     ):
         n_rel, n = len(grid.rel_axes), grid.n_coords
-        e = n_encoded(n, *encoding)
+        e = n * modes
         n_c = grid.n_channels
-        # species: encoded absolute / folded coordinates, channel, block scale, conditioning
-        self.species_index = tuple(encoded_index(range(n_rel, n), n, *encoding)) + tuple(
+        # species: encoded absolute / folded coordinates, channel, patch scale, conditioning
+        self.species_index = tuple(encoded_index(range(n_rel, n), modes)) + tuple(
             range(e, e + n_c + n_rel + n_cond)
         )
-        self.features, self.n_rbf, self.encoding = features, n_rbf, encoding
+        self.features, self.n_rbf = features, n_rbf
         self.cutoff = math.sqrt(max(n_rel, 1)) + 0.5
         k1, k2 = jr.split(key)
         self.filter_net = Linear(n_rbf, 3 * features, key=k1)
@@ -134,8 +133,9 @@ class PaiNNEncoder(eqx.Module):
     def __init__(self, grid: PointGrid, opts, *, key):
         f = opts["painn_features"]
         k1, k2, k3 = jr.split(key, 3)
-        enc = (opts["encoding"], opts["n_freq"], opts["modes"])
-        self.geometry = _Geometry(grid, f, opts["n_rbf"], enc, opts["cond_features"], True, key=k1)
+        self.geometry = _Geometry(
+            grid, f, opts["n_rbf"], opts["modes"], opts["cond_features"], True, key=k1
+        )
         self.context = MLP([f, f, 3 * f], key=k2, act_fn=silu)
         self.mixing = PaiNNMixing(f, key=k3)
         self.chunk = opts["painn_chunk"]
@@ -194,8 +194,9 @@ class PaiNNDecoder(eqx.Module):
     def __init__(self, grid: PointGrid, opts, *, key):
         f = opts["painn_point_features"]
         k1, k2, k3, k4 = jr.split(key, 4)
-        enc = (opts["encoding"], opts["n_freq"], opts["modes"])
-        self.geometry = _Geometry(grid, f, opts["n_rbf"], enc, opts["cond_features"], False, key=k1)
+        self.geometry = _Geometry(
+            grid, f, opts["n_rbf"], opts["modes"], opts["cond_features"], False, key=k1
+        )
         self.context = MLP([f, f, 3 * f], key=k2, act_fn=silu)
         self.mixing = PaiNNMixing(f, key=k3)
         self.chunk = opts["painn_chunk"]

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -24,10 +22,8 @@ from neugk_jax.models.patching import (
 )
 from neugk_jax.models.patching.field import (
     AxisBases,
-    ProductFilter,
     SeparableBasis,
     tucker_project,
-    tucker_selection,
     tucker_synthesize,
 )
 from neugk_jax.pinc import Swin5DAE
@@ -95,12 +91,10 @@ def test_linear_is_the_default():
     assert type(model.patch_embed) is PatchEmbed and type(model.unpatch) is LinearUnpatch
 
 
-@pytest.mark.parametrize("decoder", ["deeponet", "hier"])
+@pytest.mark.parametrize("decoder", ["smooth", "tucker"])
 def test_generic_nd_swap(decoder):
-    linear, field = (
-        unet("linear"),
-        unet("field", decoder=decoder, rank=16, hidden=16, code_rank=8, branch=32),
-    )
+    linear = unet("linear")
+    field = unet("field", encoder=decoder, decoder=decoder, rank=16, hidden=16, code_rank=8)
     assert isinstance(field.patch_embed, FieldPatchEmbed) and isinstance(
         field.unpatch, FieldUnpatch
     )
@@ -110,38 +104,19 @@ def test_generic_nd_swap(decoder):
     assert field.patch_decode(z).shape == x.shape
 
 
-@pytest.mark.parametrize(
-    "encoder,decoder,encoding",
-    [
-        ("kernel", "deeponet", "fourier"),
-        ("kernel", "hier", "fourier"),
-        ("kernel", "hier", "cosine"),
-        ("kernel", "smooth", "ipe"),
-        ("tucker", "tucker", "cosine"),
-        ("kernel", "tucker", "ipe"),
-        ("kernel", "hier_field", "cosine"),
-        ("smooth", "smooth", "cosine"),
-        ("separable", "separable", "cosine"),
-        ("painn", "painn", "cosine"),
-    ],
-)
-def test_adiabatic_5d_grid(encoder, decoder, encoding):
-    local = {"local": "field", "local_width": 8} if decoder == "hier_field" else {}
-    decoder = decoder.split("_")[0]
+@pytest.mark.parametrize("kind", ["smooth", "tucker", "separable", "painn"])
+def test_adiabatic_5d_grid(kind):
     opts = dict(
-        encoder=encoder,
-        decoder=decoder,
-        encoding=encoding,
+        encoder=kind,
+        decoder=kind,
         rank=16,
         hidden=16,
         code_rank=8,
-        branch=32,
         axis_hidden=8,
         painn_features=8,
         painn_point_features=8,
         n_rbf=6,
         grid=grid_5d(),
-        **local,
     )
     ae = small_ae(patching="field", patching_kwargs=opts)
     x = jr.normal(jr.PRNGKey(1), (2, *BASE))
@@ -158,8 +133,23 @@ def test_adiabatic_5d_grid(encoder, decoder, encoding):
     leaves = [g for g in jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))]
     assert all(bool(jnp.isfinite(g).all()) for g in leaves)
     unpatch = grads.backbone.unpatch
-    last = unpatch.basis.readout if decoder == "painn" else unpatch.expansion.layers[-1]
+    last = unpatch.basis.readout if kind == "painn" else unpatch.expansion.layers[-1]
     assert float(jnp.abs(last.weight).max()) > 0
+
+
+@pytest.mark.parametrize("kind", ["smooth", "tucker", "separable"])
+def test_default_heads_are_linear_in_the_data(kind):
+    opts = dict(encoder=kind, decoder=kind, rank=8, hidden=8, code_rank=4, axis_hidden=8)
+    embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), **opts)
+    unpatch = FieldUnpatch(
+        8, (2, 2), key=jr.PRNGKey(1), expand_by=(2, 5), out_channels=3, zero_init=False, **opts
+    )
+    assert len(embed.mix.layers) == 1 and len(unpatch.expansion.layers) == 1
+    x, y = jr.normal(jr.PRNGKey(2), (2, 4, 10, 3))
+    with jax.default_matmul_precision("highest"):
+        np.testing.assert_allclose(embed(2 * x - y), 2 * embed(x) - embed(y), atol=1e-4)
+        z = embed(x)
+        np.testing.assert_allclose(unpatch(3 * z), 3 * unpatch(z), atol=1e-4)
 
 
 def test_cell_centred_coordinates_keep_physical_positions():
@@ -177,9 +167,7 @@ def test_tucker_cosine_full_rank_is_exact():
     spec = {"axes": [{"kind": "relative"}] * 3}
     grid = PointGrid((6, 4, 10), (3, 2, 5), 2, spec)
     ranks = grid.patch
-    bases = AxisBases(
-        grid, ranks, key=jr.PRNGKey(0), basis="cosine", hidden=8, encoding=("cosine", 5, 16)
-    )(grid)
+    bases = AxisBases(grid, ranks, key=jr.PRNGKey(0), basis="cosine", hidden=8, modes=16)(grid)
     p = fold_patches(jr.normal(jr.PRNGKey(1), (6, 4, 10, 2)), grid.patch)
     with jax.default_matmul_precision("highest"):
         back = tucker_synthesize(tucker_project(p, grid, bases), grid, bases, ranks)
@@ -201,7 +189,6 @@ def test_one_set_of_weights_on_two_resolutions(decoder):
         rank=8,
         hidden=8,
         code_rank=4,
-        branch=16,
         ranks=[2, 10],
         axis_hidden=8,
         code_modes=[1, 2],
@@ -234,7 +221,7 @@ def test_build_from_config():
         unmerging_hidden_ratio=2.0,
         c_multiplier=2,
         type="field",
-        field={"rank": 16, "hidden": 16, "code_rank": 8, "branch": 32},
+        field={"rank": 16, "hidden": 16, "code_rank": 8},
         grid=grid_5d(),
     )
     cfg = {
@@ -257,15 +244,14 @@ def test_unknown_option_raises():
         field_options({"rnk": 4})
 
 
-@pytest.mark.parametrize("encoder,decoder", [("kernel", "hier"), ("tucker", "tucker")])
-def test_point_conditioning_enters_the_filters(encoder, decoder):
+@pytest.mark.parametrize("kind", ["smooth", "tucker"])
+def test_point_conditioning_enters_the_filters(kind):
     opts = dict(
-        encoder=encoder,
-        decoder=decoder,
+        encoder=kind,
+        decoder=kind,
         rank=8,
         hidden=8,
         code_rank=4,
-        branch=16,
         axis_hidden=8,
         cond_features=3,
         zero_init=False,
@@ -287,84 +273,10 @@ def test_band_limit_keeps_the_trained_modes_on_a_finer_grid():
     spec = {"axes": [{"kind": "relative", "band": 5}]}
     fine = PointGrid((10,), (10,), 1, spec)
     assert fine.axes[0].cap == 5 and fine.caps[0] == 5
-    bases = AxisBases(
-        fine, (10,), key=jr.PRNGKey(0), basis="cosine", hidden=8, encoding=("cosine", 5, 16)
-    )(fine)
+    bases = AxisBases(fine, (10,), key=jr.PRNGKey(0), basis="cosine", hidden=8, modes=16)(fine)
     assert (
         float(jnp.abs(bases[0][:, 5:]).max()) == 0.0 and float(jnp.abs(bases[0][:, :5]).max()) > 0
     )
-
-
-@pytest.mark.parametrize("modulation", ["cosine", "legendre", "bernstein"])
-def test_smooth_modulation_bases(modulation):
-    opts = dict(
-        encoder="smooth",
-        decoder="smooth",
-        rank=8,
-        hidden=8,
-        code_rank=4,
-        branch=16,
-        modulation=modulation,
-        zero_init=False,
-    )
-    embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), **opts)
-    unpatch = FieldUnpatch(8, (2, 2), key=jr.PRNGKey(1), expand_by=(2, 5), out_channels=3, **opts)
-    x = jr.normal(jr.PRNGKey(2), (4, 10, 3))
-    assert unpatch(embed(x)).shape == x.shape
-
-
-def test_bernstein_modulation_is_a_partition_of_unity():
-    from neugk_jax.models.patching.field import cosine_basis
-
-    pos = jnp.linspace(-0.9, 0.9, 7)[:, None]
-    np.testing.assert_allclose(cosine_basis(pos, (3,), "bernstein").sum(-1), 1.0, atol=1e-6)
-
-
-def test_total_degree_cut_keeps_the_low_cosine_tuples():
-    spec = {"axes": [{"kind": "relative"}] * 2}
-    grid = PointGrid((4, 8), (4, 8), 2, spec)
-    keep = np.asarray(tucker_selection(grid, (4, 8), 1.0))
-    i, j, c = np.unravel_index(keep, (4, 8, 2))
-    assert np.all(i / 4 + j / 8 <= 1.0) and keep.size < 4 * 8 * 2
-    opts = dict(
-        encoder="tucker",
-        decoder="tucker",
-        axis_basis="cosine",
-        degree=1.0,
-        branch=16,
-        zero_init=False,
-    )
-    embed = FieldPatchEmbed((4, 8), (4, 8), 2, 8, key=jr.PRNGKey(0), grid=spec, **opts)
-    unpatch = FieldUnpatch(
-        8, (1, 1), key=jr.PRNGKey(1), expand_by=(4, 8), out_channels=2, grid=spec, **opts
-    )
-    assert embed.mix.layers[0].inner.weight.shape[1] == keep.size
-    x = jr.normal(jr.PRNGKey(2), (4, 8, 2))
-    assert unpatch(embed(x)).shape == x.shape
-
-
-@pytest.mark.parametrize("encoding", ["cosine", "fourier"])
-def test_product_filter_splits_configuration_and_velocity_space(encoding):
-    opts = dict(
-        encoder="smooth",
-        decoder="smooth",
-        encoding=encoding,
-        filter="product",
-        rank=8,
-        hidden=8,
-        code_rank=4,
-        branch=16,
-        cond_features=3,
-        grid=grid_5d(),
-        zero_init=False,
-    )
-    ae = small_ae(patching="field", patching_kwargs=opts)
-    embed = ae.backbone.patch_embed
-    assert isinstance(embed.filters, ProductFilter)
-    n = len(embed.filters.space_index) + len(embed.filters.velocity_index)
-    assert n == embed.grid.features(None, *embed.encoding).shape[-1] + 3
-    x = jr.normal(jr.PRNGKey(1), (2, *BASE))
-    assert ae(x)["df"].shape == x.shape
 
 
 def test_separable_cosine_trunks_and_painn_geometry():
@@ -372,9 +284,7 @@ def test_separable_cosine_trunks_and_painn_geometry():
 
     spec = {"axes": [{"kind": "relative"}] * 3}
     grid = PointGrid((4, 6, 8), (2, 3, 4), 2, spec)
-    sep = SeparableBasis(
-        grid, 12, key=jr.PRNGKey(0), basis="cosine", hidden=8, encoding=("cosine", 5, 16)
-    )
+    sep = SeparableBasis(grid, 12, key=jr.PRNGKey(0), basis="cosine", hidden=8, modes=16)
     assert sep(grid).shape == (2 * 3 * 4 * 2, 12)
     d = jnp.linspace(0.0, 1.8, 5)
     assert bool(jnp.isfinite(sinc_rbf(d, 6, 2.2)).all()) and float(cosine_cutoff(d, 2.2).min()) > 0
@@ -384,11 +294,11 @@ def test_painn_encoder_contraction_matches_the_per_point_messages():
     from neugk_jax.models.patching.field import field_options
     from neugk_jax.models.patching.painn import PaiNNEncoder
 
-    opts = field_options(dict(encoding="cosine", painn_features=8, n_rbf=6, painn_chunk=3))
+    opts = field_options(dict(painn_features=8, n_rbf=6, painn_chunk=3))
     grid = PointGrid((4, 6, 8), (2, 3, 4), 2, {"axes": [{"kind": "relative"}] * 3})
     enc = PaiNNEncoder(grid, opts, key=jr.PRNGKey(0))
     enc = eqx.tree_at(lambda m: m.q0, enc, jr.normal(jr.PRNGKey(3), (8,)))
-    feats = grid.features(None, "cosine", 5, 16)
+    feats = grid.features(None, 16)
     p = fold_patches(jr.normal(jr.PRNGKey(1), (4, 6, 8, 2)), grid.patch)
     with jax.default_matmul_precision("highest"):
         w, direction, species = enc.geometry(grid, feats)
@@ -402,46 +312,3 @@ def test_painn_encoder_contraction_matches_the_per_point_messages():
             jnp.einsum("...pf,pd,p->...df", dmu_r, direction, quad),
         )
         np.testing.assert_allclose(enc(p, grid, feats), q, atol=1e-5)
-
-
-def test_cosine_filter_base_starts_at_the_cosine_products():
-    from neugk_jax.models.patching.field import CosineBaseFilter, field_options
-
-    opts = field_options(dict(encoding="cosine", filter_base="cosine", hidden=8))
-    grid = PointGrid((4, 6), (4, 6), 2, {"axes": [{"kind": "relative"}] * 2})
-    filt = CosineBaseFilter(grid, opts, 10, key=jr.PRNGKey(0))
-    feats = grid.features(None, "cosine", 5, 16)
-    out = filt(feats)
-    (k0, k1), c = filt.modes[3], filt.channels[3]
-    u = grid.offsets
-    ref = jnp.cos(k0 * jnp.pi * (u[:, 0] + 1) / 2) * jnp.cos(k1 * jnp.pi * (u[:, 1] + 1) / 2)
-    ref = ref * (math.sqrt(2.0) ** ((k0 > 0) + (k1 > 0))) * grid.channel[:, c]
-    np.testing.assert_allclose(out[:, 3], ref, atol=1e-5)
-    assert filt.modes[0] == (0, 0)
-
-
-def test_smooth_convergence_options():
-    opts = dict(
-        encoder="smooth",
-        decoder="smooth",
-        encoding="cosine",
-        rank=8,
-        hidden=8,
-        code_rank=4,
-        branch=16,
-        branch_depth=1,
-        mix_act=False,
-        functional_norm=True,
-        filter_base="cosine",
-        grid=grid_5d(),
-    )
-    ae = small_ae(patching="field", patching_kwargs=opts)
-    x = jr.normal(jr.PRNGKey(1), (2, *BASE))
-    assert ae(x)["df"].shape == x.shape
-    assert len(ae.backbone.unpatch.expansion.layers) == 1
-    loss = lambda m: jnp.mean((m(x)["df"] - x) ** 2)
-    grads = eqx.filter_grad(loss)(ae)
-    assert all(
-        bool(jnp.isfinite(g).all())
-        for g in jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))
-    )
