@@ -10,20 +10,34 @@ import numpy as np
 import pytest
 
 from neugk_jax.models.build import build_ae_from_config
-from neugk_jax.models.gk_unet import SwinNDUnet
+from neugk_jax.models.gk_unet import SwinNDUnet, patching_options
 from neugk_jax.models.patching import (
+    PATCHINGS,
     FieldPatchEmbed,
     FieldUnpatch,
     LinearUnpatch,
     PatchEmbed,
     PointGrid,
-    field_options,
+    SmoothPatchEmbed,
     fold_patches,
 )
 from neugk_jax.models.patching.field import AxisBases, tucker_project, tucker_synthesize
 from neugk_jax.pinc import Swin5DAE
 
 BASE = (8, 4, 4, 8, 4)
+SMALL = {"smooth": dict(rank=8, hidden=8, code_rank=4), "tucker": dict(axis_hidden=8)}
+
+
+def field_pair(kind, patch=(2, 5), base=(4, 10), channels=3, dim=8, **kw):
+    """Embedding / unpatch of a field kind on a 2D grid, each with the options it takes."""
+    embed_cls, unpatch_cls = PATCHINGS[kind]
+    e_kw, u_kw = patching_options(embed_cls, unpatch_cls, {**SMALL[kind], **kw})
+    grid_size = tuple(b // p for b, p in zip(base, patch))
+    embed = embed_cls(base, patch, channels, dim, key=jr.PRNGKey(0), **e_kw)
+    unpatch = unpatch_cls(
+        dim, grid_size, key=jr.PRNGKey(1), expand_by=patch, out_channels=channels, **u_kw
+    )
+    return embed, unpatch
 
 
 def grid_5d():
@@ -86,10 +100,10 @@ def test_linear_is_the_default():
     assert type(model.patch_embed) is PatchEmbed and type(model.unpatch) is LinearUnpatch
 
 
-@pytest.mark.parametrize("decoder", ["smooth", "tucker"])
-def test_generic_nd_swap(decoder):
+@pytest.mark.parametrize("kind", ["smooth", "tucker"])
+def test_generic_nd_swap(kind):
     linear = unet("linear")
-    field = unet("field", encoder=decoder, decoder=decoder, rank=16, hidden=16, code_rank=8)
+    field = unet(kind, **SMALL[kind])
     assert isinstance(field.patch_embed, FieldPatchEmbed) and isinstance(
         field.unpatch, FieldUnpatch
     )
@@ -101,10 +115,7 @@ def test_generic_nd_swap(decoder):
 
 @pytest.mark.parametrize("kind", ["smooth", "tucker"])
 def test_adiabatic_5d_grid(kind):
-    opts = dict(
-        encoder=kind, decoder=kind, rank=16, hidden=16, code_rank=8, axis_hidden=8, grid=grid_5d()
-    )
-    ae = small_ae(patching="field", patching_kwargs=opts)
+    ae = small_ae(patching=kind, patching_kwargs={**SMALL[kind], "grid": grid_5d()})
     x = jr.normal(jr.PRNGKey(1), (2, *BASE))
     out = ae(x)["df"]
     assert out.shape == x.shape
@@ -124,11 +135,7 @@ def test_adiabatic_5d_grid(kind):
 
 @pytest.mark.parametrize("kind", ["smooth", "tucker"])
 def test_default_heads_are_linear_in_the_data(kind):
-    opts = dict(encoder=kind, decoder=kind, rank=8, hidden=8, code_rank=4, axis_hidden=8)
-    embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), **opts)
-    unpatch = FieldUnpatch(
-        8, (2, 2), key=jr.PRNGKey(1), expand_by=(2, 5), out_channels=3, zero_init=False, **opts
-    )
+    embed, unpatch = field_pair(kind, zero_init=False)
     assert len(embed.mix.layers) == 1 and len(unpatch.expansion.layers) == 1
     x, y = jr.normal(jr.PRNGKey(2), (2, 4, 10, 3))
     with jax.default_matmul_precision("highest"):
@@ -159,8 +166,8 @@ def test_tucker_cosine_full_rank_is_exact():
     np.testing.assert_allclose(back, p, atol=1e-5)
 
 
-@pytest.mark.parametrize("decoder", ["smooth", "tucker"])
-def test_one_set_of_weights_on_two_resolutions(decoder):
+@pytest.mark.parametrize("kind", ["smooth", "tucker"])
+def test_one_set_of_weights_on_two_resolutions(kind):
     # x refined by 2 with the same physical patch: the weights of one grid run on the other
     spec = lambda dx: {
         "axes": [
@@ -168,27 +175,8 @@ def test_one_set_of_weights_on_two_resolutions(decoder):
             {"kind": "relative", "spacing": dx, "reference": 0.5},
         ]
     }
-    opts = dict(
-        decoder=decoder,
-        encoder="tucker",
-        rank=8,
-        hidden=8,
-        code_rank=4,
-        ranks=[2, 10],
-        axis_hidden=8,
-        code_modes=[1, 2],
-    )
-    embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), grid=spec(0.2), **opts)
-    unpatch = FieldUnpatch(
-        8,
-        (2, 2),
-        key=jr.PRNGKey(1),
-        expand_by=(2, 5),
-        out_channels=3,
-        grid=spec(0.2),
-        zero_init=False,
-        **opts,
-    )
+    extra = {"smooth": dict(code_modes=[1, 2]), "tucker": dict(ranks=[2, 10])}[kind]
+    embed, unpatch = field_pair(kind, grid=spec(0.2), zero_init=False, **extra)
     fine = PointGrid((4, 20), (2, 10), 3, spec(0.1))
     x = jr.normal(jr.PRNGKey(2), (4, 20, 3))
     z = embed.with_grid(fine)(x)
@@ -205,7 +193,7 @@ def test_build_from_config():
         merging_hidden_ratio=2.0,
         unmerging_hidden_ratio=2.0,
         c_multiplier=2,
-        type="field",
+        type="smooth",
         field={"rank": 16, "hidden": 16, "code_rank": 8},
         grid=grid_5d(),
     )
@@ -220,29 +208,21 @@ def test_build_from_config():
         "dataset": {"resolution": list(BASE), "separate_zf": False},
     }
     ae = build_ae_from_config(cfg, key=jr.PRNGKey(0))
-    assert isinstance(ae.backbone.patch_embed, FieldPatchEmbed)
+    assert isinstance(ae.backbone.patch_embed, SmoothPatchEmbed)
     assert ae(jnp.zeros((2, *BASE)))["df"].shape == (2, *BASE)
 
 
 def test_unknown_option_raises():
-    with pytest.raises(ValueError, match="unknown field patching options"):
-        field_options({"rnk": 4})
+    with pytest.raises(ValueError, match="unknown patching options"):
+        unet("smooth", rnk=4)
+    # an option of the other field kind is unknown too
+    with pytest.raises(ValueError, match="unknown patching options"):
+        unet("tucker", code_rank=4)
 
 
 @pytest.mark.parametrize("kind", ["smooth", "tucker"])
 def test_point_conditioning_enters_the_filters(kind):
-    opts = dict(
-        encoder=kind,
-        decoder=kind,
-        rank=8,
-        hidden=8,
-        code_rank=4,
-        axis_hidden=8,
-        cond_features=3,
-        zero_init=False,
-    )
-    embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), **opts)
-    unpatch = FieldUnpatch(8, (2, 2), key=jr.PRNGKey(1), expand_by=(2, 5), out_channels=3, **opts)
+    embed, unpatch = field_pair(kind, cond_features=3, zero_init=False)
     x = jr.normal(jr.PRNGKey(2), (4, 10, 3))
     ion, electron = jnp.asarray([1.0, 0.0, 0.0]), jnp.asarray([-1.0, -1.0, 0.3])
     z_ion, z_el = embed(x, point_cond=ion), embed(x, point_cond=electron)

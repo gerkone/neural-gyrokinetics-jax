@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from neugk_jax.models.patching import FIELD_PATCHINGS
 from neugk_jax.utils import to_dict
 
 # df grid (vp, mu, s, x, y) of the cyclone dataset and the release checkpoints
@@ -140,7 +141,11 @@ def build_ae_from_config(
     cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
     patching = patch.get("type", "linear")
     # field patching: options from model.patch.field, coordinates from model.patch.grid (set by run_config)
-    patching_kwargs = {**(patch.get("field") or {}), "grid": patch.get("grid")} if patching == "field" else {}
+    patching_kwargs = (
+        {**(patch.get("field") or {}), "grid": patch.get("grid")}
+        if patching in FIELD_PATCHINGS
+        else {}
+    )
     return force_f32(
         cls(
             space=5,
@@ -368,14 +373,14 @@ def build_release_gyroswin(cfg_path, *, key, resolution: Optional[Sequence[int]]
 def run_config(cfg, ds=None) -> dict:
     """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf.
 
-    With ``model.patch.type: field`` the patch coordinates come from ``ds`` (:func:`field_grid`).
+    With a field ``model.patch.type`` (smooth, tucker) the patch coordinates come from ``ds`` (:func:`field_grid`).
     """
     out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
         out["dataset"]["resolution"] = [int(r) for r in ds.resolution]
         out["dataset"]["separate_zf"] = bool(ds.separate_zf)
         patch = (out["model"] or {}).get("patch") or {}
-        if patch.get("type") == "field":
+        if patch.get("type") in FIELD_PATCHINGS:
             patch.setdefault("grid", field_grid(ds, fold_mu=out["model"].get("decouple_mu", True)))
     return out
 
@@ -388,11 +393,16 @@ def field_grid(ds, fold_mu: bool = True) -> dict:
     """
     g = ds.metadata[0]["geometry"]
     nx, ny = (int(r) for r in ds.resolution[3:])
-    lx, ly = (2 * np.pi / np.diff(np.unique(np.asarray(g[k], np.float64))).min() for k in ("kxrh", "krho"))
+    lx, ly = (
+        2 * np.pi / np.diff(np.unique(np.asarray(g[k], np.float64))).min() for k in ("kxrh", "krho")
+    )
     nodes = lambda k: [float(v) for v in np.asarray(g[k], np.float64).ravel()]
     vpar = {"kind": "absolute", "nodes": nodes("vpgr"), "weights": nodes("intvp")}
     mu = {"kind": "absolute", "nodes": nodes("mugr"), "weights": nodes("intmu")}
-    rel = [{"kind": "relative", "spacing": s} for s in (float(np.asarray(g["ints"]).ravel()[0]), lx / nx, ly / ny)]
+    rel = [
+        {"kind": "relative", "spacing": s}
+        for s in (float(np.asarray(g["ints"]).ravel()[0]), lx / nx, ly / ny)
+    ]
     if fold_mu:
         return {"axes": [vpar, *rel], "folded": [mu]}
     return {"axes": [vpar, mu, *rel]}

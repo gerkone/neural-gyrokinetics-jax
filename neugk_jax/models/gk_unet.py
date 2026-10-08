@@ -16,22 +16,19 @@ from neugk_jax.models.base import GridDecoderBase, GridEncoderBase, TokenLayerBa
 from neugk_jax.models.embeddings import APE, ContinuousConditionEmbed
 from neugk_jax.models.embeddings import token_pe as token_pe_of
 from neugk_jax.models.layers import token_layer
-from neugk_jax.models.patching import (
-    FieldPatchEmbed,
-    FieldUnpatch,
-    LinearUnpatch,
-    PatchEmbed,
-    _normalize_patch,
-    pad_amounts,
-    pad_to_blocks,
-    unpad,
-)
-from neugk_jax.models.spec import Spec, parse_spec
+from neugk_jax.models.patching import PATCHINGS, _normalize_patch, pad_amounts, pad_to_blocks, unpad
+from neugk_jax.models.spec import Spec, accepted, parse_spec
 from neugk_jax.models.tokens import TokenExpand, TokenMerge, merge_grid
 from neugk_jax.models.utils import Linear, gelu
 
-# patch embedding and unpatch classes per patching kind
-PATCHINGS = {"linear": (PatchEmbed, LinearUnpatch), "field": (FieldPatchEmbed, FieldUnpatch)}
+
+def patching_options(embed_cls, unpatch_cls, options: Mapping) -> tuple[dict, dict]:
+    """The patching options each class takes; an option neither takes raises."""
+    embed, unpatch = accepted(embed_cls, options), accepted(unpatch_cls, options)
+    unknown = set(options) - set(embed) - set(unpatch)
+    if unknown:
+        raise ValueError(f"unknown patching options {sorted(unknown)} for {embed_cls.__name__}")
+    return embed, unpatch
 
 
 def _as_seq(x, n):
@@ -239,7 +236,9 @@ class SwinNDUnet(eqx.Module):
     ):
         kind, patch_options = parse_spec(patching, PATCHINGS)
         embed_cls, unpatch_cls = PATCHINGS[kind]
-        patching_kwargs = {**patch_options, **(patching_kwargs or {})}
+        embed_kwargs, unpatch_kwargs = patching_options(
+            embed_cls, unpatch_cls, {**patch_options, **(patching_kwargs or {})}
+        )
         patch_size = _as_seq(patch_size, space)
         window_size = _as_seq(window_size, space)
         depth = _as_seq(depth, num_layers)
@@ -262,7 +261,7 @@ class SwinNDUnet(eqx.Module):
                 mlp_depth=merging_depth,
                 mlp_ratio=merging_hidden_ratio,
                 act_fn=act_fn,
-                **patching_kwargs,
+                **embed_kwargs,
             )
         grid0 = tuple(s // p for s, p in zip(padded_base, _normalize_patch(patch_size)))
         self.token_pe = (
@@ -382,7 +381,7 @@ class SwinNDUnet(eqx.Module):
             use_conv=conv_patch,
             patch_skip=unpatch_patch_skip,
             cond_dim=up_cond,
-            **patching_kwargs,
+            **unpatch_kwargs,
         )
         self.base_resolution = tuple(base_resolution)
         self.patch_size = tuple(patch_size)
