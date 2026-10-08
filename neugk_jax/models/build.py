@@ -336,6 +336,9 @@ def build_gyroswin_from_config(
         n_cond=len(mcfg.get("conditioning", []) or []),
         use_checkpoint=bool(swin.get("gradient_checkpoint", False)),
         legacy_double_shortcut=_legacy_shortcut(mcfg, legacy_double_shortcut),
+        layer=mcfg.get("layer", "swin"),
+        middle_layer=mcfg.get("middle_layer", "swin"),
+        token_pe=mcfg.get("token_pe"),
         key=key,
     )
     return force_f32(model)

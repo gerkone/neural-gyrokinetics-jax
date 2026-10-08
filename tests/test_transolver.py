@@ -120,3 +120,25 @@ def test_transolver_interfaces():
         and not TransolverBlock.modulated
     )
     assert transolver_layer(16, 1, 2, key=jr.PRNGKey(0)).needs_pos_embed
+
+
+def test_transolver_in_gyroswin():
+    from neugk_jax.gyroswin.models.gyroswin import GyroSwinMultitask
+
+    model = GyroSwinMultitask(
+        dim=8,
+        df_base_resolution=(4, 2, 4, 4, 4),
+        df_patch_size=(2, 1, 2, 2, 2),
+        df_window_size=(2, 1, 2, 2, 2),
+        depth=1,
+        num_heads=2,
+        in_channels=2,
+        out_channels=2,
+        num_layers=1,
+        layer={"kind": "transolver", "slice_num": 4},
+        middle_layer="vit",
+        token_pe="sincos",
+        key=jr.PRNGKey(0),
+    )
+    out = model(jr.normal(jr.PRNGKey(1), (2, 4, 2, 4, 4, 4)))
+    assert out["df"].shape == (2, 4, 2, 4, 4, 4) and out["phi"].shape == (4, 4, 4)
