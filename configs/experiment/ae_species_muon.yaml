@@ -13,3 +13,6 @@ model:
   hidden_mlp_ratio: 4.0
   # latent stays at 512 channels (compression as at width 1024)
   mup: {bottleneck_ratio: 3}
+validation:
+  # one sample per device
+  batch_size: 1
