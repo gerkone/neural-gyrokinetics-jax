@@ -20,12 +20,7 @@ from neugk_jax.models.patching import (
     field_options,
     fold_patches,
 )
-from neugk_jax.models.patching.field import (
-    AxisBases,
-    SeparableBasis,
-    tucker_project,
-    tucker_synthesize,
-)
+from neugk_jax.models.patching.field import AxisBases, tucker_project, tucker_synthesize
 from neugk_jax.pinc import Swin5DAE
 
 BASE = (8, 4, 4, 8, 4)
@@ -104,19 +99,10 @@ def test_generic_nd_swap(decoder):
     assert field.patch_decode(z).shape == x.shape
 
 
-@pytest.mark.parametrize("kind", ["smooth", "tucker", "separable", "painn"])
+@pytest.mark.parametrize("kind", ["smooth", "tucker"])
 def test_adiabatic_5d_grid(kind):
     opts = dict(
-        encoder=kind,
-        decoder=kind,
-        rank=16,
-        hidden=16,
-        code_rank=8,
-        axis_hidden=8,
-        painn_features=8,
-        painn_point_features=8,
-        n_rbf=6,
-        grid=grid_5d(),
+        encoder=kind, decoder=kind, rank=16, hidden=16, code_rank=8, axis_hidden=8, grid=grid_5d()
     )
     ae = small_ae(patching="field", patching_kwargs=opts)
     x = jr.normal(jr.PRNGKey(1), (2, *BASE))
@@ -133,11 +119,10 @@ def test_adiabatic_5d_grid(kind):
     leaves = [g for g in jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))]
     assert all(bool(jnp.isfinite(g).all()) for g in leaves)
     unpatch = grads.backbone.unpatch
-    last = unpatch.basis.readout if kind == "painn" else unpatch.expansion.layers[-1]
-    assert float(jnp.abs(last.weight).max()) > 0
+    assert float(jnp.abs(unpatch.expansion.layers[-1].weight).max()) > 0
 
 
-@pytest.mark.parametrize("kind", ["smooth", "tucker", "separable"])
+@pytest.mark.parametrize("kind", ["smooth", "tucker"])
 def test_default_heads_are_linear_in_the_data(kind):
     opts = dict(encoder=kind, decoder=kind, rank=8, hidden=8, code_rank=4, axis_hidden=8)
     embed = FieldPatchEmbed((4, 10), (2, 5), 3, 8, key=jr.PRNGKey(0), **opts)
@@ -277,38 +262,3 @@ def test_band_limit_keeps_the_trained_modes_on_a_finer_grid():
     assert (
         float(jnp.abs(bases[0][:, 5:]).max()) == 0.0 and float(jnp.abs(bases[0][:, :5]).max()) > 0
     )
-
-
-def test_separable_cosine_trunks_and_painn_geometry():
-    from neugk_jax.models.patching.painn import cosine_cutoff, sinc_rbf
-
-    spec = {"axes": [{"kind": "relative"}] * 3}
-    grid = PointGrid((4, 6, 8), (2, 3, 4), 2, spec)
-    sep = SeparableBasis(grid, 12, key=jr.PRNGKey(0), basis="cosine", hidden=8, modes=16)
-    assert sep(grid).shape == (2 * 3 * 4 * 2, 12)
-    d = jnp.linspace(0.0, 1.8, 5)
-    assert bool(jnp.isfinite(sinc_rbf(d, 6, 2.2)).all()) and float(cosine_cutoff(d, 2.2).min()) > 0
-
-
-def test_painn_encoder_contraction_matches_the_per_point_messages():
-    from neugk_jax.models.patching.field import field_options
-    from neugk_jax.models.patching.painn import PaiNNEncoder
-
-    opts = field_options(dict(painn_features=8, n_rbf=6, painn_chunk=3))
-    grid = PointGrid((4, 6, 8), (2, 3, 4), 2, {"axes": [{"kind": "relative"}] * 3})
-    enc = PaiNNEncoder(grid, opts, key=jr.PRNGKey(0))
-    enc = eqx.tree_at(lambda m: m.q0, enc, jr.normal(jr.PRNGKey(3), (8,)))
-    feats = grid.features(None, 16)
-    p = fold_patches(jr.normal(jr.PRNGKey(1), (4, 6, 8, 2)), grid.patch)
-    with jax.default_matmul_precision("highest"):
-        w, direction, species = enc.geometry(grid, feats)
-        quad = grid.weight / grid.weight.shape[-1]
-        x = jnp.concatenate(
-            [jnp.broadcast_to(species, (*p.shape, species.shape[-1])), p[..., None]], -1
-        )
-        dq, dmu_r, _ = jnp.split(enc.context(enc.geometry.species(x)) * w, 3, axis=-1)
-        q, _ = enc.mixing(
-            enc.q0 + jnp.einsum("...pf,p->...f", dq, quad),
-            jnp.einsum("...pf,pd,p->...df", dmu_r, direction, quad),
-        )
-        np.testing.assert_allclose(enc(p, grid, feats), q, atol=1e-5)

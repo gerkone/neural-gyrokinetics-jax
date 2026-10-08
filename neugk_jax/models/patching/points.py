@@ -66,7 +66,7 @@ class PointGrid(eqx.Module):
     Per point: ``offsets`` (cell-centred offsets of the relative axes from the patch centre),
     ``coords`` (absolute spatial and folded coordinates per token ``(*T_abs, P, n_abs)``), ``pos``
     (cell-centred position in the patch along every spatial axis), ``channel`` and ``weight``.
-    ``axes`` holds the same per spatial and folded axis for separable bases.
+    ``axes`` holds the same per spatial and folded axis for the tucker bases.
     """
 
     buffer_fields = ("coords", "offsets", "pos", "channel", "weight")
