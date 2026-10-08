@@ -25,7 +25,6 @@ dataset:
     kinetic:
       path: /local00/bioinf/galletti/kinetic/preprocessed_kvikio
       # central kx modes kept on read (null: all 191)
-      kx_crop: 169
       offset: 0
       # the 18 test runs of kinetic_exp/work/tables/splits/kinetic_test.txt are in neither list
       training_trajectories: iteration_{501,505-510,514-517,529,531,534-535,543-544,549-550,553,556,558,562-563,565,567,569,571-574,577-579,581,583,587-588,590,594,597-599,601,609,614,619,621,623,625,628,630-633,641,645,650,652,659,661,663,668,670,673,675,682,685,691,694-695,697-698,701-702,705,707-712,714-715,717-734,736-739,741-750,752,755-757,759-764,766,768-769,771-775,777-781,783-785,787-796,801}
@@ -43,7 +42,7 @@ training:
 model:
   stems:
     kinetic:
-      # (32, 12, 18, 169, 32) after kx_crop: the adiabatic token grid; 191 modes: patch 11
-      patch_size: [4, 0, 5, 10, 4]
+      # 191 kx modes / 11 -> 18 tokens (pad 198), merged to the adiabatic latent grid; with kx_crop 169 use patch 10
+      patch_size: [4, 0, 5, 11, 4]
     adiabatic:
       patch_size: [4, 0, 4, 5, 4]

@@ -125,8 +125,9 @@ class CycloneDataset:
         Serve df as ``(C, species, vpar, mu, s, x, y)`` (adiabatic trajectories get a
         unit species axis) and the flux per species. Required for kinetic trajectories.
     kx_crop
-        Number of central kx modes kept of trajectories with more (df and phi are cropped
-        in Fourier space on read).
+        Optional number of central kx modes kept of trajectories with more (df and phi are
+        cropped in Fourier space on read). Unset, frames are served with their stored kx modes
+        and a mismatch raises.
     data_type
         Data type id served with every sample (the dataset's index in a mix).
     loss_weight
@@ -330,6 +331,8 @@ class CycloneDataset:
         if "phi" in self.fields_to_load:
             phi = self.backend.read_phi(handle, t, self.stored_phi_shape)
             if phi.shape[0] != self.resolution[3]:
+                if self.kx_crop is None:
+                    raise ValueError(f"phi has {phi.shape[0]} kx modes, the dataset {self.resolution[3]}; set kx_crop to crop")
                 from neugk_jax.evaluate.fourier import crop_kx_phi
 
                 phi = crop_kx_phi(phi, self.resolution[3])
@@ -355,6 +358,8 @@ class CycloneDataset:
         """
         x = df.astype(np.float32)
         if x.shape[-2] != self.resolution[3]:
+            if self.kx_crop is None:
+                raise ValueError(f"df has {x.shape[-2]} kx modes, the dataset {self.resolution[3]}; set kx_crop to crop")
             from neugk_jax.evaluate.fourier import crop_kx_df
 
             x = crop_kx_df(x, self.resolution[3], reim_axis=1)
@@ -494,6 +499,8 @@ class CycloneDataset:
         geom = meta.get("geometry")
         if geom is None or len(geom["kxrh"]) == self.resolution[3]:
             return geom
+        if self.kx_crop is None:
+            raise ValueError(f"geometry has {len(geom['kxrh'])} kx modes, the dataset {self.resolution[3]}; set kx_crop to crop")
         # central kx modes, as kept by kx_crop
         i0 = (len(geom["kxrh"]) - self.resolution[3]) // 2
         return {**geom, "kxrh": np.asarray(geom["kxrh"])[i0 : i0 + self.resolution[3]]}

@@ -12,7 +12,6 @@ dataset:
   parts:
     kinetic_stable:
       path: /local00/bioinf/galletti/kinetic/preprocessed_kvikio
-      kx_crop: 169
       offset: 0
       # the kinetic grid: decoded by the kinetic stem, normalized with the saturated kinetic statistics
       stem: kinetic
