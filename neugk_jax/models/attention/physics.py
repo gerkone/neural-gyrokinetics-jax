@@ -86,7 +86,7 @@ class PhysicsAttention(eqx.Module):
         w = self.slice_weights(x)
         tokens = jnp.einsum("hnd,hng->hgd", fx, w) / (jnp.sum(w, axis=1)[..., None] + 1e-5)
         q, k, v = self.to_q(tokens), self.to_k(tokens), self.to_v(tokens)
-        if self.q_norm is not None:
+        if self.q_norm is not None and self.k_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         ka, kp = split_key(key, 2)
         attn = jax.nn.softmax(jnp.einsum("hgd,hfd->hgf", q, k) * self.scale, axis=-1)
