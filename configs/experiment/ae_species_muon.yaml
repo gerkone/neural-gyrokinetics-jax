@@ -3,8 +3,18 @@
 defaults:
   - ae_species_mup
 
+dataset:
+  parts:
+    kinetic:
+      # all 191 kx modes, no fft crop in the batch transform
+      kx_crop: null
 training:
   optimizer: muon
   muon_learning_rate: 0.02
   batch_size: 4
   n_epochs: 200
+model:
+  stems:
+    kinetic:
+      # 191 modes / 11 -> 18 tokens (pad 198), merged to the adiabatic latent grid
+      patch_size: [4, 0, 5, 11, 4]
