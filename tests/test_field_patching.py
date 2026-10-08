@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -400,3 +402,46 @@ def test_painn_encoder_contraction_matches_the_per_point_messages():
             jnp.einsum("...pf,pd,p->...df", dmu_r, direction, quad),
         )
         np.testing.assert_allclose(enc(p, grid, feats), q, atol=1e-5)
+
+
+def test_cosine_filter_base_starts_at_the_cosine_products():
+    from neugk_jax.models.patching.field import CosineBaseFilter, field_options
+
+    opts = field_options(dict(encoding="cosine", filter_base="cosine", hidden=8))
+    grid = PointGrid((4, 6), (4, 6), 2, {"axes": [{"kind": "relative"}] * 2})
+    filt = CosineBaseFilter(grid, opts, 10, key=jr.PRNGKey(0))
+    feats = grid.features(None, "cosine", 5, 16)
+    out = filt(feats)
+    (k0, k1), c = filt.modes[3], filt.channels[3]
+    u = grid.offsets
+    ref = jnp.cos(k0 * jnp.pi * (u[:, 0] + 1) / 2) * jnp.cos(k1 * jnp.pi * (u[:, 1] + 1) / 2)
+    ref = ref * (math.sqrt(2.0) ** ((k0 > 0) + (k1 > 0))) * grid.channel[:, c]
+    np.testing.assert_allclose(out[:, 3], ref, atol=1e-5)
+    assert filt.modes[0] == (0, 0)
+
+
+def test_smooth_convergence_options():
+    opts = dict(
+        encoder="smooth",
+        decoder="smooth",
+        encoding="cosine",
+        rank=8,
+        hidden=8,
+        code_rank=4,
+        branch=16,
+        branch_depth=1,
+        mix_act=False,
+        functional_norm=True,
+        filter_base="cosine",
+        grid=grid_5d(),
+    )
+    ae = small_ae(patching="field", patching_kwargs=opts)
+    x = jr.normal(jr.PRNGKey(1), (2, *BASE))
+    assert ae(x)["df"].shape == x.shape
+    assert len(ae.backbone.unpatch.expansion.layers) == 1
+    loss = lambda m: jnp.mean((m(x)["df"] - x) ** 2)
+    grads = eqx.filter_grad(loss)(ae)
+    assert all(
+        bool(jnp.isfinite(g).all())
+        for g in jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))
+    )

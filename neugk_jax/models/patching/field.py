@@ -16,6 +16,7 @@ the per-axis bases).
 from __future__ import annotations
 
 import copy
+import itertools
 import math
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -29,7 +30,7 @@ from neugk_jax.models.base import GridDecoderBase, GridEncoderBase
 from neugk_jax.models.ops import _normalize_patch, fold_patches, unfold_patches
 from neugk_jax.models.patching.painn import PaiNNDecoder, PaiNNEncoder, token_width
 from neugk_jax.models.patching.points import PointGrid, encoded_index, n_encoded
-from neugk_jax.models.utils import MLP, Linear, leaky_relu, silu
+from neugk_jax.models.utils import MLP, LayerNorm, Linear, leaky_relu, silu
 
 ENCODERS = ("kernel", "smooth", "tucker", "separable", "painn")
 DECODERS = ("deeponet", "hier", "smooth", "tucker", "separable", "painn")
@@ -73,6 +74,12 @@ FIELD_OPTIONS = {
     "n_rbf": 20,
     # tokens per rematerialized chunk of the token-point interactions
     "painn_chunk": 128,
+    # depth of the decoder branch mlp (1: linear), activation before the encoder mix, layer norm of
+    # the encoder functionals, filters started at fixed cosine products of the coordinates (cosine)
+    "branch_depth": 2,
+    "mix_act": True,
+    "functional_norm": False,
+    "filter_base": "none",
     "zero_init": True,
 }
 
@@ -88,6 +95,12 @@ def field_options(options: Mapping) -> dict:
         raise ValueError(f"encoder={opts['encoder']!r}; one of {ENCODERS}")
     if opts["decoder"] not in DECODERS:
         raise ValueError(f"decoder={opts['decoder']!r}; one of {DECODERS}")
+    if opts["filter_base"] not in ("none", "cosine"):
+        raise ValueError(f"filter_base={opts['filter_base']!r}; one of none, cosine")
+    if opts["filter_base"] == "cosine" and (
+        opts["filter"] != "joint" or opts["encoding"] == "fourier"
+    ):
+        raise ValueError("filter_base='cosine' needs the joint filter and a cosine / ipe encoding")
     if opts["filter"] not in ("joint", "product"):
         raise ValueError(f"filter={opts['filter']!r}; one of joint, product")
     if opts["degree"] is not None and opts["axis_basis"] != "cosine":
@@ -209,9 +222,56 @@ class ProductFilter(eqx.Module):
         return s * self.velocity(feats[..., jnp.asarray(self.velocity_index)])
 
 
+class CosineBaseFilter(eqx.Module):
+    """Filter started at fixed separable cosines: ``K(p) = prod_i cos(k_i pi (x_i + 1) / 2) [c_p = c] + MLP(p)``.
+
+    The ``out`` products of lowest total degree (per channel, modes within the grid's resolution) are
+    read off the cosine encoding of the point features; the MLP correction starts at zero.
+    """
+
+    correction: MLP
+    modes: tuple[tuple[int, ...], ...] = eqx.field(static=True)
+    channels: tuple[int, ...] = eqx.field(static=True)
+    n_coords: int = eqx.field(static=True)
+    n_modes: int = eqx.field(static=True)
+
+    def __init__(self, grid: PointGrid, opts: Mapping, out: int, *, key):
+        n, m, n_c = grid.n_coords, opts["modes"], grid.n_channels
+        caps = [min(c, m) for c in grid.caps]
+        tuples, degree = [], 0
+        while len(tuples) < -(-out // n_c):
+            tuples += sorted(
+                t for t in itertools.product(*(range(c) for c in caps)) if sum(t) == degree
+            )
+            degree += 1
+            if degree > sum(caps):
+                break
+        tuples = tuples[: -(-out // n_c)]
+        pairs = [(t, c) for t in tuples for c in range(n_c)][:out]
+        self.modes = tuple(t for t, _ in pairs)
+        self.channels = tuple(c for _, c in pairs)
+        self.n_coords, self.n_modes = n, m
+        dims = [_n_features(grid, opts)] + [opts["hidden"]] * opts["depth"] + [out]
+        self.correction = _zero_last(MLP(dims, key=key, act_fn=silu))
+
+    def __call__(self, feats: jnp.ndarray) -> jnp.ndarray:
+        enc = feats[..., : self.n_coords * self.n_modes].reshape(
+            *feats.shape[:-1], self.n_coords, self.n_modes
+        )
+        idx = jnp.asarray(self.modes)
+        picked = enc[..., jnp.arange(self.n_coords)[None, :], idx]
+        # unit rms per nonzero mode
+        scale = jnp.where(idx > 0, math.sqrt(2.0), 1.0)
+        base = jnp.prod(picked * scale, axis=-1)
+        channel = feats[..., self.n_coords * self.n_modes + jnp.asarray(self.channels)]
+        return base * channel + self.correction(feats)
+
+
 def _point_filter(grid: PointGrid, opts: Mapping, out: int, *, key) -> eqx.Module:
     if opts["filter"] == "product":
         return ProductFilter(grid, opts, out, key=key)
+    if opts["filter_base"] == "cosine":
+        return CosineBaseFilter(grid, opts, out, key=key)
     dims = [_n_features(grid, opts)] + [opts["hidden"]] * opts["depth"] + [out]
     return MLP(dims, key=key, act_fn=silu)
 
@@ -415,7 +475,8 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
     filters: eqx.Module
     mix: MLP
     keep: Optional[jnp.ndarray]
-    act: Callable = eqx.field(static=True)
+    norm: Optional[LayerNorm]
+    act: Optional[Callable] = eqx.field(static=True)
     patch_size: tuple[int, ...] = eqx.field(static=True)
     grid_size: tuple[int, ...] = eqx.field(static=True)
     encoder: str = eqx.field(static=True)
@@ -487,22 +548,28 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
                 width = self.keep.size
         mix = [width] + [int(embed_dim * mlp_ratio)] * (mlp_depth - 1) + [embed_dim]
         self.mix = MLP(mix, key=k_mix, act_fn=act_fn, use_bias=False)
-        self.act = act_fn
+        self.norm = LayerNorm(width) if opts["functional_norm"] else None
+        self.act = act_fn if opts["mix_act"] else None
+
+    def _mix(self, h: jnp.ndarray, act: bool = False) -> jnp.ndarray:
+        if self.norm is not None:
+            h = self.norm(h)
+        return self.mix(self.act(h) if act and self.act is not None else h)
 
     def __call__(self, x: jnp.ndarray, geometry=None, point_cond=None) -> jnp.ndarray:
         p = fold_patches(x, self.grid.patch)
         if self.encoder == "tucker":
             core = tucker_project(p, self.grid, self.filters(self.grid, geometry, point_cond))
-            return self.mix(core if self.keep is None else core[..., self.keep])
+            return self._mix(core if self.keep is None else core[..., self.keep])
         if self.encoder == "painn":
             feats = _with_cond(
                 self.grid.features(geometry, *self.encoding), point_cond, self.n_cond
             )
-            return self.mix(self.filters(p, self.grid, feats))
+            return self._mix(self.filters(p, self.grid, feats))
         if self.encoder == "separable":
             w = self.filters(self.grid, geometry, point_cond) * self.grid.weight[..., None]
             g, a = _letters(len(self.grid.patch), self.grid.abs_axes)
-            return self.mix(jnp.einsum(f"{g}p,{a}pk->{g}k", p, w) / p.shape[-1])
+            return self._mix(jnp.einsum(f"{g}p,{a}pk->{g}k", p, w) / p.shape[-1])
         w = (
             self.filters(
                 _with_cond(self.grid.features(geometry, *self.encoding), point_cond, self.n_cond)
@@ -516,7 +583,7 @@ class FieldPatchEmbed(_Field, GridEncoderBase):
             h = h.reshape(*h.shape[:-2], -1)
         else:
             h = jnp.einsum(f"{g}p,{a}pr->{g}r", p, w) / p.shape[-1]
-        return self.mix(self.act(h))
+        return self._mix(h, act=True)
 
 
 class FieldUnpatch(_Field, GridDecoderBase):
@@ -628,7 +695,8 @@ class FieldUnpatch(_Field, GridDecoderBase):
                 self.local = [Linear(w, w, key=k) for k in jr.split(k_local, d - 1)]
             width = rank * max(1, math.prod(self.code_modes))
             self.basis = _point_filter(self.grid, opts, basis_out, key=k_basis)
-        self.expansion = MLP([dim, opts["branch"], width], key=k_exp, act_fn=leaky_relu)
+        branch = [opts["branch"]] * (opts["branch_depth"] - 1)
+        self.expansion = MLP([dim, *branch, width], key=k_exp, act_fn=leaky_relu)
         # painn zero-initializes its own readout instead
         if opts["zero_init"] and self.decoder != "painn":
             self.expansion = _zero_last(self.expansion)
