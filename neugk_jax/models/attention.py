@@ -26,7 +26,11 @@ def einsum_attention(q, k, v, scale, bias=None, attn_drop=0.0, key=None, inferen
 def fused_attention(q, k, v, scale, bias=None):
     """:func:`einsum_attention` as the cuDNN fused kernel: q / k / v / bias in bf16, the output in q's dtype."""
     dt = jnp.bfloat16
-    b = None if bias is None else jnp.broadcast_to(bias, (q.shape[-2], q.shape[-3], k.shape[-3])).astype(dt)[None]
+    b = None
+    if bias is not None:
+        # tie the bias to q's vmapped axes, the batching rule folds them into one batch dim
+        tie = jnp.zeros((), dt) * jax.lax.stop_gradient(q[:1, :1, :1]).astype(dt).reshape(())
+        b = (jnp.broadcast_to(bias, (q.shape[-2], q.shape[-3], k.shape[-3])).astype(dt) + tie)[None]
     out = jax.nn.dot_product_attention(
         q[None].astype(dt), k[None].astype(dt), v[None].astype(dt), bias=b, scale=scale, implementation="cudnn"
     )
