@@ -8,3 +8,8 @@ training:
   muon_learning_rate: 0.02
   batch_size: 4
   n_epochs: 200
+model:
+  latent_dim: 1536
+  hidden_mlp_ratio: 4.0
+  # latent stays at 512 channels (compression as at width 1024)
+  mup: {bottleneck_ratio: 3}
