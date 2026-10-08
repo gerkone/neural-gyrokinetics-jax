@@ -225,10 +225,7 @@ def main(data, out):
     big = 26
     cx = M + CW / 2
     enc_c, dec_c, basis_c = ACCENT["enc"][0], ACCENT["dec"][0], ACCENT["basis"][0]
-    y = 34
-    cv.text(M, y + 40, "Smooth field patching", size=48, weight=700)
-    cv.text(M, y + 82, "nonlinear in the coordinates, linear in the data", size=26, color=MUTED)
-    y += 116
+    y = 30
 
     # 1: tiling
     h1 = 300
