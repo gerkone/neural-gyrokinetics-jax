@@ -1,0 +1,20 @@
+# @package _global_
+# weight-aligned neural fields of the representation interpolation (scripts/eval_interp.py): shared
+# per-trajectory initialization, extremes 20 apart whose midpoints are the interpolation targets
+#   python main.py experiment=nf_interp training.ckpt_dir=<dir>
+defaults:
+  - override /model: nf/mlp
+  - override /dataset: cyclone_nf
+  - override /training: nf
+
+workflow: nf
+training:
+  shared_init:
+    enabled: true
+dataset:
+  # every sixth held-out test trajectory
+  validation_trajectories: [
+    iteration_0, iteration_55, iteration_100, iteration_125, iteration_151,
+    iteration_176, iteration_202, iteration_227, iteration_252, iteration_278,
+  ]
+  timesteps: [100, 120, 140, 160, 180, 200]

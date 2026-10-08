@@ -2,7 +2,7 @@
 
 Each turns one trajectory's ground-truth snapshots into reconstructed dfs ``(2, vp, mu, s, x, y)``
 and the total compressed bytes: the traditional codecs (iso-CR per snapshot or a fixed knob),
-the per-snapshot neural fields (torch checkpoints) and the autoencoders (JAX runs or torch
+the per-snapshot neural fields (torch or JAX checkpoints) and the autoencoders (JAX runs or torch
 checkpoints, on the trajectory's training normalization).
 """
 
@@ -23,8 +23,9 @@ import jax.random as jr
 import numpy as np
 
 from neugk_jax.pinc.benchmark.codecs import CODECS, encode_at_cr
-from neugk_jax.pinc.neural_field import MLPNF, from_torch_state, n_params, sample_field
+from neugk_jax.pinc.neural_field import MLPNF, build_nf, from_torch_state, n_params, sample_field
 from neugk_jax.pinc.nf_runner import snapshot_norm
+from neugk_jax.training.checkpoint import load_model_only
 from neugk_jax.utils import recombine_zf
 
 # neural-field checkpoint prefixes: density warm-up (nf) and physics fine-tune (nf-pinc)
@@ -32,10 +33,13 @@ NF_PREFIX = {"nf": "best_mlp", "nf-pinc": "best_int_mlp"}
 
 
 def discover(ckpt_dir: str, prefix: str) -> tuple[dict[str, dict[int, str]], Optional[int]]:
-    """``{traj: {t: path}}`` of the ``<prefix>_<traj>_t<t>_x<cr>.pt`` checkpoints and their CR."""
-    rx = re.compile(re.escape(prefix) + r"_(iteration_\d+)_t(\d+)_x(\d+)\.pt$")
+    """``{traj: {t: path}}`` of the ``<prefix>_<traj>_t<t>_x<cr>`` checkpoints and their CR.
+
+    The checkpoints are torch ``.pt`` or ``NFRunner`` ``.eqx`` files.
+    """
+    rx = re.compile(re.escape(prefix) + r"_(iteration_\d+)_t(\d+)_x(\d+)\.(pt|eqx)$")
     weights, cr = defaultdict(dict), None
-    for p in glob.glob(os.path.join(ckpt_dir, prefix + "_*.pt")):
+    for p in glob.glob(os.path.join(ckpt_dir, prefix + "_*")):
         m = rx.search(os.path.basename(p))
         if m:
             weights[m.group(1)][int(m.group(2))] = p
@@ -98,6 +102,16 @@ def load_torch_nf(path: str, grid_size: Sequence[int]) -> MLPNF:
     return from_torch_state(model, state)
 
 
+def load_nf(path: str, grid_size: Sequence[int]) -> MLPNF:
+    """A torch ``.pt`` neural field, or an ``NFRunner`` ``.eqx`` next to its ``config.yaml``."""
+    if path.endswith(".pt"):
+        return load_torch_nf(path, grid_size)
+    from omegaconf import OmegaConf
+
+    mcfg = OmegaConf.load(Path(path).parent / "config.yaml").model
+    return load_model_only(path, build_nf(mcfg, grid_size, key=jr.PRNGKey(0)))
+
+
 @partial(jax.jit, static_argnums=1)
 def _decode_nf(model, grid_size, df):
     scale, shift = snapshot_norm(df)
@@ -114,7 +128,7 @@ class NeuralField(Reconstructor):
         dfs, size = [], 0
         for t, df in zip(timesteps, gt):
             grid = tuple(int(n) for n in df.shape[1:])
-            model = load_torch_nf(self.weights[traj][int(t)], grid)
+            model = load_nf(self.weights[traj][int(t)], grid)
             dfs.append(_decode_nf(model, grid, jnp.asarray(df)))
             size += 4 * n_params(model)
         return dfs, size

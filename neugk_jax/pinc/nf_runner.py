@@ -15,6 +15,11 @@ Checkpoints ``<prefix><name>_<traj>_t<t>_x<cr>.eqx`` (prefix ``best_`` density, 
 ``best_int_`` pinc final / best) go to ``training.ckpt_dir`` (default ``output_path``); finished
 snapshots are skipped, and snapshots with a density field in ``training.init_from`` (default: the
 checkpoint directory) start the pinc phase from it, so a run resumes by restarting it.
+
+With ``training.shared_init.enabled`` the density phase of every snapshot starts from one field
+per trajectory, density-fit cycling over the trajectory's snapshots (``shared_init/<traj>.eqx`` in
+the checkpoint directory, trained first when missing), so the fields of a trajectory are aligned in
+weight space.
 """
 
 from __future__ import annotations
@@ -256,6 +261,9 @@ class NFRunner:
         ]
         # warm-startable snapshots first, so whole pools skip the density phase
         jobs.sort(key=lambda j: not self.has_density(*j))
+        if self.shared_dir:
+            # whole trajectories per process, each trains its own shared initializations
+            return [j for j in jobs if j[0] % self.dist.num_processes == self.dist.process_id]
         # this process's share; pools are sharded over its devices
         return jobs[self.dist.process_id :: self.dist.num_processes]
 
@@ -263,17 +271,7 @@ class NFRunner:
         return self.ckpt_path("best_", fid, t, self.init_from).exists()
 
     def load_pool(self, jobs):
-        template = build_nf(self.cfg.model, self.grid, key=jr.PRNGKey(0))
-        models = [
-            load_model_only(self.ckpt_path("best_", f, t, self.init_from), template)
-            for f, t in jobs
-        ]
-        stacked = jax.tree_util.tree_map(
-            lambda *xs: jnp.stack(xs), *[eqx.filter(m, eqx.is_array) for m in models]
-        )
-        return shard_batch(
-            self.dist, eqx.combine(stacked, eqx.partition(template, eqx.is_array)[1])
-        )
+        return self.load_models([self.ckpt_path("best_", f, t, self.init_from) for f, t in jobs])
 
     def pool_data(self, jobs) -> dict:
         """Stacked per-NF fields, normalization, geometry, spectral stats and pinc targets."""
@@ -301,29 +299,101 @@ class NFRunner:
         models = eqx.filter_vmap(lambda k: build_nf(self.cfg.model, self.grid, key=k))(keys)
         return shard_batch(self.dist, models)
 
+    def density_steps(self, subsamples) -> list[int]:
+        dcfg = self.tcfg.density
+        n, batch = int(np.prod(self.grid)), int(dcfg.batch_size)
+        chunk = int(dcfg.get("scan_steps", 64))
+        return [chunk * max(1, math.ceil(math.ceil(n * s / batch) / chunk)) for s in subsamples]
+
+    def fit(self, models, fields, opt, opt_state, steps, key, tag: str = "density"):
+        """Point-batch MSE epochs of ``steps`` steps each of the pool on its z-scored ``fields``."""
+        dcfg = self.tcfg.density
+        chunk, n = int(dcfg.get("scan_steps", 64)), int(np.prod(self.grid))
+        arange = jnp.arange(int(dcfg.batch_size))
+        for e, n_steps in enumerate(steps):
+            keys = jr.split(jr.fold_in(key, e), fields.shape[0])
+            perm = permutations(shard_batch(self.dist, keys), n)
+            losses = []
+            for c in range(n_steps // chunk):
+                models, opt_state, loss = density_chunk(
+                    (fields, perm, jnp.int32(c * chunk), arange), models, opt_state, opt, chunk
+                )
+                losses.append(loss)
+            self.log({f"{tag}/mse": float(jnp.mean(jnp.stack(losses))) / fields.shape[0]})
+        return models, opt_state
+
     def density(self, models, data, key):
         dcfg = self.tcfg.density
-        n = int(np.prod(self.grid))
-        batch, chunk = int(dcfg.batch_size), int(dcfg.get("scan_steps", 64))
-        subs = np.linspace(*dcfg.subsample, int(dcfg.epochs))
-        steps = [chunk * max(1, math.ceil(math.ceil(n * s / batch) / chunk)) for s in subs]
+        steps = self.density_steps(np.linspace(*dcfg.subsample, int(dcfg.epochs)))
         tcfg = {"weight_decay": dcfg.weight_decay, "clip_grad": False}
         opt = build_optimizer(
             epoch_cosine(dcfg.lr, dcfg.min_lr, steps), tcfg, models, decoupled=True
         )
         opt_state = opt.init(eqx.filter(models, eqx.is_array))
-        arange = jnp.arange(batch)
-        for e, n_steps in enumerate(steps):
-            keys = jr.split(jr.fold_in(key, e), data["df"].shape[0])
-            perm = permutations(shard_batch(self.dist, keys), n)
-            losses = []
-            for c in range(n_steps // chunk):
-                models, opt_state, loss = density_chunk(
-                    (data["df"], perm, jnp.int32(c * chunk), arange), models, opt_state, opt, chunk
+        return self.fit(models, data["df"], opt, opt_state, steps, key)[0]
+
+    @property
+    def shared_dir(self) -> Path | None:
+        on = (self.tcfg.get("shared_init") or {}).get("enabled", False)
+        return self.output_path / "shared_init" if on else None
+
+    def shared_path(self, fid: int) -> Path:
+        return self.shared_dir / f"{self.traj_name(fid)}.eqx"
+
+    def train_shared(self, fids: list[int], key) -> None:
+        """Shared initializations of ``fids``, one field per trajectory pooled like the snapshots.
+
+        ``rounds`` passes over the trajectory's snapshots, ``epochs`` full-grid epochs on each,
+        AdamW at a constant ``lr``.
+        """
+        scfg = self.tcfg.shared_init
+        pool = int(self.tcfg.pool_size) * self.dist.local_device_count
+        steps = self.density_steps([1.0] * int(scfg.epochs))
+        tcfg = {"weight_decay": scfg.weight_decay, "clip_grad": False}
+        for start in range(0, len(fids), pool):
+            group = fids[start : start + pool]
+            n_real = len(group)
+            group = group + [group[-1]] * (pool - n_real)
+            ts = [[t for t in self.timesteps(f) if t < self.ds.num_ts(f)] for f in group]
+            if len({len(t) for t in ts}) != 1:
+                raise ValueError("a shared initialization pool needs one snapshot count")
+            gkey = jr.fold_in(key, start)
+            models = self.init_pool(gkey, pool)
+            opt = build_optimizer(lambda _: scfg.lr, tcfg, models, decoupled=True)
+            opt_state = opt.init(eqx.filter(models, eqx.is_array))
+            for r in range(int(scfg.rounds)):
+                for k in range(len(ts[0])):
+                    dfs = jnp.stack(
+                        [jnp.asarray(self.ds.read_frame(f, t[k])["df"]) for f, t in zip(group, ts)]
+                    )
+                    scale, shift = jax.vmap(snapshot_norm)(dfs)
+                    fields = shard_batch(self.dist, (dfs - shift) / scale)
+                    models, opt_state = self.fit(
+                        models,
+                        fields,
+                        opt,
+                        opt_state,
+                        steps,
+                        jr.fold_in(jr.fold_in(gkey, r + 1), k),
+                        "shared_init",
+                    )
+            self.shared_dir.mkdir(parents=True, exist_ok=True)
+            rows = local_rows(models)
+            for i, fid in enumerate(group[:n_real]):
+                one = jax.tree_util.tree_map(
+                    lambda x: x[i] if isinstance(x, np.ndarray) else x, rows
                 )
-                losses.append(loss)
-            self.log({"density/mse": float(jnp.mean(jnp.stack(losses))) / data["df"].shape[0]})
-        return models
+                save_model_only(self.shared_path(fid), one)
+
+    def load_models(self, paths: list[Path]):
+        template = build_nf(self.cfg.model, self.grid, key=jr.PRNGKey(0))
+        models = [load_model_only(p, template) for p in paths]
+        stacked = jax.tree_util.tree_map(
+            lambda *xs: jnp.stack(xs), *[eqx.filter(m, eqx.is_array) for m in models]
+        )
+        return shard_batch(
+            self.dist, eqx.combine(stacked, eqx.partition(template, eqx.is_array)[1])
+        )
 
     def pinc(self, models, data):
         pcfg = self.tcfg.pinc
@@ -369,6 +439,11 @@ class NFRunner:
         pool = int(self.tcfg.pool_size) * self.dist.local_device_count
         key = jr.PRNGKey(int(self.cfg.get("seed", 0)))
         self._step = 0
+        if self.shared_dir:
+            fids = sorted({f for f, t in self.jobs if not self.has_density(f, t)})
+            todo = [f for f in fids if not self.shared_path(f).exists()]
+            if todo:
+                self.train_shared(todo, jr.fold_in(key, 1 << 30))
         for p, start in enumerate(range(0, len(self.jobs), pool)):
             t0 = time.perf_counter()
             jobs = self.jobs[start : start + pool]
@@ -379,7 +454,10 @@ class NFRunner:
             if all(self.has_density(*j) for j in jobs):
                 models = self.load_pool(jobs)
             else:
-                models = self.init_pool(jr.fold_in(key, 2 * p), pool)
+                if self.shared_dir:
+                    models = self.load_models([self.shared_path(f) for f, _ in jobs])
+                else:
+                    models = self.init_pool(jr.fold_in(key, 2 * p), pool)
                 models = self.density(models, data, jr.fold_in(key, 2 * p + 1))
                 self.save(jobs, n_real, {"best_": models})
             score = math.nan

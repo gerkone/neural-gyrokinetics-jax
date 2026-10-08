@@ -31,3 +31,10 @@ pinc:
 ckpt_dir: null
 # directory of density fields (best_*) the pinc phase warm-starts from; null: ckpt_dir
 init_from: null
+# per-trajectory shared initialization of the density phase (weight-aligned fields), under ckpt_dir
+shared_init:
+  enabled: false
+  rounds: 4  # passes over the trajectory's snapshots
+  epochs: 2  # full-grid epochs per snapshot and pass
+  lr: 5.0e-3
+  weight_decay: 1.0e-2
