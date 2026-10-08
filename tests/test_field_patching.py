@@ -136,6 +136,7 @@ def test_adiabatic_5d_grid(encoder, decoder, encoding):
         branch=32,
         axis_hidden=8,
         painn_features=8,
+        painn_point_features=8,
         n_rbf=6,
         grid=grid_5d(),
         **local,
@@ -375,3 +376,27 @@ def test_separable_cosine_trunks_and_painn_geometry():
     assert sep(grid).shape == (2 * 3 * 4 * 2, 12)
     d = jnp.linspace(0.0, 1.8, 5)
     assert bool(jnp.isfinite(sinc_rbf(d, 6, 2.2)).all()) and float(cosine_cutoff(d, 2.2).min()) > 0
+
+
+def test_painn_encoder_contraction_matches_the_per_point_messages():
+    from neugk_jax.models.patching.field import field_options
+    from neugk_jax.models.patching.painn import PaiNNEncoder
+
+    opts = field_options(dict(encoding="cosine", painn_features=8, n_rbf=6, painn_chunk=3))
+    grid = PointGrid((4, 6, 8), (2, 3, 4), 2, {"axes": [{"kind": "relative"}] * 3})
+    enc = PaiNNEncoder(grid, opts, key=jr.PRNGKey(0))
+    enc = eqx.tree_at(lambda m: m.q0, enc, jr.normal(jr.PRNGKey(3), (8,)))
+    feats = grid.features(None, "cosine", 5, 16)
+    p = fold_patches(jr.normal(jr.PRNGKey(1), (4, 6, 8, 2)), grid.patch)
+    with jax.default_matmul_precision("highest"):
+        w, direction, species = enc.geometry(grid, feats)
+        quad = grid.weight / grid.weight.shape[-1]
+        x = jnp.concatenate(
+            [jnp.broadcast_to(species, (*p.shape, species.shape[-1])), p[..., None]], -1
+        )
+        dq, dmu_r, _ = jnp.split(enc.context(enc.geometry.species(x)) * w, 3, axis=-1)
+        q, _ = enc.mixing(
+            enc.q0 + jnp.einsum("...pf,p->...f", dq, quad),
+            jnp.einsum("...pf,pd,p->...df", dmu_r, direction, quad),
+        )
+        np.testing.assert_allclose(enc(p, grid, feats), q, atol=1e-5)

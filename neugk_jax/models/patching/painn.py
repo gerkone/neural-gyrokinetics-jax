@@ -100,16 +100,26 @@ class _Geometry(eqx.Module):
         return w, direction, feats[..., jnp.asarray(self.species_index)]
 
 
-def _chunked(fn, *arrays):
-    """``fn`` over the first token axis of the arrays, rematerialized per slice."""
-    if arrays[0].ndim < 3:
-        return fn(*arrays)
-    return jax.lax.map(jax.checkpoint(lambda a: fn(*a)), arrays)
+def _chunked(fn, n_tok: int, size: int, *arrays):
+    """``fn`` over chunks of ``size`` tokens (the first ``n_tok`` axes flattened), rematerialized per chunk."""
+    lead = arrays[0].shape[:n_tok]
+    n = math.prod(lead)
+    k = -(-n // size)
+
+    def chunks(a):
+        a = a.reshape(n, *a.shape[n_tok:])
+        a = jnp.pad(a, [(0, k * size - n)] + [(0, 0)] * (a.ndim - 1))
+        return a.reshape(k, size, *a.shape[1:])
+
+    out = jax.lax.map(jax.checkpoint(lambda a: fn(*a)), tuple(chunks(a) for a in arrays))
+    return jax.tree_util.tree_map(
+        lambda o: o.reshape(k * size, *o.shape[2:])[:n].reshape(*lead, *o.shape[2:]), out
+    )
 
 
 def token_width(grid: PointGrid, opts) -> int:
     """Width of the decoder's token state: F scalars and F vectors of the relative axes."""
-    return opts["painn_features"] * (1 + len(grid.rel_axes))
+    return opts["painn_point_features"] * (1 + len(grid.rel_axes))
 
 
 class PaiNNEncoder(eqx.Module):
@@ -119,6 +129,7 @@ class PaiNNEncoder(eqx.Module):
     context: MLP
     mixing: PaiNNMixing
     q0: jnp.ndarray
+    chunk: int = eqx.field(static=True)
 
     def __init__(self, grid: PointGrid, opts, *, key):
         f = opts["painn_features"]
@@ -127,6 +138,7 @@ class PaiNNEncoder(eqx.Module):
         self.geometry = _Geometry(grid, f, opts["n_rbf"], enc, opts["cond_features"], True, key=k1)
         self.context = MLP([f, f, 3 * f], key=k2, act_fn=silu)
         self.mixing = PaiNNMixing(f, key=k3)
+        self.chunk = opts["painn_chunk"]
         self.q0 = jnp.zeros((f,))
 
     def __call__(self, patches: jnp.ndarray, grid: PointGrid, feats: jnp.ndarray) -> jnp.ndarray:
@@ -136,43 +148,57 @@ class PaiNNEncoder(eqx.Module):
         abs_first = 0 in grid.abs_axes
         n_tok = patches.ndim - 1
 
+        f = self.geometry.features
+        lin, (l1, l2) = self.geometry.species.inner, self.context.layers
+        w2, b2 = l2.inner.weight, l2.inner.bias
+        wq, wr, _ = jnp.split(w, 3, axis=-1)
+
         def messages(x, sp, qw):
-            # x (..., P) values, sp (P, S) species, qw (P,) quadrature weights
-            qj = self.geometry.species(
-                jnp.concatenate([jnp.broadcast_to(sp, (*x.shape, sp.shape[-1])), x[..., None]], -1)
-            )
-            dq, dmu_r, _ = jnp.split(self.context(qj) * w, 3, axis=-1)
-            dq = jnp.einsum("...pf,p->...f", dq, qw)
-            dmu = jnp.einsum("...pf,pd,p->...df", dmu_r, direction, qw)
-            return dq, dmu
+            # x (n, P) values, sp (P, S) species, qw (P,) quadrature weights
+            # q_j = s_j + a x_j and the first context layer act elementwise; the second is
+            # contracted after the sum over the points, as one matmul per token
+            s = sp @ lin.weight[:, :-1].T + lin.bias
+            h = silu(l1(s) + x[..., None] * (l1.inner.weight @ lin.weight[:, -1]))
+            gq = qw[:, None] * wq
+            gr = jnp.einsum("pc,pd->pdc", qw[:, None] * wr, direction)
+            dq = jnp.einsum("cf,pc,npf->nc", w2[:f], gq, h, optimize="optimal")
+            dmu = jnp.einsum("cf,pdc,npf->ndc", w2[f : 2 * f], gr, h, optimize="optimal")
+            return dq + gq.sum(0) * b2[:f], dmu + gr.sum(0) * b2[f : 2 * f]
 
         if abs_first and n_tok >= 1:
             # one absolute-axis row at a time (a vmap would batch the chunks of all rows)
             dq, dmu = jax.lax.map(
-                lambda r: _chunked(lambda xx: messages(xx, r[1], r[2]), r[0]),
+                lambda r: _chunked(
+                    lambda xx: messages(xx, r[1], r[2]), r[0].ndim - 1, self.chunk, r[0]
+                ),
                 (patches, species, quad),
             )
         else:
-            dq, dmu = _chunked(lambda xx: messages(xx, species, quad), patches)
+            dq, dmu = _chunked(lambda xx: messages(xx, species, quad), n_tok, self.chunk, patches)
         q, _ = self.mixing(self.q0 + dq, dmu)
         return q
 
 
 class PaiNNDecoder(eqx.Module):
-    """Token to points: the token's message to every point, added to the point's species embedding, a PaiNN update and a linear readout."""
+    """Token to points: the token's message to every point, added to the point's species embedding, a PaiNN update and a linear readout.
+
+    Every point runs the update block, so its width is ``painn_point_features``.
+    """
 
     geometry: _Geometry
     context: MLP
     mixing: PaiNNMixing
     readout: Linear
+    chunk: int = eqx.field(static=True)
 
     def __init__(self, grid: PointGrid, opts, *, key):
-        f = opts["painn_features"]
+        f = opts["painn_point_features"]
         k1, k2, k3, k4 = jr.split(key, 4)
         enc = (opts["encoding"], opts["n_freq"], opts["modes"])
         self.geometry = _Geometry(grid, f, opts["n_rbf"], enc, opts["cond_features"], False, key=k1)
         self.context = MLP([f, f, 3 * f], key=k2, act_fn=silu)
         self.mixing = PaiNNMixing(f, key=k3)
+        self.chunk = opts["painn_chunk"]
         readout = Linear(f, 1, key=k4)
         self.readout = eqx.tree_at(
             lambda m: (m.inner.weight, m.inner.bias), readout, (jnp.zeros((1, f)), jnp.zeros((1,)))
@@ -199,6 +225,9 @@ class PaiNNDecoder(eqx.Module):
 
         if abs_first and q_t.ndim >= 2:
             return jax.lax.map(
-                lambda r: _chunked(lambda x, y: points(x, y, r[2]), r[0], r[1]), (q_t, mu_t, q0)
+                lambda r: _chunked(
+                    lambda x, y: points(x, y, r[2]), r[0].ndim - 1, self.chunk, r[0], r[1]
+                ),
+                (q_t, mu_t, q0),
             )
-        return _chunked(lambda x, y: points(x, y, q0), q_t, mu_t)
+        return _chunked(lambda x, y: points(x, y, q0), q_t.ndim - 1, self.chunk, q_t, mu_t)

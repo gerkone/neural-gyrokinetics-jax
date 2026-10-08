@@ -67,9 +67,12 @@ FIELD_OPTIONS = {
     "axis_hidden": 64,
     # length of a per-call descriptor (e.g. of the species) fed to the filter mlps as conditioning, 0: none
     "cond_features": 0,
-    # painn: feature width of the interaction, number of sinc radial basis functions
+    # painn: feature width of the encoder interaction and of the decoder's points, sinc radial basis functions
     "painn_features": 64,
+    "painn_point_features": 32,
     "n_rbf": 20,
+    # tokens per rematerialized chunk of the token-point interactions
+    "painn_chunk": 128,
     "zero_init": True,
 }
 
