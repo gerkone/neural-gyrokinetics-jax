@@ -14,6 +14,7 @@ import jax.random as jr
 
 from neugk_jax.losses import df_loss, part_weight, recon_loss
 from neugk_jax.models.build import ae_conditioning, build_ae, mup_multipliers
+from neugk_jax.models.utils import cast_floating
 from neugk_jax.pinc.eval import AEEvaluator, VQVAEEvaluator, reconstruct, select_conditions
 from neugk_jax.pinc.quantizers import VectorQuantizer
 from neugk_jax.pinc.vqvae import Swin5DVQVAE
@@ -67,6 +68,9 @@ class AERunner(BaseRunner):
         self.extra_zf = bool(self.cfg.model.get("extra_zf_loss", False)) and self.separate_zf
         # training.batch_transform: readers serve raw frames, normalized per batch in the step
         self.train_ds.batch_transform = bool(self.tcfg.get("batch_transform", False))
+        # training.compute_dtype: forward in bf16 on a cast copy of the fp32 weights (torch autocast)
+        dt = self.tcfg.get("compute_dtype")
+        self.compute_dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16}.get(dt) if dt else None
 
     def host_batch(self, batch: dict) -> dict:
         # data type of a one-type batch, read on the host
@@ -81,6 +85,16 @@ class AERunner(BaseRunner):
         part = batch.pop("part", None)
         ds = self.train_ds if part is None else list(self.train_ds.parts.values())[part]
         return {**batch, "df": per_shard(ds.transform, batch["df"], batch["file_index"])}
+
+    def forward(self, model, x, cond, keys) -> dict:
+        """Training reconstruction, in ``compute_dtype`` when set; the outputs come back fp32."""
+        if self.compute_dtype is None:
+            return reconstruct(model, x, cond, keys, inference=False)
+        dt = self.compute_dtype
+        model = cast_floating(model, dt)
+        cond = None if cond is None else cond.astype(dt)
+        out = reconstruct(model, x.astype(dt), cond, keys, inference=False)
+        return {**out, "df": out["df"].astype(jnp.float32)}
 
     def checkpoint_meta(self) -> dict:
         return {"resolution": [int(r) for r in self.train_ds.resolution]}
@@ -111,7 +125,7 @@ class AERunner(BaseRunner):
     def loss_fn(self, model, batch, key):
         x = batch["df"]
         keys = jr.split(key, x.shape[0])
-        pred = reconstruct(model, x, batch.get("conditioning"), keys, inference=False)["df"]
+        pred = self.forward(model, x, batch.get("conditioning"), keys)["df"]
         loss = self.df_recon_loss(pred, x)
         return loss * part_weight(batch), {"df": loss}
 

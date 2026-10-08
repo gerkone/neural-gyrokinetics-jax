@@ -18,7 +18,7 @@ def einsum_attention(q, k, v, scale, bias=None, attn_drop=0.0, key=None, inferen
     logits = jnp.einsum("...nhd,...mhd->...hnm", q, k) * scale
     if bias is not None:
         logits = logits + bias
-    attn = jax.nn.softmax(logits, axis=-1)
+    attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(v.dtype)
     attn = dropout(attn, attn_drop, key=key, inference=inference)
     return jnp.einsum("...hnm,...mhd->...nhd", attn, v)
 

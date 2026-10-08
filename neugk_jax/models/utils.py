@@ -104,6 +104,14 @@ def init_linears(model, scheme, *, key):
     return eqx.tree_at(linears, model, new)
 
 
+def cast_floating(tree, dtype):
+    """``tree`` with its floating-point arrays cast to ``dtype`` (a compute copy of fp32 weights)."""
+    return jax.tree_util.tree_map(
+        lambda x: x.astype(dtype) if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,
+        tree,
+    )
+
+
 def zero_init_output(model, layer: int = -1):
     """Zero one ``Linear`` of every ``unpatch`` expansion (the last by default; ``0`` is the muP
     readout): the autoencoder starts at a zero output."""

@@ -188,6 +188,30 @@ def test_swin5d_ae_bottleneck_input_norm():
     assert not jnp.allclose(normed.encode(x), plain.encode(x))
 
 
+def test_swin5d_ae_bf16_compute_copy():
+    import equinox as eqx
+
+    from neugk_jax.models.utils import cast_floating
+
+    base = (4, 4, 4, 16, 8)
+    ae = Swin5DAE(
+        space=5, decouple_mu=True, dim=16, base_resolution=base, in_channels=2, out_channels=2,
+        patch_size=(2, 0, 2, 4, 2), window_size=(2, 0, 2, 2, 2), depth=1, num_heads=2, num_layers=1,
+        bottleneck_dim=8, bottleneck_depth=1, bottleneck_num_heads=2, merging_depth=1, unmerging_depth=1,
+        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0, key=jr.PRNGKey(0),
+    )
+    x = jr.normal(jr.PRNGKey(1), (2, *base))
+    ref = ae(x)["df"]
+    low = cast_floating(ae, jnp.bfloat16)(x.astype(jnp.bfloat16))["df"]
+    assert low.dtype == jnp.bfloat16
+    assert float(jnp.linalg.norm(low.astype(jnp.float32) - ref) / jnp.linalg.norm(ref)) < 3e-2
+    # gradients reach the fp32 weights through the cast copy
+    loss = lambda m: jnp.mean((cast_floating(m, jnp.bfloat16)(x.astype(jnp.bfloat16))["df"].astype(jnp.float32) - x) ** 2)
+    grads = eqx.filter_grad(loss)(ae)
+    leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))
+    assert leaves and all(g.dtype == jnp.float32 and bool(jnp.isfinite(g).all()) for g in leaves)
+
+
 def test_dit_forward():
     grid = (2, 4, 2)
     z_dim = 16
