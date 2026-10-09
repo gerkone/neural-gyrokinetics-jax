@@ -1,4 +1,4 @@
-"""Lossless zstd shards: the ``.zstd_bf16.bin`` sibling of a bf16 shard.
+"""Lossless zstd shards: the ``.zstd16.bin`` sibling of a bf16 shard.
 
 Layout: a header padded to 4 KiB (``MAGIC``, version, element bytes, raw bytes, chunk bytes, chunk
 count, then the ``n + 1`` absolute chunk offsets), then the chunks back to back. A chunk holds up to
@@ -49,7 +49,7 @@ def _shuffle(raw: np.ndarray, elem_bytes: int) -> np.ndarray:
 def encode(
     raw: np.ndarray, *, elem_bytes: int = 2, chunk_bytes: int = CHUNK_BYTES, level: int = 1
 ) -> bytes:
-    """``.zstd_bf16`` bytes of the C-ordered payload ``raw`` (``elem_bytes`` bytes per element)."""
+    """``.zstd16`` bytes of the C-ordered payload ``raw`` (``elem_bytes`` bytes per element)."""
     raw = np.ascontiguousarray(raw).view(np.uint8).ravel()
     if raw.size % elem_bytes or chunk_bytes % elem_bytes:
         raise ValueError(
@@ -72,7 +72,7 @@ def encode(
 def parse_header(buf) -> Header:
     magic, version, elem_bytes, raw_bytes, chunk_bytes, n = _FIXED.unpack_from(buf, 0)
     if magic != MAGIC or version != VERSION:
-        raise IOError(f"not a .zstd_bf16 v{VERSION} shard (magic {magic!r}, version {version})")
+        raise IOError(f"not a .zstd16 v{VERSION} shard (magic {magic!r}, version {version})")
     offsets = np.frombuffer(buf, dtype=np.uint64, count=n + 1, offset=_FIXED.size)
     return Header(elem_bytes, raw_bytes, chunk_bytes, tuple(int(o) for o in offsets))
 
@@ -80,7 +80,7 @@ def parse_header(buf) -> Header:
 def decode(
     buf, header: Header | None = None, *, out: np.ndarray | None = None, unshuffle: bool = True
 ) -> np.ndarray:
-    """Raw payload bytes of the ``.zstd_bf16`` shard in ``buf``; with ``unshuffle=False`` every chunk stays shuffled."""
+    """Raw payload bytes of the ``.zstd16`` shard in ``buf``; with ``unshuffle=False`` every chunk stays shuffled."""
     header = header or parse_header(buf)
     src = memoryview(buf).cast("B")
     out = np.empty(header.raw_bytes, np.uint8) if out is None else out[: header.raw_bytes]

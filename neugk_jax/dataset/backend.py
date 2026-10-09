@@ -198,11 +198,12 @@ class NumpyBackend(DataBackend):
             ├── poten_00000.bin
             └── ...
 
-    ``prefer_dtype`` (``fp16``/``bf16``/``zstd_bf16``/``i8``/``i4``) reads the quantized sibling when
-    present and otherwise the fp32 shard round-tripped through that dtype, so the model sees
-    the same precision either way; ``zstd_bf16`` is the losslessly compressed ``bf16``. ``lightweight_metadata`` reads ``metadata_light`` (no
-    per-element moments) when it exists. ``split_into_bands`` names the zonal-flow band
-    layout written by ``preprocess --split-into-bands``.
+    ``prefer_dtype`` (``fp16``/``bf16``/``zstd16``/``i8``/``i4``) reads the quantized sibling
+    when present and otherwise the fp32 shard round-tripped through that dtype, so the model
+    sees the same precision either way; ``zstd16`` is the losslessly compressed ``bf16``.
+    ``lightweight_metadata`` reads ``metadata_light`` (no per-element moments) when it exists.
+    ``split_into_bands`` names the zonal-flow band layout written by
+    ``preprocess --split-into-bands``.
     """
 
     def __init__(
@@ -251,10 +252,10 @@ class NumpyBackend(DataBackend):
     def _read(self, handle: str, kind: str, t: int, shape: tuple):
         fp32 = os.path.join(handle, "data", frame_name(kind, t) + ".bin")
         path, bits = quant.resolve(fp32, self.prefer_dtype)
-        if bits == "zstd_bf16" and not self._zstd_announced:
+        if bits == "zstd16" and not self._zstd_announced:
             self._zstd_announced = True
             decode = getattr(self, "zstd_decode", "cpu")
-            print(f"[data] reading zstd_bf16 shards ({decode} decode), first: {path}", flush=True)
+            print(f"[data] reading zstd16 shards ({decode} decode), first: {path}", flush=True)
         if bits == "fp32" and self.prefer_dtype != "fp32":
             # no quantized sibling: quantize the fp32 shard on the fly
             return self._roundtrip(fp32, shape)
@@ -266,7 +267,7 @@ class NumpyBackend(DataBackend):
     def _read_file(self, path: str, bits: str, shape: tuple):
         if bits == "fp32":
             return read_bin(path, shape)
-        if bits == "zstd_bf16":
+        if bits == "zstd16":
             raw = zframe.decode(np.fromfile(path, dtype=np.uint8))
             return raw.view(quant.payload_dtype("bf16")).astype(np.float32).reshape(shape)
         return quant.read(path, bits, int(np.prod(shape))).reshape(shape)
@@ -288,7 +289,7 @@ class KvikIOBackend(NumpyBackend):
 
     Shards are read into a cupy buffer on device ``rank`` and handed to jax zero-copy over
     DLPack (fp32 / fp16 / bf16 / i8); i4 shards and on-the-fly quantization go through the
-    host. ``zstd_bf16`` shards are decompressed on the host (``zstd_decode="cpu"``) or by nvCOMP on the
+    host. ``zstd16`` shards are decompressed on the host (``zstd_decode="cpu"``) or by nvCOMP on the
     device (``"gpu"``) and unshuffled on the device. Requires the dataloader to run in-process.
     Same layout and options as ``NumpyBackend``.
     """
@@ -340,7 +341,7 @@ class KvikIOBackend(NumpyBackend):
         import kvikio
 
         n_elems = int(np.prod(shape))
-        if bits == "zstd_bf16":
+        if bits == "zstd16":
             return self._read_zstd(path, shape)
         if bits == "i4":
             return self._output(quant.read(path, bits, n_elems).reshape(shape))

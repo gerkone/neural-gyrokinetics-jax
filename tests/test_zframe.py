@@ -1,4 +1,4 @@
-"""Lossless ``.zstd_bf16`` shards: encode / decode, the jitted device unshuffle and the backend read path."""
+"""Lossless ``.zstd16`` shards: encode / decode, the jitted device unshuffle and the backend read path."""
 
 from __future__ import annotations
 
@@ -30,27 +30,24 @@ def test_rejects_other_files():
         zframe.parse_header(b"\0" * 4096)
 
 
-def test_backend_reads_zstd_bf16_as_the_bf16_shard(tmp_path):
+def test_backend_reads_zstd16_as_the_bf16_shard(tmp_path):
     shape = (2, 1, 4, 3, 5, 7, 4)
     x = np.random.default_rng(0).standard_normal(shape).astype(ml_dtypes.bfloat16)
     traj = tmp_path / "traj"
     (traj / "data").mkdir(parents=True)
     x.tofile(traj / "data" / "timestep_00000.bf16.bin")
     ref = NumpyBackend(prefer_dtype="bf16").read_df(str(traj), 0, shape)
-    (traj / "data" / "timestep_00000.zstd_bf16.bin").write_bytes(zframe.encode(x, chunk_bytes=64))
+    (traj / "data" / "timestep_00000.zstd16.bin").write_bytes(zframe.encode(x, chunk_bytes=64))
     fp32 = str(traj / "data" / "timestep_00000.bin")
     # opt-in only: a bf16 preference never reads the compressed sibling
-    assert (
-        quant.resolve(fp32, "bf16")[1] == "bf16"
-        and quant.resolve(fp32, "zstd_bf16")[1] == "zstd_bf16"
-    )
-    out = NumpyBackend(prefer_dtype="zstd_bf16").read_df(str(traj), 0, shape)
+    assert quant.resolve(fp32, "bf16")[1] == "bf16" and quant.resolve(fp32, "zstd16")[1] == "zstd16"
+    out = NumpyBackend(prefer_dtype="zstd16").read_df(str(traj), 0, shape)
     assert out.dtype == np.float32 and np.array_equal(out, ref)
-    (traj / "data" / "timestep_00000.zstd_bf16.bin").unlink()
-    assert quant.resolve(fp32, "zstd_bf16")[1] == "bf16"
+    (traj / "data" / "timestep_00000.zstd16.bin").unlink()
+    assert quant.resolve(fp32, "zstd16")[1] == "bf16"
 
 
-def test_zstd_bf16_preference_rounds_fp32_shards_to_bf16(tmp_path):
+def test_zstd16_preference_rounds_fp32_shards_to_bf16(tmp_path):
     shape = (2, 1, 4, 3, 5, 7, 4)
     traj = tmp_path / "traj"
     (traj / "data").mkdir(parents=True)
@@ -58,5 +55,5 @@ def test_zstd_bf16_preference_rounds_fp32_shards_to_bf16(tmp_path):
         traj / "data" / "timestep_00000.bin"
     )
     a = NumpyBackend(prefer_dtype="bf16").read_df(str(traj), 0, shape)
-    b = NumpyBackend(prefer_dtype="zstd_bf16").read_df(str(traj), 0, shape)
+    b = NumpyBackend(prefer_dtype="zstd16").read_df(str(traj), 0, shape)
     assert np.array_equal(a, b)
