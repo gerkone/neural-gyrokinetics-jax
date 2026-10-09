@@ -395,7 +395,8 @@ class KineticSwin5DAE(Swin5DAE):
         if self.normalized_latent:
             z = self.post_z_norm(z)
         z = self.middle_post(self.middle_upproj(z), cond, key=keys[0], inference=inference)
-        z = self.middle_upscale(z)
+        # the shared upscale is built for the primary grid; crop to this stem's grid
+        z = self.middle_upscale(z, target_grid_size=bb.grid_sizes[-2])
         for blk, k in zip(bb.up_blocks, keys[1:]):
             z = blk(z, None, cond, key=k, inference=inference)
         return {"df": bb.patch_decode(z, cond)}

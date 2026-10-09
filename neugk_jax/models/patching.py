@@ -258,8 +258,15 @@ class PatchExpand(eqx.Module):
         # norm runs over out_dim channels after unfold
         self.norm = make_norm(self.out_dim, rms=rms_norm) if norm else None
 
-    def __call__(self, x: jnp.ndarray, cond: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        cond: Optional[jnp.ndarray] = None,
+        target_grid_size: Optional[Sequence[int]] = None,
+    ) -> jnp.ndarray:
+        """``target_grid_size`` overrides the crop of the constructor (same expansion)."""
         # order: proj_concat (skip residual) -> film -> expansion -> crop -> norm
+        target = self.target_grid_size if target_grid_size is None else tuple(target_grid_size)
         if self.proj_concat is not None:
             x = leaky_relu(self.proj_concat(x))
         if self.modulation is not None:
@@ -267,8 +274,11 @@ class PatchExpand(eqx.Module):
         x = self.expansion(x if self.in_mult == 1.0 else x * self.in_mult)
         if not self.use_conv:
             x = unfold_patches(x, self.expand_by, out_channels=self.out_dim)
+        grid = x.shape[: len(target)]
+        if any(t > g for t, g in zip(target, grid)):
+            raise ValueError(f"expanded grid {grid} is smaller than the target {target}")
         # crop any overshoot from ceiling the expand factor
-        x = unpad(x, self.target_grid_size)
+        x = unpad(x, target)
         if self.norm is not None:
             x = self.norm(x)
         return x
