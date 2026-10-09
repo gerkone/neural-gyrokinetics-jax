@@ -32,8 +32,9 @@ public data tests.
 - `configs/` — Hydra configs; `configs/checkpoints/` holds release model configs
 - `main.py` — Hydra entrypoint
 - `scripts/` — `translate_ckpt.py` (AE / DiT / GyroSwin), `eval_diffusion.py`, `export_pinc_torch.py`,
-  `resume_pinc_torch.py` (a torch PINC-AE `ckp.pth` as a resumable JAX run), `export_nf_torch.py`
-  (neural fields to the torch `.pt` checkpoints `neugk.pinc.eval` scores)
+  `release_checkpoint.py`, and the PINC benchmarks: `eval_compression.py` (codecs, neural fields and
+  autoencoders on the steady-state or transition snapshots), `eval_scaling.py`, `eval_interp.py`
+  (representation interpolation) and `eval_snapshots.py`
 - `docs/metrics.md` — validation metric definitions and renames
 - `tests/`
 
@@ -46,7 +47,8 @@ and `experiment=diffusion` / `experiment=pinc_revival` need `ae_checkpoint=<ae r
 python main.py experiment=pinc_revival_ae logging=wandb                      # base ae
 python main.py experiment=pinc_revival ae_checkpoint=<base ae run> logging=wandb
 python main.py experiment=nf training.ckpt_dir=<nf dir>                       # restart resumes
-python scripts/export_nf_torch.py <nf dir> --out <torch nf dir>
+python scripts/eval_compression.py --methods nf,nf-pinc,zfp --ckpts <nf dir> --path <eval data> \
+    --ae PINC-AE=<pinc-ae run> --outdir <out> --gpus 0,1
 ```
 
 ## Tests

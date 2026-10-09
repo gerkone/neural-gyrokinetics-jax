@@ -1,9 +1,9 @@
-# base ae pretraining of the pinc_revival two-stage runs (torch: 8 x 32, plain mse; no bf16 shards on disk, so fp32 reads)
+# base ae pretraining of the pinc_revival runs
 defaults:
   - ae@_here_
   - _self_
 
-batch_size: 32  # per device; fp32 compute fits 32 on a b300 (torch: 8 x 32 with bf16 autocast)
+batch_size: 32  # per device
 n_epochs: 400
 loss_type: mse
 num_workers: 8

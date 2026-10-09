@@ -13,14 +13,14 @@ pinc:
   min_lr: 1.0e-8
   warmup: 20
   weight_decay: 1.0e-12
-  # comparators of the shared pinc terms (neugk_jax.pinc.losses.compare), as the torch neural fields
+  # comparators of the shared pinc terms (neugk_jax.pinc.losses.compare)
   loss_types:
     potential: phi_c  # the (re, im) complex potential of the one-sided spectrum, also for psnr(phi)
     phi_int: std_l1
     flux_int: l1
     kyspec: std_l1
     qspec: l1
-  df_units: physical  # df mse in physical units (torch nf) or of the z-scored field
+  df_units: physical  # df mse in physical units or of the z-scored field
   loss_weights:
     df: 1.0
     phi_int: 1.0

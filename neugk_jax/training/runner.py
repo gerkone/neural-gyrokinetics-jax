@@ -100,7 +100,6 @@ class StepSpec:
     post_update: Callable
 
 
-
 @eqx.filter_jit(donate="all-except-first")
 def train_step(inputs, model, opt_state, spec: StepSpec):
     """``inputs = (batch, ctx, key)``; ``ctx`` holds the run-constant device tables (not donated).

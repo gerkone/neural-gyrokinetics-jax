@@ -109,7 +109,7 @@ def sz3_recon(df, error_bound: float = 5.0):
     return _wrap(sz3_encode, sz3_decode, df, float(error_bound))
 
 
-# wavelet: separable periodized dwt, global top-k on the joint re/im magnitude, sparse float16 storage
+# wavelet: separable periodized dwt, global top-k on the re/im magnitude, sparse float16 storage
 _WAV_AXES = (
     (1, "bior6.8", 2),
     (2, "haar", 1),
@@ -245,7 +245,7 @@ def jpeg2000_recon(df, ratio: float = 1167.0):
 
 @dataclass(frozen=True)
 class Codec:
-    """A codec, its rate knob and search range, whether the ratio grows with the knob, integer knob."""
+    """A codec, its rate knob and range, whether the ratio grows with it, and an integer knob."""
 
     fn: Callable[..., Tuple[np.ndarray, bytes, int]]
     knob: str

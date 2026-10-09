@@ -89,7 +89,7 @@ def local_rows(tree):
 
 @eqx.filter_jit(donate="all-except-first")
 def density_chunk(inputs, models, opt_state, optimizer, n_steps: int):
-    """``n_steps`` AdamW steps of the pool on point batches ``perm[:, step * B : (step + 1) * B]``."""
+    """``n_steps`` AdamW steps of the pool on the point batches ``perm[:, step * B : ...]``."""
     fields, perm, start, batch = inputs
     grid, n = fields.shape[2:], perm.shape[1]
     params, static = eqx.partition(models, eqx.is_array)

@@ -99,7 +99,7 @@ def moment_weights(geometry: dict) -> dict:
 
 
 def velocity_moment_errors(pred, gt, weights: dict) -> dict[str, float]:
-    """Relative L1 of the density, momentum and energy moments and the free-energy error, in float64."""
+    """Relative L1 of the density, momentum and energy moments and free-energy error, in float64."""
     with jax.enable_x64(True):
         w = {k: jnp.asarray(v, jnp.float64) for k, v in weights.items()}
         out = _velocity_moments(jnp.asarray(pred), jnp.asarray(gt), w)
@@ -107,7 +107,7 @@ def velocity_moment_errors(pred, gt, weights: dict) -> dict[str, float]:
 
 
 def zonal_profiles(phi_spec: np.ndarray, geometry: dict) -> dict[str, np.ndarray]:
-    """GKW ``zfshear`` profiles: flux-surface averaged zonal potential, its first and second radial derivative."""
+    """GKW ``zfshear`` profiles: zonal potential and its first two radial derivatives."""
     ints = np.asarray(geometry["ints"], np.float64).reshape(-1, 1)
     kx = np.asarray(geometry["kxrh"], np.float64).reshape(-1)
     zon = (np.asarray(phi_spec)[:, :, 0] * ints).sum(0)
@@ -136,7 +136,7 @@ def log_spectral_distance(p, g, floor: float = LSD_FLOOR) -> float:
 
 
 def wasserstein1(p, g) -> float:
-    """1D Wasserstein-1 distance of the normalized non-negative spectra, in units of the grid length."""
+    """1D Wasserstein-1 distance of the normalized non-negative spectra, in grid lengths."""
     p, g = np.maximum(p, 0), np.maximum(g, 0)
     cp, cg = np.cumsum(p / (p.sum() + 1e-30)), np.cumsum(g / (g.sum() + 1e-30))
     return float(np.abs(cp - cg).sum() / len(g))
@@ -202,7 +202,7 @@ def _shift(u, axis: int, off: int):
 
 
 def optical_flow_5d(x, alpha: float = 1.0, n_iters: int = 50):
-    """Iterative Horn-Schunck optical flow of a ``(c, t, vp, mu, s, x, y)`` sequence, ``(5, t - 1, ...)``.
+    """Iterative Horn-Schunck flow ``(5, t - 1, ...)`` of a ``(c, t, vp, mu, s, x, y)`` sequence.
 
     Channel-mean intensity, central-difference spatial gradients and the zero-padded star-stencil
     average over the five spatial axes.

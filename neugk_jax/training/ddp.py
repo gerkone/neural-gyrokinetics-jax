@@ -121,7 +121,7 @@ def _assemble_blocks(blocks, sharding: NamedSharding, n_procs: int):
 
 
 def row_devices(dist: DistributedInfo, n_rows: int) -> list:
-    """The local device each of ``n_rows`` process-local batch rows lands on in :func:`shard_batch`."""
+    """Local device of each of ``n_rows`` process-local batch rows in :func:`shard_batch`."""
     mesh = dist.mesh
     if mesh.size == 1:
         return [mesh.devices.flat[0]] * n_rows

@@ -1,4 +1,4 @@
-"""CLI: JAX AE / VQ-VAE or PINC PEFT checkpoint -> torch ``{model_state_dict, epoch, loss}`` + ``config.yaml``.
+"""CLI: JAX AE / VQ-VAE / PINC PEFT checkpoint -> torch ``{model_state_dict, ...}`` and config.
 
 PEFT adapters are merged into the base weights (``--peft-format`` keeps them as peft keys, for a
 strategy-selected adapter set only); keys and shapes follow the base AE (the run's ``ae_checkpoint``

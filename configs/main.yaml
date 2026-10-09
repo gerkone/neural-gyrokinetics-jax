@@ -22,8 +22,7 @@ output_path: null
 load_ckpt: false
 # trained ae run directory (or checkpoint file) for workflow=diffusion and workflow=pinc stage=peft
 ae_checkpoint: null
-# workflow=pinc: peft fine-tunes lora adapters of ae_checkpoint, joint trains a fresh ae on df + physics,
-# else plain ae training
+# workflow=pinc: peft adapts ae_checkpoint with lora, joint trains a fresh ae on df + physics
 stage: null
 # persistent xla compilation cache directory; null disables it
 jax_compilation_cache_dir: null

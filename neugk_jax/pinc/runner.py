@@ -74,7 +74,7 @@ class AERunner(BaseRunner):
         self.extra_zf = bool(self.cfg.model.get("extra_zf_loss", False)) and self.separate_zf
         # training.batch_transform: readers serve raw frames, normalized per batch in the step
         self.train_ds.batch_transform = bool(self.tcfg.get("batch_transform", False))
-        # training.compute_dtype: forward in bf16 on a cast copy of the fp32 weights (torch autocast)
+        # training.compute_dtype: forward in bf16 on a cast copy of the fp32 weights
         dt = self.tcfg.get("compute_dtype")
         self.compute_dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16}.get(dt) if dt else None
 

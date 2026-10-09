@@ -212,11 +212,13 @@ class Gate(eqx.Module):
 
 
 def cast_floating(tree, dtype):
-    """``tree`` with its floating-point arrays cast to ``dtype`` (a compute copy of fp32 weights)."""
-    return jax.tree_util.tree_map(
-        lambda x: x.astype(dtype) if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,
-        tree,
-    )
+    """``tree`` with its floating-point arrays cast to ``dtype``."""
+
+    def cast(x):
+        floating = eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating)
+        return x.astype(dtype) if floating else x
+
+    return jax.tree_util.tree_map(cast, tree)
 
 
 def trainable_mask(model):

@@ -1,15 +1,17 @@
-"""CLI: rate-distortion points of the compression benchmark for the scaling figure.
+"""CLI: rate-distortion points of the compression benchmark across compression ratios.
 
-``nf``: the NF (density, ``mlp_*``) and NF-PINC (``int_mlp_*``) fields of ``<scale-dir>/<cr>x/`` and
-``ae``: autoencoder runs (``--ae FAMILY@LABEL=RUN[:CKPT]``), one entry per variant pooled over the
-trajectories, appended to ``<outdir>/scaling.pkl`` as ``{family: [{"cr", "name", metric...}]}``.
+``nf``: the NF (density, ``mlp_*``) and NF-PINC (``int_mlp_*``) fields of ``<scale-dir>/<cr>x/``
+and ``ae``: autoencoder runs (``--ae FAMILY@LABEL=RUN[:CKPT]``), one entry per variant pooled over
+the trajectories, appended to ``<outdir>/scaling.pkl`` as ``{family: [{"cr", "name", metric...}]}``.
 ``codecs``: each (codec, target CR, trajectory) encoded per snapshot at iso-CR, rows
-``{traj, t, raw, bytes, knob, psnr, l1, phi_l1, phi_psnr, eflux_l1, sec}`` in ``<outdir>/codecs.pkl``
-keyed by ``(codec, target)``; CPU parallel. Every family and key is skipped when already stored.
+``{traj, t, raw, bytes, knob, psnr, l1, phi_l1, phi_psnr, eflux_l1, sec}`` in
+``<outdir>/codecs.pkl`` keyed by ``(codec, target)``; CPU parallel. Every family and key is skipped
+when already stored.
 
-    python scripts/eval_scaling.py nf --scale-dir nf_ckps_scale --crs 50,1168 --path ... --outdir out
-    python scripts/eval_scaling.py ae --ae AE@AE_502=runs/scaling_ae_502/20261004 --path ... --outdir out
-    python scripts/eval_scaling.py codecs --codecs zfp,sz3 --crs 50,1168 --workers 30 --path ... --outdir out
+    python scripts/eval_scaling.py nf --scale-dir nf_scale --crs 50,1168 --path ... --outdir out
+    python scripts/eval_scaling.py ae --ae AE@AE_502=runs/scaling_ae_502 --path ... --outdir out
+    python scripts/eval_scaling.py codecs --codecs zfp,sz3 --crs 50,1168 --workers 30 \\
+        --path ... --outdir out
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ def _save(path: str, obj) -> None:
 
 
 def nf_weights(cr_dir: str, prefix: str) -> dict[int, dict]:
-    """``{cr: {traj: {t: path}}}`` of the ``<prefix>_<traj>_t<t>_x<cr>.pt`` checkpoints in ``cr_dir``."""
+    """``{cr: {traj: {t: path}}}`` of the ``<prefix>_<traj>_t<t>_x<cr>.pt`` files in ``cr_dir``."""
     import re
 
     rx = re.compile(rf"^{prefix}_(iteration_\d+)_t(\d+)_x(\d+)\.pt$")

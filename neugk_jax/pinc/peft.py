@@ -43,7 +43,7 @@ def uniform_ds(*datasets) -> float:
 
 
 class PINCPEFTRunner(AERunner):
-    """Adapter fine-tune (``stage=peft``) or joint training of a Swin5DAE against the PINC losses."""
+    """Adapter fine-tune (``stage=peft``) or joint training of a Swin5DAE on the PINC losses."""
 
     val_metrics = ("phi_int_mse",)
     accepts_vq = True

@@ -1,16 +1,16 @@
-"""CLI: the compression benchmark (Table 1 steady state, transition windows) over test trajectories.
+"""CLI: compression benchmark on the steady-state snapshots or transition windows of trajectories.
 
 The (trajectory, timesteps) set and the iso-CR target come from the PINC-NF checkpoints in
 ``--ckpts`` (``nf_ckps_intdiag`` for the steady state, ``nf_ckps_transition`` for the transition
-windows). Rows are written per (method, trajectory) and resume; ``eval1k_<LABEL>.json`` is rebuilt
-at the end. Methods: ``nf``, ``nf-pinc``, ``pinn`` (``--pinn-ckpts``), the codecs ``zfp``, ``sz3``,
-``wavelet``, ``pca``, ``jpeg2000`` at the neural-field CR, and autoencoders ``--ae LABEL=RUN[:CKPT]``
-(a JAX run directory, or a torch ``.pth`` of the ``pinc_revival`` AE).
+windows). Rows are written per (method, trajectory) and resume; ``eval1k_<LABEL>.json`` is
+rebuilt at the end. Methods: ``nf``, ``nf-pinc``, ``pinn`` (``--pinn-ckpts``), the codecs ``zfp``,
+``sz3``, ``wavelet``, ``pca``, ``jpeg2000`` at the neural-field CR, and autoencoders
+``--ae LABEL=RUN[:CKPT]`` (a JAX run directory, or a torch ``.pth`` of the ``pinc_revival`` AE).
 
     python scripts/eval_compression.py --methods nf,nf-pinc,zfp --ckpts nf_ckps_intdiag \\
-        --path /system/user/publicwork/galletti/pinc_revival_eval --gpus 0,1 --outdir out
-    python scripts/eval_compression.py --ae PINC-AE=runs/pinc_ae:ckp.eqx --ckpts nf_ckps_transition \\
-        --path ... --outdir out_transition --dump-diags
+        --path <eval data> --gpus 0,1 --outdir out
+    python scripts/eval_compression.py --ae PINC-AE=runs/pinc_ae:ckp.eqx \\
+        --ckpts nf_ckps_transition --path ... --outdir out_transition --dump-diags
 """
 
 from __future__ import annotations

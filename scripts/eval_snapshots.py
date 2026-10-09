@@ -1,12 +1,13 @@
 """CLI: an AE / PINC-AE over the evaluation snapshots, with the ``neugk.pinc.eval`` metrics.
 
 The snapshots are ``dataset.validation_trajectories`` x ``dataset.timesteps`` of the ``nf``
-dataset config (the 1080 eval1k snapshots); the AE normalization comes from the ``pinc_revival``
-dataset config (or ``--stats``). Per snapshot, as ``neugk.pinc.eval.metrics.ml_eval``: PSNR of the
-recombined physical df and of the real potential, ``|sum Q_pred - sum Q_gt|``, df rel-L2.
-Reported as the mean (and std) over trajectories of the per-trajectory means.
+dataset config; the AE normalization comes from the ``pinc_revival`` dataset config (or
+``--stats``). Per snapshot, as ``neugk.pinc.eval.metrics.ml_eval``: PSNR of the recombined
+physical df and of the real potential, ``|sum Q_pred - sum Q_gt|``, df rel-L2. Reported as the
+mean (and std) over trajectories of the per-trajectory means.
 
-    python scripts/eval_snapshots.py --base <base ae .pth / jax run> [--lora <jax pinc run | torch peft .pth>]
+    python scripts/eval_snapshots.py --base <base ae .pth / jax run> \\
+        [--lora <jax pinc run | torch peft .pth>]
 """
 
 from __future__ import annotations
@@ -70,7 +71,9 @@ def load_model(cfg, ds, base: str, lora: str | None):
         load_torch_state,
     )
 
-    model = load_or_translate(build_ae(cfg, ds, key=jr.PRNGKey(0)), str(resolve_checkpoint(base)), strict=True)
+    model = load_or_translate(
+        build_ae(cfg, ds, key=jr.PRNGKey(0)), str(resolve_checkpoint(base)), strict=True
+    )
     if lora is None:
         return model
     model = attach_ae_lora(model, cfg.model.peft.lora, key=jr.PRNGKey(1))
@@ -82,11 +85,17 @@ def load_model(cfg, ds, base: str, lora: str | None):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base", required=True, help="base ae: torch .pth, jax .eqx or run directory")
-    p.add_argument("--lora", default=None, help="pinc adapters: jax run directory / .eqx, or torch peft .pth")
-    p.add_argument("--stats", default=None, help="normalization stats pickle (default: the pinc_revival one)")
+    p.add_argument(
+        "--lora", default=None, help="pinc adapters: jax run directory / .eqx, or torch peft .pth"
+    )
+    p.add_argument(
+        "--stats", default=None, help="normalization stats pickle (default: the pinc_revival one)"
+    )
     p.add_argument("--batch-size", type=int, default=16, help="per device")
     p.add_argument("--out", default=None, help="json of the per-snapshot rows")
-    p.add_argument("--precision", default="highest", help="jax_default_matmul_precision (tf32 otherwise)")
+    p.add_argument(
+        "--precision", default="highest", help="jax_default_matmul_precision (tf32 otherwise)"
+    )
     args, overrides = p.parse_known_args()
     jax.config.update("jax_default_matmul_precision", args.precision)
 
@@ -97,20 +106,30 @@ def main():
     dist = init_distributed()
     stats = args.stats or cfg.dataset.normalization_stats
     ds = build_dataset(
-        cfg.dataset, split="val", dist=dist, trajectories=list(nf.validation_trajectories),
-        cond_filters=None, offset=0, subsample=1, normalization_stats=stats,
+        cfg.dataset,
+        split="val",
+        dist=dist,
+        trajectories=list(nf.validation_trajectories),
+        cond_filters=None,
+        offset=0,
+        subsample=1,
+        normalization_stats=stats,
     )
     enc, dec = ae_conditioning(cfg.model)
     slots = conditioning_slots(ds.conditions, set(enc) | set(dec))
     model = load_model(cfg, ds, args.base, args.lora)
     index = {v: k for k, v in ds.flat_index_to_file_and_tstep.items()}
-    snaps = [(f, int(t)) for f in range(len(ds.files)) for t in nf.timesteps if (f, int(t)) in index]
+    snaps = [
+        (f, int(t)) for f in range(len(ds.files)) for t in nf.timesteps if (f, int(t)) in index
+    ]
     geom = GeometryCache(ds).table()
     gbs = args.batch_size * dist.device_count
     loader = BatchLoader(workers=8, prefetch=2)
 
     def load(ds_, idx, read):
-        return select_conditions(stack_fields(read(ds_, idx), ("df", "file_index", "conditioning")), slots)
+        return select_conditions(
+            stack_fields(read(ds_, idx), ("df", "file_index", "conditioning")), slots
+        )
 
     from neugk_jax.training.data import BatchPlan
 
@@ -119,18 +138,27 @@ def main():
     for b in range(0, len(flat), gbs):
         sel = flat[b : b + gbs]
         n = len(sel)
-        plans.append(BatchPlan(np.asarray(sel + [sel[-1]] * (gbs - n)), np.arange(gbs) < n, b // gbs))
+        plans.append(
+            BatchPlan(np.asarray(sel + [sel[-1]] * (gbs - n)), np.arange(gbs) < n, b // gbs)
+        )
     rows, t0 = [], time.perf_counter()
     for plan, batch, _ in loader.iterate(ds, plans, load, lambda b: shard_batch(dist, b)):
         batch.pop("mask")
         m = jax.device_get(snapshot_metrics(model, batch, ds.norm, geom))
         for i in np.flatnonzero(plan.mask):
             f, t = ds.flat_index_to_file_and_tstep[int(plan.indices[i])]
-            rows.append({"traj": Path(ds.files[f]).name.split("_ifft")[0], "t": int(t), **{k: float(v[i]) for k, v in m.items()}})
+            rows.append(
+                {
+                    "traj": Path(ds.files[f]).name.split("_ifft")[0],
+                    "t": int(t),
+                    **{k: float(v[i]) for k, v in m.items()},
+                }
+            )
     loader.close()
     dt = time.perf_counter() - t0
     trajs = sorted({r["traj"] for r in rows})
-    print(f"{len(rows)} snapshots, {len(trajs)} trajectories, {dt:.0f}s ({len(rows) / dt:.1f} snapshots/s)")
+    rate = len(rows) / dt
+    print(f"{len(rows)} snapshots, {len(trajs)} trajectories, {dt:.0f}s ({rate:.1f} snapshots/s)")
     for k in ("psnr", "phi_psnr", "eflux_l1", "df_rel_l2"):
         per = [np.mean([r[k] for r in rows if r["traj"] == tr]) for tr in trajs]
         print(f"  {k:10s} {np.mean(per):.3f} +- {np.std(per):.3f}")

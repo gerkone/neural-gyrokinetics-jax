@@ -5,7 +5,7 @@ its ``config.yaml``; a torch export (or torch run) directory gives ``torch/best.
 ``config.yaml``.
 
     python scripts/release_checkpoint.py --root <release> --name <name> [--run <jax run dir>]
-        [--ckpt best.eqx] [--torch <dir with best.pth>] [--row "<paper label>"] [--note "..."]
+        [--ckpt best.eqx] [--torch <dir with best.pth>] [--row "<table label>"] [--note "..."]
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def main():
     p.add_argument("--run", default=None, help="jax run directory")
     p.add_argument("--ckpt", default="best.eqx")
     p.add_argument("--torch", default=None, help="directory with best.pth + config.yaml")
-    p.add_argument("--row", default=None, help="paper table label")
+    p.add_argument("--row", default=None, help="results table label")
     p.add_argument("--note", default=None)
     args = p.parse_args()
     if not (args.run or args.torch):

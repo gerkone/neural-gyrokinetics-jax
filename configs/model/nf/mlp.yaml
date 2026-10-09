@@ -1,4 +1,4 @@
-# the pinc-paper neural field: 64 wide, 5 layers, residual, discrete grid embedding (1167x)
+# pinc neural field: 64 wide, 5 layers, residual, discrete grid embedding (1167x)
 name: mlp
 dim: 64
 n_layers: 5

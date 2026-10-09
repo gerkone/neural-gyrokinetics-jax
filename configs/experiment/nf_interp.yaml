@@ -1,6 +1,5 @@
 # @package _global_
-# weight-aligned neural fields of the representation interpolation (scripts/eval_interp.py): shared
-# per-trajectory initialization, extremes 20 apart whose midpoints are the interpolation targets
+# weight-aligned neural fields for scripts/eval_interp.py: shared per-trajectory init, extremes 20 apart
 #   python main.py experiment=nf_interp training.ckpt_dir=<dir>
 defaults:
   - override /model: nf/mlp

@@ -260,7 +260,7 @@ class CycloneDataset:
             self.backend.keep_half = self._batch_transform
 
     def transform(self, df, fids):
-        """The df frame transform on a raw batch ``(B, 2, ...)``: float32, zf separation, normalization."""
+        """Frame transform of a raw batch ``(B, 2, ...)``: float32, zf separation, normalization."""
         x = df.astype(np.float32)
         x = separate_zf_fn(x, axis=1) if self.separate_zf else x
         return self.norm.normalize("df", x, fids).astype(np.float32)
