@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -137,8 +138,7 @@ class StepSpec:
     post_update: Callable
 
 
-@eqx.filter_jit(donate="all-except-first")
-def train_step(inputs, model, opt_state, spec: StepSpec):
+def _train_step(inputs, model, opt_state, spec: StepSpec):
     """``inputs = (batch, ctx, key)``; ``ctx`` holds the run-constant device tables (not donated).
 
     A ``"state"`` entry of the loss aux is not logged but handed to
@@ -158,9 +158,61 @@ def train_step(inputs, model, opt_state, spec: StepSpec):
     return model, opt_state, {"total": value, **aux, **extra}
 
 
-@eqx.filter_jit(donate="all")
+train_step = eqx.filter_jit(_train_step, donate="all-except-first")
+
+
+@partial(jax.jit, donate_argnums=(0, 1))
 def _add_logs(acc, logs):
     return jax.tree_util.tree_map(jnp.add, acc, logs)
+
+
+class FlatStep:
+    """``train_step`` as a plain ``jax.jit`` over flat lists of the model and optimizer-state arrays.
+
+    The static parts are split off once, so a step call only flattens two lists of arrays; the
+    step key is ``fold_in(key, step)`` inside the program. ``matches`` tells whether a model and
+    optimizer state have the structure this step was built for.
+    """
+
+    def __init__(self, spec: StepSpec, model, opt_state):
+        (m_leaves, self.m_def, self.m_static), (o_leaves, self.o_def, self.o_static) = (
+            self._split(model),
+            self._split(opt_state),
+        )
+
+        def step(dyn, static, i, m_leaves, o_leaves):
+            batch, ctx, key = eqx.combine(dyn, jax.tree_util.tree_unflatten(static[0], static[1]))
+            model, opt_state = self.unflatten(m_leaves, o_leaves)
+            model, opt_state, logs = _train_step((batch, ctx, jr.fold_in(key, i)), model, opt_state, spec)
+            return self._split(model)[0], self._split(opt_state)[0], logs
+
+        self._step = jax.jit(step, static_argnums=1, donate_argnums=(3, 4))
+
+    @staticmethod
+    def _split(tree):
+        params, static = eqx.partition(tree, eqx.is_array)
+        leaves, treedef = jax.tree_util.tree_flatten(params)
+        return leaves, treedef, static
+
+    def matches(self, model, opt_state) -> bool:
+        (_, m_def, m_static), (_, o_def, o_static) = self._split(model), self._split(opt_state)
+        return (m_def, o_def) == (self.m_def, self.o_def) and bool(
+            eqx.tree_equal((m_static, o_static), (self.m_static, self.o_static))
+        )
+
+    def flatten(self, model, opt_state):
+        return self._split(model)[0], self._split(opt_state)[0]
+
+    def unflatten(self, m_leaves, o_leaves):
+        model = eqx.combine(jax.tree_util.tree_unflatten(self.m_def, m_leaves), self.m_static)
+        opt_state = eqx.combine(jax.tree_util.tree_unflatten(self.o_def, o_leaves), self.o_static)
+        return model, opt_state
+
+    def __call__(self, inputs, i, m_leaves, o_leaves):
+        # non-array inputs are static, as under eqx.filter_jit
+        dyn, static = eqx.partition(inputs, eqx.is_array)
+        leaves, treedef = jax.tree_util.tree_flatten(static)
+        return self._step(dyn, (treedef, tuple(leaves)), np.int32(i), m_leaves, o_leaves)
 
 
 def configure_compilation_cache(cfg) -> None:
@@ -400,18 +452,24 @@ class BaseRunner:
         acc, waits = None, []
         t_start = t_first = time.perf_counter()
         step0 = (epoch - 1) * self.steps_per_epoch
-        for i, (_, batch, wait) in enumerate(batches):
-            waits.append(wait)
-            batch.pop("mask")
-            batch = self.place_batch(batch)
-            batch.update(self.step_extras(step0 + i))
-            self.model, self.opt_state, logs = train_step(
-                (batch, self.ctx, jr.fold_in(step_key, i)), self.model, self.opt_state, self.spec
-            )
-            acc = logs if acc is None else _add_logs(acc, logs)
-            if i == 0:
-                jax.block_until_ready(acc)
-                t_first = time.perf_counter()
+        if getattr(self, "_flat_step", None) is None or not self._flat_step.matches(self.model, self.opt_state):
+            self._flat_step = FlatStep(self.spec, self.model, self.opt_state)
+        flat = self._flat_step
+        step_key = replicate(self.dist, step_key)
+        m_leaves, o_leaves = flat.flatten(self.model, self.opt_state)
+        try:
+            for i, (_, batch, wait) in enumerate(batches):
+                waits.append(wait)
+                batch.pop("mask")
+                batch = self.place_batch(batch)
+                batch.update(self.step_extras(step0 + i))
+                m_leaves, o_leaves, logs = flat((batch, self.ctx, step_key), i, m_leaves, o_leaves)
+                acc = logs if acc is None else _add_logs(acc, logs)
+                if i == 0:
+                    jax.block_until_ready(acc)
+                    t_first = time.perf_counter()
+        finally:
+            self.model, self.opt_state = flat.unflatten(m_leaves, o_leaves)
         n = len(waits)
         if acc is None:
             return {}, {}
