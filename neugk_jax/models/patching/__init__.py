@@ -2,7 +2,7 @@
 
 ``linear``: ``PatchEmbed`` / ``LinearUnpatch`` with weights tied to the patch size. ``points``: patch
 point coordinates (``PointGrid``). ``field``: ``SmoothPatchEmbed`` / ``SmoothUnpatch`` and
-``TuckerPatchEmbed`` / ``TuckerUnpatch``, whose weights are functions of the point coordinates.
+``DCTPatchEmbed`` / ``DCTUnpatch``, whose weights are functions of the point coordinates.
 :data:`PATCHINGS` maps a patching kind to its embedding / unpatch pair. The fold / unfold / padding ops
 live in :mod:`neugk_jax.models.ops` and are re-exported here.
 """
@@ -16,14 +16,15 @@ from neugk_jax.models.ops import (
     unpad,
 )
 from neugk_jax.models.patching.field import (
-    AxisBases,
+    CosineFilter,
+    DCTBases,
+    DCTPatchEmbed,
+    DCTUnpatch,
     FieldPatchEmbed,
     FieldUnpatch,
     PointFilter,
     SmoothPatchEmbed,
     SmoothUnpatch,
-    TuckerPatchEmbed,
-    TuckerUnpatch,
 )
 from neugk_jax.models.patching.linear import LinearUnpatch, PatchEmbed
 from neugk_jax.models.patching.points import AxisPoints, PointGrid
@@ -31,15 +32,18 @@ from neugk_jax.models.patching.points import AxisPoints, PointGrid
 PATCHINGS = {
     "linear": (PatchEmbed, LinearUnpatch),
     "smooth": (SmoothPatchEmbed, SmoothUnpatch),
-    "tucker": (TuckerPatchEmbed, TuckerUnpatch),
+    "dct": (DCTPatchEmbed, DCTUnpatch),
 }
-FIELD_PATCHINGS = ("smooth", "tucker")
+FIELD_PATCHINGS = ("smooth", "dct")
 
 __all__ = [
     "FIELD_PATCHINGS",
     "PATCHINGS",
-    "AxisBases",
     "AxisPoints",
+    "CosineFilter",
+    "DCTBases",
+    "DCTPatchEmbed",
+    "DCTUnpatch",
     "FieldPatchEmbed",
     "FieldUnpatch",
     "LinearUnpatch",
@@ -48,8 +52,6 @@ __all__ = [
     "PointGrid",
     "SmoothPatchEmbed",
     "SmoothUnpatch",
-    "TuckerPatchEmbed",
-    "TuckerUnpatch",
     "_normalize_patch",
     "fold_patches",
     "pad_amounts",

@@ -6,8 +6,10 @@ or ``absolute`` (node values mapped to [-1, 1] by ``range`` or the node extent, 
 ``weights``); absolute axes may be folded into the channels as ``(c, *folded)``. Without a spec every
 axis is relative with unit spacing. A point at cell ``j`` of a patch of ``q`` cells sits at
 ``(2 j + 1) / q - 1``, so the same physical position keeps its coordinate when the resolution changes.
-A relative axis may give its ``band``, the number of modes the data resolves per patch (default: the
-patch's point count); cosines are cut there, so a finer sampling of the same data adds no modes.
+Any axis may give its ``band``, the number of modes the data resolves per patch: the coordinate
+encoding fed to the filter MLPs is cut there (no cut without a ``band``), independently of the grid, so
+the filters are the same functions on every grid. Fixed cosine bases are further cut at the points of
+the grid (``AxisPoints.cap``), the modes it can represent.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from neugk_jax.models.ops import _normalize_patch
+
+NO_BAND = 1 << 30
 
 
 def _cells(j, q):
@@ -44,7 +48,11 @@ def _mean_one(w: np.ndarray) -> np.ndarray:
 
 
 class AxisPoints(eqx.Module):
-    """One axis of a patch: coordinates and quadrature weights, ``(p,)`` or ``(T, p)`` per token."""
+    """One axis of a patch: coordinates and quadrature weights, ``(p,)`` or ``(T, p)`` per token.
+
+    ``cap``: the modes a fixed cosine basis can use on this grid; ``band``: the cut of the coordinate
+    encoding (grid independent).
+    """
 
     buffer_fields = ("coords", "weight")
 
@@ -52,37 +60,41 @@ class AxisPoints(eqx.Module):
     weight: jnp.ndarray
     kind: str = eqx.field(static=True)
     cap: int = eqx.field(static=True)
+    band: int = eqx.field(static=True)
 
-    def __init__(self, coords, weight, kind: str, cap: int):
+    def __init__(self, coords, weight, kind: str, cap: int, band: int):
         self.coords = jnp.asarray(coords, jnp.float32)
         self.weight = jnp.asarray(weight, jnp.float32)
         self.kind = kind
         self.cap = int(cap)
+        self.band = int(band)
 
 
 class PointGrid(eqx.Module):
-    """Coordinates of the points of one patch, in ``fold_patches`` order.
+    """Coordinates of the points of one channel of a patch, in ``fold_patches`` order.
 
-    Per point: ``offsets`` (cell-centred offsets of the relative axes from the patch centre),
-    ``coords`` (absolute spatial and folded coordinates per token ``(*T_abs, P, n_abs)``), ``pos``
-    (cell-centred position in the patch along every spatial axis), ``channel`` and ``weight``.
-    ``axes`` holds the same per spatial and folded axis for the tucker bases.
+    The points are the spatial cells of the patch times the folded nodes; every channel has the same
+    points. Per point: ``offsets`` (cell-centred offsets of the relative axes from the patch centre),
+    ``coords`` (absolute spatial and folded coordinates per token, ``(*T_abs, P, n_abs)``), ``pos``
+    (cell-centred position in the patch along every spatial axis) and the quadrature ``weight``.
+    ``axes`` holds the same per spatial and folded axis, for separable bases.
     """
 
-    buffer_fields = ("coords", "offsets", "pos", "channel", "weight")
+    buffer_fields = ("coords", "offsets", "pos", "weight")
 
     coords: jnp.ndarray
     offsets: jnp.ndarray
     pos: jnp.ndarray
-    channel: jnp.ndarray
     weight: jnp.ndarray
     axes: tuple[AxisPoints, ...]
     patch: tuple[int, ...] = eqx.field(static=True)
+    tokens: tuple[int, ...] = eqx.field(static=True)
     rel_axes: tuple[int, ...] = eqx.field(static=True)
     abs_axes: tuple[int, ...] = eqx.field(static=True)
     n_fold: tuple[int, ...] = eqx.field(static=True)
+    n_channels: int = eqx.field(static=True)
     half: tuple[float, ...] = eqx.field(static=True)
-    caps: tuple[int, ...] = eqx.field(static=True)
+    bands: tuple[int, ...] = eqx.field(static=True)
     spacing: tuple[float, ...] = eqx.field(static=True)
     reference: tuple[float, ...] = eqx.field(static=True)
 
@@ -103,14 +115,13 @@ class PointGrid(eqx.Module):
         n_fold = tuple(len(f["nodes"]) for f in folded)
         if channels % max(1, math.prod(n_fold)):
             raise ValueError(f"{channels} channels do not hold the folded axes {n_fold}")
-        n_c = channels // math.prod(n_fold)
-        idx = np.meshgrid(*(np.arange(k) for k in (*patch, n_c, *n_fold)), indexing="ij")
+        idx = np.meshgrid(*(np.arange(k) for k in (*patch, *n_fold)), indexing="ij")
         idx = [i.reshape(-1) for i in idx]
-        offs, ic, ifold = idx[:n], idx[n], idx[n + 1 :]
-        n_points = len(ic)
+        offs, ifold = idx[:n], idx[n:]
+        n_points = math.prod(patch) * math.prod(n_fold)
 
         rel = [i for i, a in enumerate(axes) if a.get("kind", "relative") == "relative"]
-        band = [min(patch[i], int(axes[i].get("band", patch[i]))) for i in range(n)]
+        band = [int(axes[i].get("band", NO_BAND)) for i in range(n)]
         self.rel_axes = tuple(rel)
         self.abs_axes = tuple(i for i in range(n) if i not in rel)
         tokens = [padded[i] // patch[i] for i in self.abs_axes]
@@ -118,20 +129,16 @@ class PointGrid(eqx.Module):
         coords, weight, per_axis = [], np.ones(lead), []
         for i in range(n):
             if i in rel:
-                per_axis.append(
-                    AxisPoints(
-                        _cells(np.arange(patch[i]), patch[i]),
-                        np.ones(patch[i]),
-                        "relative",
-                        band[i],
-                    )
-                )
+                cells = _cells(np.arange(patch[i]), patch[i])
+                cap = min(patch[i], band[i])
+                per_axis.append(AxisPoints(cells, np.ones(patch[i]), "relative", cap, band[i]))
                 continue
             j = self.abs_axes.index(i)
             unit, w = _mapped(axes[i], padded[i])
             rows = np.arange(tokens[j])[:, None] * patch[i] + np.arange(patch[i])[None]
+            n_nodes = len(axes[i]["nodes"])
             per_axis.append(
-                AxisPoints(unit[rows], _mean_one(w[rows]), "absolute", len(axes[i]["nodes"]))
+                AxisPoints(unit[rows], _mean_one(w[rows]), "absolute", n_nodes, band[i])
             )
             pos = np.arange(tokens[j])[:, None] * patch[i] + offs[i][None]
             shape = [1] * len(tokens) + [n_points]
@@ -140,7 +147,8 @@ class PointGrid(eqx.Module):
             weight = weight * w[pos].reshape(shape)
         for f, i in zip(folded, ifold):
             unit, w = _mapped(f, len(f["nodes"]))
-            per_axis.append(AxisPoints(unit, _mean_one(w), "folded", len(unit)))
+            f_band = int(f.get("band", NO_BAND))
+            per_axis.append(AxisPoints(unit, _mean_one(w), "folded", len(unit), f_band))
             coords.append(np.broadcast_to(unit[i], lead))
             weight = weight * w[i]
         self.axes = tuple(per_axis)
@@ -151,14 +159,16 @@ class PointGrid(eqx.Module):
         pos = np.stack([_cells(o, p) for o, p in zip(offs, patch)], -1)
         self.pos = jnp.asarray(pos, jnp.float32)
         self.offsets = jnp.asarray(pos[:, list(rel)], jnp.float32)
-        self.channel = jnp.asarray(np.eye(n_c)[ic], jnp.float32)
         self.patch = patch
+        self.tokens = tuple(padded[i] // patch[i] for i in range(n))
         self.n_fold = n_fold
+        self.n_channels = channels // math.prod(n_fold)
         self.half = tuple(patch[i] / 2 for i in rel)
-        self.caps = (
+        # encoding cut per coordinate: offsets, absolute, then folded
+        self.bands = (
             tuple(band[i] for i in rel)
-            + tuple(len(axes[i]["nodes"]) for i in self.abs_axes)
-            + n_fold
+            + tuple(band[i] for i in self.abs_axes)
+            + tuple(int(f.get("band", NO_BAND)) for f in folded)
         )
         self.spacing = tuple(float(axes[i].get("spacing", 1.0)) for i in rel)
         # physical half-width of a full patch at the nominal spacing, unless given
@@ -170,55 +180,31 @@ class PointGrid(eqx.Module):
     def n_coords(self) -> int:
         return self.offsets.shape[-1] + self.coords.shape[-1]
 
-    @property
-    def n_channels(self) -> int:
-        return self.channel.shape[-1]
+    def centres(self, k: int) -> jnp.ndarray:
+        """``(T_k,)`` cell-centred patch centres along spatial axis ``k``, in [-1, 1] over the box."""
+        return jnp.asarray(_cells(np.arange(self.tokens[k]), self.tokens[k]), jnp.float32)
 
     def spacings(self, geometry=None) -> jnp.ndarray:
         return jnp.asarray(self.spacing if geometry is None else geometry, jnp.float32)
 
-    def scale(self, geometry=None, half=None) -> jnp.ndarray:
-        """Log physical half-width of a patch (``half`` cells per relative axis) over the reference."""
-        half = jnp.asarray(self.half if half is None else half, jnp.float32)
+    def scale(self, geometry=None) -> jnp.ndarray:
+        """Log physical half-width of a patch per relative axis, over the reference."""
+        half = jnp.asarray(self.half, jnp.float32)
         return jnp.log(half * self.spacings(geometry) / jnp.asarray(self.reference, jnp.float32))
 
     def features(self, geometry, modes: int) -> jnp.ndarray:
-        """``(*T_abs, P, F)`` encoded coordinates, channel and log physical half-width of every point."""
+        """``(*T_abs, P, F)`` encoded coordinates and log physical half-widths of every point."""
         lead = self.coords.shape[:-1]
         x = jnp.concatenate(
             [jnp.broadcast_to(self.offsets, (*lead, self.offsets.shape[-1])), self.coords], -1
         )
-        enc = encode(x, jnp.asarray(self.caps), modes)
         scale = self.scale(geometry)
-        return jnp.concatenate(
-            [
-                enc,
-                jnp.broadcast_to(self.channel, (*lead, self.n_channels)),
-                jnp.broadcast_to(scale, (*lead, scale.shape[-1])),
-            ],
-            -1,
-        )
-
-    def axis_features(self, k: int, geometry, modes: int) -> jnp.ndarray:
-        """``(..., p, F)`` encoded coordinates of axis ``k`` (spatial, then folded), plus the log half-width of a relative axis."""
-        ax = self.axes[k]
-        enc = encode(ax.coords[..., None], jnp.asarray([ax.cap]), modes)
-        if ax.kind != "relative":
-            return enc
-        j = self.rel_axes.index(k)
-        scale = self.scale(geometry, [self.patch[k] / 2 if i == k else 1.0 for i in self.rel_axes])[
-            j
-        ]
-        return jnp.concatenate([enc, jnp.broadcast_to(scale, (*enc.shape[:-1], 1))], -1)
-
-
-def encoded_index(ids: Sequence[int], modes: int) -> list[int]:
-    """Positions of the encodings of the coordinates ``ids`` in the :meth:`PointGrid.features` layout."""
-    return [c * modes + m for c in ids for m in range(modes)]
+        enc = encode(x, jnp.asarray(self.bands), modes)
+        return jnp.concatenate([enc, jnp.broadcast_to(scale, (*lead, scale.shape[-1]))], -1)
 
 
 def encode(x, caps, modes: int) -> jnp.ndarray:
-    """Cosines ``cos(k pi (x + 1) / 2)`` of the coordinates ``x`` in [-1, 1], cut at the resolution ``caps``."""
+    """Cosines ``cos(k pi (x + 1) / 2)`` of the coordinates ``x`` in [-1, 1], cut at the ``caps``."""
     k = jnp.arange(modes)
     c = jnp.cos(k * jnp.pi * (x[..., None] + 1) / 2) * (k < caps[:, None])
     return c.reshape(*x.shape[:-1], -1)

@@ -376,7 +376,7 @@ def build_release_gyroswin(cfg_path, *, key, resolution: Optional[Sequence[int]]
 def run_config(cfg, ds=None) -> dict:
     """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf.
 
-    With a field ``model.patch.type`` (smooth, tucker) the patch coordinates come from ``ds`` (:func:`field_grid`).
+    With a field ``model.patch.type`` (smooth, dct) the patch coordinates come from ``ds`` (:func:`field_grid`).
     """
     out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
@@ -391,7 +391,7 @@ def run_config(cfg, ds=None) -> dict:
 def field_grid(ds, fold_mu: bool = True) -> dict:
     """Field patching grid of a ``(vp, mu, s, x, y)`` dataset (its first trajectory).
 
-    vpar and mu are absolute (nodes and quadrature weights, mu folded into the channels with
+    vpar and mu are absolute (their nodes, uniform weights, mu folded into the channels with
     ``fold_mu``), s, x and y relative with their grid spacings (x, y from the box lengths).
     """
     g = ds.metadata[0]["geometry"]
@@ -400,8 +400,8 @@ def field_grid(ds, fold_mu: bool = True) -> dict:
         2 * np.pi / np.diff(np.unique(np.asarray(g[k], np.float64))).min() for k in ("kxrh", "krho")
     )
     nodes = lambda k: [float(v) for v in np.asarray(g[k], np.float64).ravel()]
-    vpar = {"kind": "absolute", "nodes": nodes("vpgr"), "weights": nodes("intvp")}
-    mu = {"kind": "absolute", "nodes": nodes("mugr"), "weights": nodes("intmu")}
+    vpar = {"kind": "absolute", "nodes": nodes("vpgr")}
+    mu = {"kind": "absolute", "nodes": nodes("mugr")}
     rel = [
         {"kind": "relative", "spacing": s}
         for s in (float(np.asarray(g["ints"]).ravel()[0]), lx / nx, ly / ny)
