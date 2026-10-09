@@ -134,3 +134,32 @@ def test_local_view_places_unreplicated_arrays_on_the_local_mesh():
     assert out["single"].sharding.device_set == local
     assert out["replicated"].sharding.device_set == local and out["static"] == 3
     assert np.array_equal(np.asarray(out["single"]), np.arange(4.0))
+
+
+def test_flat_step_matches_filter_jit_step(tmp_path):
+    import equinox as eqx
+    from helpers import make_traj, tiny_ae_cfg
+
+    from neugk_jax.pinc.runner import AERunner
+    from neugk_jax.training.ddp import replicate, shard_batch
+    from neugk_jax.training.runner import FlatStep, train_step
+
+    res = (4, 4, 4, 16, 8)
+    make_traj(tmp_path, "iteration_0", n_t=5, resolution=res)
+    make_traj(tmp_path, "iteration_1", n_t=4, resolution=res)
+    cfg = tiny_ae_cfg(tmp_path, res, tmp_path / "run")
+    r = AERunner(cfg, output_path=cfg.output_path)
+    batch = r.place_batch(shard_batch(r.dist, r.load_batch(r.train_ds, [0, 1] * r.dist.local_device_count, r.loader.read)))
+    key = replicate(r.dist, jr.PRNGKey(3))
+    copy = lambda t: jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True) if eqx.is_array(x) else x, t)
+    model, opt = copy(r.model), copy(r.opt_state)
+    flat = FlatStep(r.spec, r.model, r.opt_state)
+    m_leaves, o_leaves = flat.flatten(copy(r.model), copy(r.opt_state))
+    for i in range(3):
+        model, opt, logs = train_step((batch, r.ctx, jr.fold_in(key, i)), model, opt, r.spec)
+        m_leaves, o_leaves, flat_logs = flat((batch, r.ctx, key), i, m_leaves, o_leaves)
+        assert all(np.array_equal(logs[k], flat_logs[k]) for k in logs)
+    flat_model, flat_opt = flat.unflatten(m_leaves, o_leaves)
+    for a, b in zip(jax.tree_util.tree_leaves((model, opt)), jax.tree_util.tree_leaves((flat_model, flat_opt))):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+    assert flat.matches(flat_model, flat_opt)
