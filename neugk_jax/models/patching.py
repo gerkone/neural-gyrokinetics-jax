@@ -30,6 +30,27 @@ def _normalize_patch(patch_size: Sequence[int]) -> tuple[int, ...]:
     return tuple(p if p and p > 0 else 1 for p in patch_size)
 
 
+def _merged_transpose(x: jnp.ndarray, perm: Sequence[int]) -> jnp.ndarray:
+    """``jnp.transpose(x, perm)`` with size-1 axes dropped and axes that stay adjacent merged."""
+    keep = [a for a in perm if x.shape[a] != 1]
+    out_shape = [x.shape[a] for a in perm]
+    if not keep:
+        return x.reshape(out_shape)
+    rank = {a: i for i, a in enumerate(sorted(keep))}
+    p = [rank[a] for a in keep]
+    x = x.reshape([x.shape[a] for a in sorted(keep)])
+    groups = [[p[0]]]
+    for a in p[1:]:
+        if a == groups[-1][-1] + 1:
+            groups[-1].append(a)
+        else:
+            groups.append([a])
+    by_input = sorted(range(len(groups)), key=lambda g: groups[g][0])
+    x = x.reshape([math.prod(x.shape[a] for a in groups[g]) for g in by_input])
+    x = jnp.transpose(x, [by_input.index(g) for g in range(len(groups))])
+    return x.reshape(out_shape)
+
+
 def fold_patches(x: jnp.ndarray, patch_size: Sequence[int]) -> jnp.ndarray:
     """``(*spatial, c) → (*grid, prod(patch)*c)`` where ``grid_i = spatial_i // patch_i``.
 
@@ -45,7 +66,7 @@ def fold_patches(x: jnp.ndarray, patch_size: Sequence[int]) -> jnp.ndarray:
         new_shape.extend([s // p, p])
     x = x.reshape(*new_shape, x.shape[-1])
     perm = list(range(0, 2 * n, 2)) + list(range(1, 2 * n, 2)) + [2 * n]
-    x = jnp.transpose(x, perm)
+    x = _merged_transpose(x, perm)
     return x.reshape(*(s // p for s, p in zip(spatial, ps)), -1)
 
 
@@ -60,7 +81,7 @@ def unfold_patches(
         out_channels = x.shape[-1] // math.prod(eb)
     x = x.reshape(*grid, *eb, out_channels)
     perm = [a for i in range(n) for a in (i, i + n)] + [2 * n]
-    x = jnp.transpose(x, perm)
+    x = _merged_transpose(x, perm)
     return x.reshape(*[g * e for g, e in zip(grid, eb)], out_channels)
 
 
