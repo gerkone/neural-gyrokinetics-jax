@@ -21,7 +21,7 @@ from neugk_jax.evaluate.integrals import _pev_fluxes, _solve_fields
 
 EPS = 1e-8
 # spectral bins below this fraction of the ground-truth peak count as equal in the log distance
-LSD_FLOOR = 1e-3
+LSD_FLOOR = 1e-2
 
 
 @jax.jit
@@ -145,10 +145,11 @@ def wasserstein1(p, g) -> float:
 def time_averaged_spectral_metrics(pred_diags: Sequence[dict], gt_diags: Sequence[dict]) -> dict:
     """Errors of the time-averaged ky and heat-flux spectra and of the zonal-flow profiles.
 
-    Spectra: Pearson, Spearman, L1, rel-L1 and rel-L2 over every ky, the mean gap of the sorted
-    normalized values (``_wd``), and over ky > 0 (the zonal mode excluded) the log-spectral distance
-    (``_lsd``) and the Wasserstein-1 distance along ky (``_w1``). The zonal-flow profiles are scored
-    per snapshot (rel-L2, energy ratio) and averaged over time.
+    Spectra: Pearson, Spearman, L1, rel-L1, rel-L2, the log-spectral distance (``_lsd``) and the
+    Wasserstein-1 distance along ky (``_w1``) over every ky, the last two also over ky > 0 with the
+    zonal mode excluded (``_lsd_nz``, ``_w1_nz``), and the mean gap of the sorted normalized values
+    (``_wd``). The zonal-flow profiles are scored per snapshot (rel-L2, energy ratio) and averaged
+    over time.
     """
     out: dict[str, float] = {}
     for key in ("kyspec", "qspec"):
@@ -161,9 +162,11 @@ def time_averaged_spectral_metrics(pred_diags: Sequence[dict], gt_diags: Sequenc
         out[f"{key}_rl1"] = float(np.abs(p - g).sum() / (np.abs(g).sum() + 1e-12))
         pn, gn = p / (p.sum() + 1e-12), g / (g.sum() + 1e-12)
         out[f"{key}_wd"] = float(np.abs(np.sort(pn) - np.sort(gn)).mean())
-        pk, gk = p.reshape(-1)[1:].astype(np.float64), g.reshape(-1)[1:].astype(np.float64)
+        pk, gk = p.reshape(-1).astype(np.float64), g.reshape(-1).astype(np.float64)
         out[f"{key}_lsd"] = log_spectral_distance(pk, gk)
         out[f"{key}_w1"] = wasserstein1(pk, gk)
+        out[f"{key}_lsd_nz"] = log_spectral_distance(pk[1:], gk[1:])
+        out[f"{key}_w1_nz"] = wasserstein1(pk[1:], gk[1:])
     for key in ("zfphi", "zfflow", "zfshear"):
         rl2 = [
             np.linalg.norm(p[key] - g[key]) / (np.linalg.norm(g[key]) + 1e-12)
