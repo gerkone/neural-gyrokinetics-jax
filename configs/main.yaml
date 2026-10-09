@@ -1,8 +1,10 @@
-# entry point: python main.py [experiment=ae|diffusion|gyroswin|pinc_revival|vqvae] [key=...]
+# entry point: python main.py [experiment=ae|diffusion|gyroswin|pinc_revival_ae|pinc_revival|nf|vqvae] [key=...]
 #   python main.py                                                  # ae preset
 #   python main.py experiment=diffusion ae_checkpoint=<ae_run_dir>  # latent flow matching
 #   python main.py experiment=gyroswin                              # next-step gyroswin
+#   python main.py experiment=pinc_revival_ae                       # pinc base ae pretraining
 #   python main.py experiment=pinc_revival ae_checkpoint=<ae_run>   # pinc-ae lora fine-tune
+#   python main.py experiment=nf training.ckpt_dir=<dir>            # per-snapshot neural fields
 #   python main.py load_ckpt=true output_path=<run_dir>             # resume a run in place
 # the experiment presets (configs/experiment) pick the model/dataset/training groups per workflow.
 defaults:
@@ -20,7 +22,7 @@ output_path: null
 load_ckpt: false
 # trained ae run directory (or checkpoint file) for workflow=diffusion and workflow=pinc stage=peft
 ae_checkpoint: null
-# workflow=pinc: peft fine-tunes lora adapters of ae_checkpoint, else plain ae training
+# workflow=pinc: peft adapts ae_checkpoint with lora, joint trains a fresh ae on df + physics
 stage: null
 # persistent xla compilation cache directory; null disables it
 jax_compilation_cache_dir: null

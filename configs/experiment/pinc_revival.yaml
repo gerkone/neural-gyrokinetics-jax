@@ -8,6 +8,8 @@ defaults:
 
 workflow: pinc
 stage: peft
+training:
+  batch_size: 12  # per device; 8 x 12, the global batch of 96
 validation:
   validate_every_n_epochs: 5
   eval_integrals: true

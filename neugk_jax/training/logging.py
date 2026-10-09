@@ -8,8 +8,9 @@ from typing import Any
 class Logger:
     """wandb wrapper that logs the full resolved config; a no-op on non-rank-0 processes.
 
-    ``logging`` holds the run settings (``mode``, ``project``, ``entity``, ``run_id``);
-    ``mode`` defaults to disabled when the section is missing.
+    ``logging`` holds the run settings (``mode``, ``project``, ``entity``, ``run_id`` and
+    ``wandb_id``, an existing run to continue); ``mode`` defaults to disabled when the section is
+    missing.
     """
 
     def __init__(self, *, is_rank0: bool, config: dict | None = None, logging: dict | None = None):
@@ -30,6 +31,8 @@ class Logger:
             name=logging.get("run_id"),
             mode=mode,
             config=config,
+            id=logging.get("wandb_id"),
+            resume="allow" if logging.get("wandb_id") else None,
         )
 
     def log(self, data: dict[str, Any], step: int | None = None, commit: bool = True) -> None:

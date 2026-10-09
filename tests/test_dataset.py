@@ -289,3 +289,24 @@ def test_normalized_field_without_stats_raises(synthetic_dir):
     ds.norm.normalize("df", np.zeros((2, *ds.resolution), np.float32), 0)
     with pytest.raises(KeyError, match="flux"):
         ds.norm.normalize("flux", np.float32(1.0), 0)
+
+
+def test_batch_transform_matches_per_sample_frames(tmp_path):
+    from helpers import RES, make_traj
+
+    from neugk_jax.dataset import CycloneDataset, NumpyBackend
+
+    for i in range(2):
+        make_traj(tmp_path, f"iteration_{i}", n_t=3)
+    rng = np.random.default_rng(0)
+    shape = (4, 1, RES[1], 1, 1, 1)
+    stats = {"df": {"full": {"mean": rng.normal(size=shape), "std": rng.uniform(0.5, 2, shape)}}}
+    norm = {"df": {"type": "zscore", "agg_axes": [1, 3, 4, 5]}}
+    kw = dict(path=str(tmp_path), trajectories="iteration_{0-1}", backend=NumpyBackend())
+    ds = CycloneDataset(**kw, normalization=norm, normalization_stats=stats, separate_zf=True)
+    ref = np.stack([ds[i].df for i in range(len(ds))])
+    ds.batch_transform = True
+    raw = np.stack([ds[i].df for i in range(len(ds))])
+    fids = np.asarray([ds[i].file_index for i in range(len(ds))])
+    assert raw.shape[1] == 2 and ref.shape[1] == 4
+    np.testing.assert_allclose(np.asarray(ds.transform(raw, fids)), ref, rtol=1e-6, atol=1e-6)

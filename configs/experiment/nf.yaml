@@ -1,0 +1,8 @@
+# @package _global_
+# per-snapshot neural fields, density then pinc phase: python main.py experiment=nf output_path=<ckpt dir>
+defaults:
+  - override /model: nf/mlp
+  - override /dataset: cyclone_nf
+  - override /training: nf
+
+workflow: nf
