@@ -52,8 +52,15 @@ def multipliers(model, mask, base, delta) -> tuple:
     return unflat(lr), unflat(wd)
 
 
-def build_multipliers(build: Callable[[int], object], model, mask, base_width: int, delta_width: int) -> tuple:
-    """:func:`multipliers` with ``build(width)`` returning the model at ``width`` (built abstractly)."""
+def build_multipliers(
+    build: Callable[[int], object], model, mask, base_width: int, delta_width: int
+) -> tuple:
+    """:func:`multipliers` with ``build(width)`` the model at ``width`` (built abstractly)."""
     import equinox as eqx
 
-    return multipliers(model, mask, eqx.filter_eval_shape(build, base_width), eqx.filter_eval_shape(build, delta_width))
+    return multipliers(
+        model,
+        mask,
+        eqx.filter_eval_shape(build, base_width),
+        eqx.filter_eval_shape(build, delta_width),
+    )

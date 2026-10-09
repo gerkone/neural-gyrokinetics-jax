@@ -171,7 +171,7 @@ def test_ae_evaluator_padded_last_batch_and_no_retrace(tiny_setup):
 
 
 def test_diffusion_evaluator_samples_and_scores(tiny_setup):
-    """Samples decode to df, are scored against the df targets and flux-aggregated per trajectory."""
+    """Samples decode to df, scored against the df targets and flux-aggregated per trajectory."""
     from neugk_jax.diffusion.dit import DiT
 
     ds, ae = tiny_setup

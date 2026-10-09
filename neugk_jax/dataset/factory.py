@@ -38,7 +38,8 @@ def build_dataset(
         norm_stats = to_dict(norm_stats)
     normalization = to_dict(dcfg.get("normalization")) or None
     stats_ready = stats is not None or (
-        norm_stats is not None and not (isinstance(norm_stats, str) and not os.path.exists(norm_stats))
+        norm_stats is not None
+        and not (isinstance(norm_stats, str) and not os.path.exists(norm_stats))
     )
     lightweight = bool(dcfg.get("lightweight_metadata", stats_ready))
     if lightweight and normalization is not None and not stats_ready:
@@ -124,7 +125,9 @@ def build_splits(
         for part_name, part in parts.items():
             source = part.get("stats_from")
             if source is not None and source not in splits:
-                raise ValueError(f"dataset.parts.{part_name}.stats_from {source!r} must name an earlier part")
+                raise ValueError(
+                    f"dataset.parts.{part_name}.stats_from {source!r} must name an earlier part"
+                )
             stems[part_name] = part.get("stem", part_name)
             splits[part_name] = build_splits(
                 OmegaConf.create({**shared, **part}),
@@ -142,9 +145,13 @@ def build_splits(
             CycloneMix({n: s[1] for n, s in splits.items()}, stems=stems),
         )
     if stats is None:
-        run_stats = os.path.join(run_stats_dir, f"{name or 'dataset'}.pkl") if run_stats_dir else None
+        run_stats = (
+            os.path.join(run_stats_dir, f"{name or 'dataset'}.pkl") if run_stats_dir else None
+        )
         stats = resolve_stats(dcfg, run_stats=run_stats, dist=dist, **kwargs)
-    train = build_dataset(dcfg, split="train", dist=dist, prefer_dtype=train_dtype, stats=stats, **kwargs)
+    train = build_dataset(
+        dcfg, split="train", dist=dist, prefer_dtype=train_dtype, stats=stats, **kwargs
+    )
     # dataset.prefer_dtype is the stored precision, so validation reads it too
     val = build_dataset(
         dcfg,
@@ -158,7 +165,7 @@ def build_splits(
 
 
 def save_run_stats(ds, directory: str, overwrite: bool = True) -> None:
-    """The normalization statistics of ``ds`` (every part of a mix) as ``<part>.pkl`` in ``directory``."""
+    """Writes the statistics of ``ds`` (each part of a mix) as ``<part>.pkl`` in ``directory``."""
     os.makedirs(directory, exist_ok=True)
     parts = getattr(ds, "parts", None) or {"dataset": ds}
     for name, part in parts.items():

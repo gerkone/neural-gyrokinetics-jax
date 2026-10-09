@@ -149,9 +149,15 @@ def test_partitioned_step_matches_filter_jit_step(tmp_path):
     make_traj(tmp_path, "iteration_1", n_t=4, resolution=res)
     cfg = tiny_ae_cfg(tmp_path, res, tmp_path / "run")
     r = AERunner(cfg, output_path=cfg.output_path)
-    batch = r.place_batch(shard_batch(r.dist, r.load_batch(r.train_ds, [0, 1] * r.dist.local_device_count, r.loader.read)))
+    batch = r.place_batch(
+        shard_batch(
+            r.dist, r.load_batch(r.train_ds, [0, 1] * r.dist.local_device_count, r.loader.read)
+        )
+    )
     key = replicate(r.dist, jr.PRNGKey(3))
-    copy = lambda t: jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True) if eqx.is_array(x) else x, t)
+    copy = lambda t: jax.tree_util.tree_map(
+        lambda x: jnp.array(x, copy=True) if eqx.is_array(x) else x, t
+    )
     model, opt = copy(r.model), copy(r.opt_state)
     step = PartitionedTrainStep(r.spec, r.model, r.opt_state, sharding=replicated_sharding(r.dist))
     state = step.init(copy(r.model), copy(r.opt_state))
@@ -160,6 +166,8 @@ def test_partitioned_step_matches_filter_jit_step(tmp_path):
         state, step_logs = step(state, (batch, r.ctx, key), i)
         assert all(np.array_equal(logs[k], step_logs[k]) for k in logs)
     step_model, step_opt = step.restore(state)
-    for a, b in zip(jax.tree_util.tree_leaves((model, opt)), jax.tree_util.tree_leaves((step_model, step_opt))):
+    for a, b in zip(
+        jax.tree_util.tree_leaves((model, opt)), jax.tree_util.tree_leaves((step_model, step_opt))
+    ):
         assert np.array_equal(np.asarray(a), np.asarray(b))
     assert step.matches(step_model, step_opt)

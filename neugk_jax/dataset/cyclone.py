@@ -229,7 +229,9 @@ class CycloneDataset:
                     warnings.warn(f"{fp}: missing metadata {missing}; excluding trajectory")
                 continue
             if offset < int(meta.get("first_frame", 0)):
-                raise ValueError(f"{fp}: frames before {meta['first_frame']} are not stored (offset={offset})")
+                raise ValueError(
+                    f"{fp}: frames before {meta['first_frame']} are not stored (offset={offset})"
+                )
             if n_species(meta) > 1 and not species_axis:
                 raise ValueError(f"{fp}: {n_species(meta)} species need species_axis=True")
             fid = len(kept_files)
@@ -246,7 +248,7 @@ class CycloneDataset:
             if tail_offset > 0:
                 timesteps = timesteps[:-tail_offset]
             n = len(timesteps[::subsample]) - bundle_seq_length * 2 + 1
-            # a single-snapshot trajectory still serves its frame unless a next-step target is needed
+            # a one-snapshot trajectory serves its frame unless a next-step target is needed
             if mode != "next" and len(timesteps) == 1:
                 n = 1
             for t_idx in range(max(0, n)):
@@ -262,12 +264,16 @@ class CycloneDataset:
         self.stored_phi_shape = (stored[3], stored[2], stored[4])
         nx = stored[3] if kx_crop is None else min(stored[3], int(kx_crop))
         self.resolution = (*stored[:3], nx, stored[4])
-        self.df_shape = (2, self.n_species, *self.resolution) if species_axis else (2, *self.resolution)
+        self.df_shape = (
+            (2, self.n_species, *self.resolution) if species_axis else (2, *self.resolution)
+        )
         self.phi_resolution = (self.resolution[3], self.resolution[2], self.resolution[4])
 
-        # normalization_stats when given, else metadata moments (direct construction only, build_dataset resolves data stats)
+        # normalization_stats, else metadata moments (build_dataset resolves the data stats itself)
         insert = species_axis and len(self.stored_df_shape) == 6
-        if isinstance(normalization_stats, (str, os.PathLike)) and not os.path.exists(normalization_stats):
+        if isinstance(normalization_stats, (str, os.PathLike)) and not os.path.exists(
+            normalization_stats
+        ):
             raise FileNotFoundError(f"normalization_stats {normalization_stats} does not exist")
         if isinstance(normalization_stats, (str, os.PathLike)):
             self.stats = load_stats(normalization_stats, normalization)
@@ -279,10 +285,13 @@ class CycloneDataset:
             self.stats = {}
         if insert and "df" in self.stats:
             # single-species stats still without it get the unit species axis of the served df
-            self.stats = {**self.stats, "df": {
-                k: {n: np.expand_dims(a, 1) if np.ndim(a) == 6 else a for n, a in v.items()}
-                for k, v in self.stats["df"].items()
-            }}
+            self.stats = {
+                **self.stats,
+                "df": {
+                    k: {n: np.expand_dims(a, 1) if np.ndim(a) == 6 else a for n, a in v.items()}
+                    for k, v in self.stats["df"].items()
+                },
+            }
         ndims = {"df": len(self.df_shape), "phi": len(self.phi_resolution), "flux": 0, "fluxavg": 0}
         self.norm = NormTable.from_stats(
             self.stats, normalization, normalization_scope, len(self.files), ndims
@@ -332,7 +341,10 @@ class CycloneDataset:
             phi = self.backend.read_phi(handle, t, self.stored_phi_shape)
             if phi.shape[0] != self.resolution[3]:
                 if self.kx_crop is None:
-                    raise ValueError(f"phi has {phi.shape[0]} kx modes, the dataset {self.resolution[3]}; set kx_crop to crop")
+                    raise ValueError(
+                        f"phi has {phi.shape[0]} kx modes, the dataset {self.resolution[3]};"
+                        " set kx_crop to crop"
+                    )
                 from neugk_jax.evaluate.fourier import crop_kx_phi
 
                 phi = crop_kx_phi(phi, self.resolution[3])
@@ -359,7 +371,10 @@ class CycloneDataset:
         x = df.astype(np.float32)
         if x.shape[-2] != self.resolution[3]:
             if self.kx_crop is None:
-                raise ValueError(f"df has {x.shape[-2]} kx modes, the dataset {self.resolution[3]}; set kx_crop to crop")
+                raise ValueError(
+                    f"df has {x.shape[-2]} kx modes, the dataset {self.resolution[3]};"
+                    " set kx_crop to crop"
+                )
             from neugk_jax.evaluate.fourier import crop_kx_df
 
             x = crop_kx_df(x, self.resolution[3], reim_axis=1)
@@ -390,7 +405,7 @@ class CycloneDataset:
             return self._frames(handle, int(fid), int(t))
 
     def _targets(self, handle, fid: int, t_idx: int) -> dict:
-        """Normalized next-step targets (frames, ``flux``, ``fluxavg``) of sample ``(fid, t_idx)``."""
+        """Normalized next-step targets (frames, ``flux``, ``fluxavg``) of ``(fid, t_idx)``."""
         t = t_idx + self.offset + self.bundle_seq_length
         flux = self.flux(fid)
         out = self._frames(handle, fid, t)
@@ -445,7 +460,10 @@ class CycloneDataset:
             return None
         meta = self.metadata[fid]
         return np.concatenate(
-            [np.atleast_1d(np.asarray(self.condition_value(meta, k, timestep), np.float32)) for k in self.conditions]
+            [
+                np.atleast_1d(np.asarray(self.condition_value(meta, k, timestep), np.float32))
+                for k in self.conditions
+            ]
         )
 
     @staticmethod
@@ -500,7 +518,10 @@ class CycloneDataset:
         if geom is None or len(geom["kxrh"]) == self.resolution[3]:
             return geom
         if self.kx_crop is None:
-            raise ValueError(f"geometry has {len(geom['kxrh'])} kx modes, the dataset {self.resolution[3]}; set kx_crop to crop")
+            raise ValueError(
+                f"geometry has {len(geom['kxrh'])} kx modes, the dataset {self.resolution[3]};"
+                " set kx_crop to crop"
+            )
         # central kx modes, as kept by kx_crop
         i0 = (len(geom["kxrh"]) - self.resolution[3]) // 2
         return {**geom, "kxrh": np.asarray(geom["kxrh"])[i0 : i0 + self.resolution[3]]}

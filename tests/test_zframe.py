@@ -1,4 +1,4 @@
-"""Lossless ``.zstd16`` shards: encode / decode, the jitted device unshuffle and the backend read path."""
+"""Lossless ``.zstd16`` shards: encode / decode, the jitted device unshuffle, the backend read."""
 
 from __future__ import annotations
 

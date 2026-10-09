@@ -140,7 +140,7 @@ def stack_fields(samples: Sequence[CycloneSample], fields: Sequence[str]) -> dic
 
 
 class BatchLoader:
-    """Prefetches batches with ``prefetch`` batches in flight and ``workers`` sample-reading threads.
+    """Prefetches batches: ``prefetch`` batches in flight, ``workers`` sample-reading threads.
 
     ``load(ds, indices, read)`` builds the host/device batch tree from sample indices
     (``read`` maps ``ds.__getitem__`` over the reader pool), ``place`` moves it to its

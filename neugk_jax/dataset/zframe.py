@@ -80,7 +80,10 @@ def parse_header(buf) -> Header:
 def decode(
     buf, header: Header | None = None, *, out: np.ndarray | None = None, unshuffle: bool = True
 ) -> np.ndarray:
-    """Raw payload bytes of the ``.zstd16`` shard in ``buf``; with ``unshuffle=False`` every chunk stays shuffled."""
+    """Raw payload bytes of the ``.zstd16`` shard in ``buf``.
+
+    With ``unshuffle=False`` every chunk stays byte-shuffled.
+    """
     header = header or parse_header(buf)
     src = memoryview(buf).cast("B")
     out = np.empty(header.raw_bytes, np.uint8) if out is None else out[: header.raw_bytes]

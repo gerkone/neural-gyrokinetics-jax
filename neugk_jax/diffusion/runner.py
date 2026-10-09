@@ -66,9 +66,7 @@ def check_ae_dataset(ae_dataset: dict, dataset: dict) -> None:
         raise ValueError(f"diffusion dataset does not match the AE run's dataset:\n{lines}")
 
 
-def load_autoencoder(
-    path, *, resolution=None, dataset: dict | None = None, legacy=False, ds=None
-):
+def load_autoencoder(path, *, resolution=None, dataset: dict | None = None, legacy=False, ds=None):
     """AE of a run directory or checkpoint file; ``dataset`` is checked against the run's.
 
     ``legacy`` forces the doubled swin residual, else ``model.legacy_swin_shortcut`` decides.
@@ -136,7 +134,10 @@ class FlowMatchingRunner(BaseRunner):
         )
         self.latent_shape = (*self.ae.bottleneck_grid_size, int(self.ae.bottleneck_dim))
         ae_file = resolve_checkpoint(cfg.ae_checkpoint)
-        for split_ds, key in ((self.train_ds, "latents_cache_train"), (self.val_ds, "latents_cache_val")):
+        for split_ds, key in (
+            (self.train_ds, "latents_cache_train"),
+            (self.val_ds, "latents_cache_val"),
+        ):
             for ds in parts_of(split_ds).values():
                 meta = latent_cache_meta(
                     ds, ae_file, normalization_stats=dcfg.get("normalization_stats")
@@ -165,7 +166,9 @@ class FlowMatchingRunner(BaseRunner):
         else:
             parts = list(parts_of(self.train_ds).values())
             # mean latent variance over all parts, each weighted by its sample count
-            var = sum(float(np.mean(p.latent_stats.var)) * len(p) for p in parts) / sum(map(len, parts))
+            var = sum(float(np.mean(p.latent_stats.var)) * len(p) for p in parts) / sum(
+                map(len, parts)
+            )
             self.latent_scale = float(1.0 / np.sqrt(max(var, 1e-12)))
             with open_dict(cfg):
                 cfg.latent_scale = self.latent_scale

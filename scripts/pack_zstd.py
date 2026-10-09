@@ -91,7 +91,8 @@ def main():
             if i % 500 == 0 or i == len(todo):
                 dt = time.time() - t0
                 print(
-                    f"{i}/{len(todo)} files, {raw_total / 1e9:.1f} GB packed at {raw_total / 1e9 / dt:.2f} GB/s, "
+                    f"                    /{len(todo)} files, {raw_total / 1e9:.1f} GB packed"
+                    f" at {raw_total / 1e9 / dt:.2f} GB/s, "
                     f"ratio {raw_total / max(comp_total, 1):.3f}",
                     flush=True,
                 )

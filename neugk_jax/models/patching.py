@@ -133,7 +133,9 @@ class PatchEmbed(eqx.Module):
         return self.patch(fold_patches(x, self.patch_size))
 
 
-def merge_grid(grid_size: Sequence[int], merge_mask: Optional[Sequence[bool]] = None) -> tuple[int, ...]:
+def merge_grid(
+    grid_size: Sequence[int], merge_mask: Optional[Sequence[bool]] = None
+) -> tuple[int, ...]:
     mask = merge_mask if merge_mask is not None else [True] * len(grid_size)
     return tuple((g + 1) // 2 if g > 2 and m else g for g, m in zip(grid_size, mask))
 

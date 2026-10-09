@@ -14,7 +14,7 @@ from neugk_jax.models.utils import Gate, Linear, RMSNorm, dropout, split_key
 
 
 def einsum_attention(q, k, v, scale, bias=None, attn_drop=0.0, key=None, inference=True):
-    """Softmax attention of ``q`` (..., n, heads, head_dim) over ``k``/``v`` (..., m, heads, head_dim)."""
+    """Softmax attention of ``q`` (..., n, heads, dim) over ``k``/``v`` (..., m, heads, dim)."""
     logits = jnp.einsum("...nhd,...mhd->...hnm", q, k) * scale
     if bias is not None:
         logits = logits + bias
@@ -24,7 +24,7 @@ def einsum_attention(q, k, v, scale, bias=None, attn_drop=0.0, key=None, inferen
 
 
 def fused_attention(q, k, v, scale, bias=None):
-    """:func:`einsum_attention` as the cuDNN fused kernel: q / k / v / bias in bf16, the output in q's dtype."""
+    """:func:`einsum_attention` as the fused cuDNN kernel (bf16 q/k/v/bias, output in q's dtype)."""
     dt = jnp.bfloat16
     b = None
     if bias is not None:
@@ -32,7 +32,12 @@ def fused_attention(q, k, v, scale, bias=None):
         tie = jnp.zeros((), dt) * jax.lax.stop_gradient(q[:1, :1, :1]).astype(dt).reshape(())
         b = (jnp.broadcast_to(bias, (q.shape[-2], q.shape[-3], k.shape[-3])).astype(dt) + tie)[None]
     out = jax.nn.dot_product_attention(
-        q[None].astype(dt), k[None].astype(dt), v[None].astype(dt), bias=b, scale=scale, implementation="cudnn"
+        q[None].astype(dt),
+        k[None].astype(dt),
+        v[None].astype(dt),
+        bias=b,
+        scale=scale,
+        implementation="cudnn",
     )
     return out[0].astype(q.dtype)
 

@@ -39,7 +39,9 @@ class CycloneMix:
         self.parts = dict(parts)
         mixing = dict(mixing or {})
         if mixing and set(mixing) != set(self.parts):
-            raise ValueError(f"dataset.mixing names {sorted(mixing)}, the parts are {sorted(self.parts)}")
+            raise ValueError(
+                f"dataset.mixing names {sorted(mixing)}, the parts are {sorted(self.parts)}"
+            )
         for name, spec in list(mixing.items()):
             if isinstance(spec, Mapping) and ("share" in spec or "loss_weight" in spec):
                 self.parts[name].loss_weight = float(spec.get("loss_weight", 1.0))
@@ -53,7 +55,9 @@ class CycloneMix:
         first = next(iter(self.parts.values()))
         for name, ds in self.parts.items():
             if ds.conditions != first.conditions or ds.separate_zf != first.separate_zf:
-                raise ValueError(f"part {name!r}: conditions / separate_zf differ from the first part")
+                raise ValueError(
+                    f"part {name!r}: conditions / separate_zf differ from the first part"
+                )
         stems = dict(stems or {})
         for i, (name, ds) in enumerate(self.parts.items()):
             ds.data_type, ds.stem = i, stems.get(name, name)

@@ -210,7 +210,7 @@ class DiTModulation(eqx.Module):
         self.proj = Linear(cond_dim, 6 * dim, key=key)
 
     def __call__(self, cond: jax.Array):
-        # cond: (..., cond_dim) → 6 tensors of shape (..., dim); SiLU already applied in ContinuousConditionEmbed
+        # cond (..., cond_dim) -> 6 tensors (..., dim); ContinuousConditionEmbed applied the silu
         return jnp.split(self.proj(cond), 6, axis=-1)
 
 

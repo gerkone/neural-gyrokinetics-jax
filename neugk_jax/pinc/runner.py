@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import equinox as eqx
 import jax.numpy as jnp
-import numpy as np
 import jax.random as jr
+import numpy as np
 
 from neugk_jax.losses import df_loss, part_weight, recon_loss
 from neugk_jax.models.build import ae_conditioning, build_ae, mup_multipliers
@@ -39,7 +39,7 @@ def train_dtype(cfg):
 
 
 def read_loss_weights(mcfg, supported) -> dict[str, float]:
-    """Nonzero ``model.loss_weights`` + ``model.extra_loss_weights``; raises unless all are supported."""
+    """Nonzero ``model.loss_weights`` + ``model.extra_loss_weights``; raises on unsupported ones."""
     weights = {**to_dict(mcfg.get("loss_weights")), **to_dict(mcfg.get("extra_loss_weights"))}
     if not weights:
         raise ValueError(f"model.loss_weights is required; weights over {tuple(supported)}")

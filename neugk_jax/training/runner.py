@@ -20,8 +20,8 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import optax
-from optax.contrib import MuonDimensionNumbers, muon
 from omegaconf import OmegaConf
+from optax.contrib import MuonDimensionNumbers, muon
 
 from neugk_jax.dataset.factory import build_splits, save_run_stats
 from neugk_jax.evaluate.base import MultiEvaluator
@@ -58,13 +58,15 @@ def weight_decay_mask(params, exclude):
 
 
 def is_hidden_matrix(path, leaf) -> bool:
-    """A trunk weight matrix (out, in): both sides >= 16, not a patch / unpatch / position-bias layer."""
+    """A trunk weight matrix (out, in): both sides >= 16, not patch / unpatch / position bias."""
     name = jax.tree_util.keystr(path).lower()
     hidden = not any(k in name for k in ("patch_embed", "unpatch", "rpb"))
     return leaf.ndim == 2 and min(leaf.shape) >= 16 and hidden
 
 
-def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999, mask=None, multipliers=None):
+def build_optimizer(
+    schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999, mask=None, multipliers=None
+):
     """Clip + Adam chain over the ``mask`` leaves (default ``trainable_mask``).
 
     ``decoupled`` selects AdamW, else Adam with coupled L2 decay. ``training.optimizer: muon``
@@ -83,21 +85,39 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
     if tcfg.get("optimizer", "adam") == "muon":
         ratio = float(tcfg.muon_learning_rate) / float(tcfg.learning_rate)
         out_in = MuonDimensionNumbers(reduction_axis=1, output_axis=0)
-        dims = lambda p: jax.tree_util.tree_map_with_path(lambda k, x: out_in if is_hidden_matrix(k, x) else None, p)
+        dims = lambda p: jax.tree_util.tree_map_with_path(
+            lambda k, x: out_in if is_hidden_matrix(k, x) else None, p
+        )
         opt = muon(
-            lambda c: ratio * schedule(c), adam_learning_rate=schedule, adam_b2=b2, weight_decay=wd,
-            adam_weight_decay=wd, muon_weight_dimension_numbers=dims,
+            lambda c: ratio * schedule(c),
+            adam_learning_rate=schedule,
+            adam_b2=b2,
+            weight_decay=wd,
+            adam_weight_decay=wd,
+            muon_weight_dimension_numbers=dims,
         )
         if multipliers is None:
             return optax.chain(clip, opt)
         # muon's shape scaling transfers the hidden matrices; the adam leaves keep their muP lr
-        adam_mult = jax.tree_util.tree_map_with_path(lambda k, x, m: 1.0 if is_hidden_matrix(k, x) else m, params, multipliers[0])
-        return optax.chain(clip, opt, optax.stateless(lambda u, p: jax.tree_util.tree_map(lambda ui, m: ui * m, u, adam_mult)))
+        adam_mult = jax.tree_util.tree_map_with_path(
+            lambda k, x, m: 1.0 if is_hidden_matrix(k, x) else m, params, multipliers[0]
+        )
+        return optax.chain(
+            clip,
+            opt,
+            optax.stateless(
+                lambda u, p: jax.tree_util.tree_map(lambda ui, m: ui * m, u, adam_mult)
+            ),
+        )
     if multipliers is not None:
         if tcfg.get("optimizer", "adam") != "adam" or decoupled:
-            raise NotImplementedError("muP multipliers need optimizer adam or muon, adam with coupled weight decay")
+            raise NotImplementedError(
+                "muP multipliers need optimizer adam or muon, adam with coupled weight decay"
+            )
         lr_mult, wd_mult = multipliers
-        decay = lambda g, p: jax.tree_util.tree_map(lambda gi, pi, m, k: gi + wd * m * pi if k else gi, g, p, wd_mult, mask)
+        decay = lambda g, p: jax.tree_util.tree_map(
+            lambda gi, pi, m, k: gi + wd * m * pi if k else gi, g, p, wd_mult, mask
+        )
         return optax.chain(
             clip,
             optax.stateless(decay),
@@ -249,7 +269,9 @@ class BaseRunner:
                 evaluators[name] = self.make_evaluator()
         finally:
             self.val_ds = full
-        return MultiEvaluator(evaluators) if any(e is not None for e in evaluators.values()) else None
+        return (
+            MultiEvaluator(evaluators) if any(e is not None for e in evaluators.values()) else None
+        )
 
     def step_context(self) -> dict:
         return {}
@@ -268,7 +290,7 @@ class BaseRunner:
         return batch
 
     def place_batch(self, batch: dict) -> dict:
-        """Transform of a sharded training batch on its devices, in the main thread before the step."""
+        """Transform of a sharded training batch on its devices, in the main thread."""
         return batch
 
     def load_batch(self, ds, indices, read) -> dict:

@@ -220,7 +220,9 @@ class Swin5DAE(eqx.Module):
         z = self.backbone.patch_encode(df)
         for blk, k in zip(self.backbone.down_blocks, keys):
             z = blk(z, cond, return_skip=False, key=k, inference=inference)
-        z = self.middle_downproj(self.middle_pre(self.bottleneck_input(z), cond, key=keys[-1], inference=inference))
+        z = self.middle_downproj(
+            self.middle_pre(self.bottleneck_input(z), cond, key=keys[-1], inference=inference)
+        )
         return self.pre_z_norm(z) if self.normalized_latent else z
 
     def decode(self, z: jnp.ndarray, condition=None, *, key=None, inference: bool = True):
@@ -313,7 +315,7 @@ class KineticSwin5DAE(Swin5DAE):
 
         def stem_kwargs(spec):
             ns = int(spec.get("n_species", n_species))
-            # species: unpatched, full attention (an infinite window is never partitioned or shifted)
+            # species: unpatched, full-axis attention, never partitioned or shifted
             return dict(
                 space=6,
                 mu_axis=2,
@@ -346,7 +348,8 @@ class KineticSwin5DAE(Swin5DAE):
                     raise ValueError(f"stem {name!r}: trunk weight {b.shape} != {a.shape}")
             if bb.grid_sizes[-1][1:] != self.backbone.grid_sizes[-1][1:]:
                 raise ValueError(
-                    f"stem {name!r}: latent grid {bb.grid_sizes[-1]} != {self.backbone.grid_sizes[-1]}"
+                    f"stem {name!r}: latent grid {bb.grid_sizes[-1]}"
+                    f" != {self.backbone.grid_sizes[-1]}"
                 )
             # trunk weights are taken from the primary backbone at call time
             self.stem_backbones[name] = eqx.tree_at(
@@ -361,15 +364,19 @@ class KineticSwin5DAE(Swin5DAE):
         """The stem whose input shape ``(C, species, vpar, mu, s, x, y)`` is ``shape``."""
         hits = [n for n, s in self.stem_inputs.items() if tuple(s) == tuple(shape)]
         if len(hits) != 1:
-            raise ValueError(f"input {tuple(shape)} matches stems {hits}; inputs: {self.stem_inputs}")
+            raise ValueError(
+                f"input {tuple(shape)} matches stems {hits}; inputs: {self.stem_inputs}"
+            )
         return hits[0]
 
     def stem_backbone(self, stem: Optional[str] = None):
-        """The backbone of ``stem``: its own patching and window layout, the shared trunk weights."""
+        """The backbone of ``stem``: its own patching and window layout, the shared trunk."""
         if stem is None or stem == self.primary_stem:
             return self.backbone
         if stem not in self.stem_backbones:
-            raise KeyError(f"unknown stem {stem!r}; one of {[self.primary_stem, *self.stem_backbones]}")
+            raise KeyError(
+                f"unknown stem {stem!r}; one of {[self.primary_stem, *self.stem_backbones]}"
+            )
         return eqx.tree_at(
             lambda t: _trunk_params(t, self.trunk_index),
             self.stem_backbones[stem],
@@ -385,7 +392,9 @@ class KineticSwin5DAE(Swin5DAE):
         z = z + self.species_embed[: z.shape[0]].reshape(-1, *(1,) * (z.ndim - 2), z.shape[-1])
         for blk, k in zip(bb.down_blocks, keys):
             z = blk(z, cond, return_skip=False, key=k, inference=inference)
-        z = self.middle_downproj(self.middle_pre(self.bottleneck_input(z), cond, key=keys[-1], inference=inference))
+        z = self.middle_downproj(
+            self.middle_pre(self.bottleneck_input(z), cond, key=keys[-1], inference=inference)
+        )
         return self.pre_z_norm(z) if self.normalized_latent else z
 
     def decode(self, z, condition=None, *, stem=None, key=None, inference: bool = True):
@@ -428,7 +437,9 @@ class StemView(eqx.Module):
     model: KineticSwin5DAE
     stem: str = eqx.field(static=True)
 
-    def __call__(self, df, condition=None, return_latent: bool = False, *, key=None, inference=True):
+    def __call__(
+        self, df, condition=None, return_latent: bool = False, *, key=None, inference=True
+    ):
         return self.model(
             df, condition, return_latent, stem=self.stem, key=key, inference=inference
         )

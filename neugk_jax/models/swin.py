@@ -74,7 +74,7 @@ def _build_shift_mask(
 
 
 def _window_attention(attn, x, window_size, shift_size, attn_mask):
-    """Shifted-window self-attention of ``x`` (*spatial, dim): pad, roll, partition, attend, undo."""
+    """Shifted-window attention of ``x`` (*spatial, dim): pad, roll, partition, attend, undo."""
     spatial = x.shape[:-1]
     h = pad_to_blocks(x, window_size)
     padded = h.shape[:-1]

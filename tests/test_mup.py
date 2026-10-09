@@ -19,14 +19,26 @@ BASE = (8, 4, 4, 8, 4)
 
 def cfg(width=64):
     patch = dict(
-        patch_size=[2, 0, 2, 4, 2], window_size=[2, 0, 2, 2, 2], merging_depth=2, unmerging_depth=2,
-        merging_hidden_ratio=1.0, unmerging_hidden_ratio=1.0, c_multiplier=1,
+        patch_size=[2, 0, 2, 4, 2],
+        window_size=[2, 0, 2, 2, 2],
+        merging_depth=2,
+        unmerging_depth=2,
+        merging_hidden_ratio=1.0,
+        unmerging_hidden_ratio=1.0,
+        c_multiplier=1,
     )
-    mup = dict(enable=True, head_dim=16, bottleneck_ratio=2, base_width=32, delta_width=48, output_mult=1.0)
+    mup = dict(
+        enable=True, head_dim=16, bottleneck_ratio=2, base_width=32, delta_width=48, output_mult=1.0
+    )
     return {
         "model": {
-            "latent_dim": width, "num_layers": 1, "init_weights": "kaiming_uniform", "patch": patch, "mup": mup,
-            "vit": {"num_heads": [4], "depth": [1]}, "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2},
+            "latent_dim": width,
+            "num_layers": 1,
+            "init_weights": "kaiming_uniform",
+            "patch": patch,
+            "mup": mup,
+            "vit": {"num_heads": [4], "depth": [1]},
+            "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2},
         },
         "dataset": {"resolution": list(BASE), "separate_zf": False},
         "training": {"learning_rate": 2.4e-3, "weight_decay": 1e-6, "adam_b2": 0.95},
@@ -61,8 +73,13 @@ def test_mup_adam_step():
     mask = trainable_mask(model)
     mults = build_multipliers(build, model, mask, 32, 48)
     opt = build_optimizer(
-        optax.constant_schedule(2.4e-3), OmegaConf.create(c["training"]), model,
-        decoupled=False, b2=0.95, mask=mask, multipliers=mults,
+        optax.constant_schedule(2.4e-3),
+        OmegaConf.create(c["training"]),
+        model,
+        decoupled=False,
+        b2=0.95,
+        mask=mask,
+        multipliers=mults,
     )
     params, static = eqx.partition(model, mask)
     state = opt.init(params)
@@ -87,7 +104,15 @@ def test_mup_muon_step():
     mask = trainable_mask(model)
     mults = build_multipliers(build, model, mask, 32, 48)
     tcfg = OmegaConf.create({**c["training"], "optimizer": "muon", "muon_learning_rate": 0.02})
-    make = lambda m: build_optimizer(optax.constant_schedule(2.4e-3), tcfg, model, decoupled=False, b2=0.95, mask=mask, multipliers=m)
+    make = lambda m: build_optimizer(
+        optax.constant_schedule(2.4e-3),
+        tcfg,
+        model,
+        decoupled=False,
+        b2=0.95,
+        mask=mask,
+        multipliers=m,
+    )
     params = eqx.filter(model, mask)
     grads = jax.tree_util.tree_map(lambda p: jr.normal(jr.PRNGKey(1), p.shape), params)
     plain, _ = make(None).update(grads, make(None).init(params), params)

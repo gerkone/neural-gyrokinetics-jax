@@ -90,7 +90,7 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     from neugk_jax.models.build import build_ae_from_config
     from neugk_jax.training.checkpoint import save_model_only
 
-    # FlowMatchingRunner expects ae config at <ae_ckpt_dir>/config.yaml with resolution for build_ae_from_config
+    # FlowMatchingRunner reads the ae config (with resolution) from <ae_ckpt_dir>/config.yaml
     ae_dir = tmp_path / "ae_ckpt"
     ae_dir.mkdir(exist_ok=True)
     ae_cfg_with_res = OmegaConf.create(OmegaConf.to_container(ae_cfg))

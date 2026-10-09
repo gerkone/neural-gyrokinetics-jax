@@ -5,7 +5,8 @@ trajectory; step ``t`` targets are the next-step targets at ``timestep_index + t
 Logs ``{field}_x{t}`` per step (relative-norm MSE for df/phi, MSE for flux/fluxavg,
 optional ``phi_int`` (MSE of the integrated phi) and ``flux_int_rel_err``
 (``|eflux - flux| / |flux|`` of the integrated heat flux)), ``df_rel_l2_x{t}``/
-``phi_rel_l2_x{t}`` and the step means ``{field}``. Batches keep one shape; rollout steps beyond a trajectory are masked.
+``phi_rel_l2_x{t}`` and the step means ``{field}``. Batches keep one shape; rollout steps beyond
+a trajectory are masked.
 """
 
 from __future__ import annotations

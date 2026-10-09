@@ -53,7 +53,17 @@ def _sample_decode(dit, ae, key, cond, n, steps, latent_scale, latent_shape=None
 
 @traced_jit("diffusion_eval_step")
 def diffusion_eval_step(
-    dit, ae, key, batch, acc, norm, geom, steps: int, latent_scale: float, latent_shape=None, stem=None
+    dit,
+    ae,
+    key,
+    batch,
+    acc,
+    norm,
+    geom,
+    steps: int,
+    latent_scale: float,
+    latent_shape=None,
+    stem=None,
 ):
     x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
     pred = _sample_decode(

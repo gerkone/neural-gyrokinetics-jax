@@ -172,10 +172,25 @@ def test_swin5d_ae_decouple_mu():
 def test_swin5d_ae_bottleneck_input_norm():
     base = (4, 4, 4, 16, 8)
     kw = dict(
-        space=5, decouple_mu=True, dim=16, base_resolution=base, in_channels=2, out_channels=2,
-        patch_size=(2, 0, 2, 4, 2), window_size=(2, 0, 2, 2, 2), depth=1, num_heads=2, num_layers=1,
-        bottleneck_dim=8, bottleneck_depth=1, bottleneck_num_heads=2, merging_depth=1, unmerging_depth=1,
-        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0, key=jr.PRNGKey(0),
+        space=5,
+        decouple_mu=True,
+        dim=16,
+        base_resolution=base,
+        in_channels=2,
+        out_channels=2,
+        patch_size=(2, 0, 2, 4, 2),
+        window_size=(2, 0, 2, 2, 2),
+        depth=1,
+        num_heads=2,
+        num_layers=1,
+        bottleneck_dim=8,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
+        key=jr.PRNGKey(0),
     )
     plain, normed = Swin5DAE(**kw), Swin5DAE(**kw, input_norm=True)
     assert plain.input_norm is None and normed.input_norm is not None
@@ -195,10 +210,25 @@ def test_swin5d_ae_bf16_compute_copy():
 
     base = (4, 4, 4, 16, 8)
     ae = Swin5DAE(
-        space=5, decouple_mu=True, dim=16, base_resolution=base, in_channels=2, out_channels=2,
-        patch_size=(2, 0, 2, 4, 2), window_size=(2, 0, 2, 2, 2), depth=1, num_heads=2, num_layers=1,
-        bottleneck_dim=8, bottleneck_depth=1, bottleneck_num_heads=2, merging_depth=1, unmerging_depth=1,
-        merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0, key=jr.PRNGKey(0),
+        space=5,
+        decouple_mu=True,
+        dim=16,
+        base_resolution=base,
+        in_channels=2,
+        out_channels=2,
+        patch_size=(2, 0, 2, 4, 2),
+        window_size=(2, 0, 2, 2, 2),
+        depth=1,
+        num_heads=2,
+        num_layers=1,
+        bottleneck_dim=8,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
+        key=jr.PRNGKey(0),
     )
     x = jr.normal(jr.PRNGKey(1), (2, *base))
     ref = ae(x)["df"]
@@ -206,7 +236,9 @@ def test_swin5d_ae_bf16_compute_copy():
     assert low.dtype == jnp.bfloat16
     assert float(jnp.linalg.norm(low.astype(jnp.float32) - ref) / jnp.linalg.norm(ref)) < 3e-2
     # gradients reach the fp32 weights through the cast copy
-    loss = lambda m: jnp.mean((cast_floating(m, jnp.bfloat16)(x.astype(jnp.bfloat16))["df"].astype(jnp.float32) - x) ** 2)
+    loss = lambda m: jnp.mean(
+        (cast_floating(m, jnp.bfloat16)(x.astype(jnp.bfloat16))["df"].astype(jnp.float32) - x) ** 2
+    )
     grads = eqx.filter_grad(loss)(ae)
     leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))
     assert leaves and all(g.dtype == jnp.float32 and bool(jnp.isfinite(g).all()) for g in leaves)
@@ -260,12 +292,32 @@ def test_kinetic_ae_stem_decodes_on_own_grid(monkeypatch):
     from neugk_jax.pinc import KineticSwin5DAE
 
     # kinetic and adiabatic stems with different token grids along x (8 vs 7)
-    stems = {"kinetic": {"resolution": [4, 4, 4, 24, 8], "n_species": 2, "patch_size": [2, 0, 2, 3, 2]},
-             "adiabatic": {"resolution": [4, 4, 4, 14, 8], "n_species": 1, "patch_size": [2, 0, 2, 2, 2]}}
+    stems = {
+        "kinetic": {"resolution": [4, 4, 4, 24, 8], "n_species": 2, "patch_size": [2, 0, 2, 3, 2]},
+        "adiabatic": {
+            "resolution": [4, 4, 4, 14, 8],
+            "n_species": 1,
+            "patch_size": [2, 0, 2, 2, 2],
+        },
+    }
     m = KineticSwin5DAE(
-        stems=stems, decouple_mu=True, dim=16, in_channels=2, out_channels=2, window_size=(2, 0, 2, 4, 2), depth=1,
-        num_heads=2, num_layers=1, bottleneck_dim=8, bottleneck_depth=1, bottleneck_num_heads=2, merging_depth=1,
-        unmerging_depth=1, merging_hidden_ratio=2.0, unmerging_hidden_ratio=2.0, key=jr.PRNGKey(0),
+        stems=stems,
+        decouple_mu=True,
+        dim=16,
+        in_channels=2,
+        out_channels=2,
+        window_size=(2, 0, 2, 4, 2),
+        depth=1,
+        num_heads=2,
+        num_layers=1,
+        bottleneck_dim=8,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
+        key=jr.PRNGKey(0),
     )
     upscaled = []
     call = PatchExpand.__call__

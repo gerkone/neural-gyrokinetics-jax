@@ -718,7 +718,16 @@ def preprocess_gyaradax(
     return out_path
 
 
-KINETIC_STEP_KEYS = ("df", "phi", "fluxes", "time", "step", "ky_spec", "kx_spec", "last_growth_rate")
+KINETIC_STEP_KEYS = (
+    "df",
+    "phi",
+    "fluxes",
+    "time",
+    "step",
+    "ky_spec",
+    "kx_spec",
+    "last_growth_rate",
+)
 FLUX_NAMES = ("pflux", "eflux", "vflux")
 
 
@@ -748,8 +757,28 @@ def kinetic_geometry(cfg) -> dict:
 
     geom = create_geometry(geometry_spec_from_config(cfg))
     geom = _ensure_species_arrays(geom, gkparams_from_config(cfg))
-    keys = ("kxrh", "krho", "intvp", "vpgr", "intmu", "mugr", "ints", "bn", "bt_frac", "rfun",
-            "efun", "little_g", "mas", "tmp", "de", "signz", "vthrat", "d2X", "signB", "parseval")
+    keys = (
+        "kxrh",
+        "krho",
+        "intvp",
+        "vpgr",
+        "intmu",
+        "mugr",
+        "ints",
+        "bn",
+        "bt_frac",
+        "rfun",
+        "efun",
+        "little_g",
+        "mas",
+        "tmp",
+        "de",
+        "signz",
+        "vthrat",
+        "d2X",
+        "signB",
+        "parseval",
+    )
     np_geom = {k: np.array(geom[k], dtype=np.float64) for k in keys}
     # the neugk flux kernel weights ints twice, so ky>0 carries 2 * ns instead of 2
     np_geom["parseval"][1:] *= len(np_geom["ints"])
@@ -833,7 +862,9 @@ def preprocess_gyaradax_kinetic(
     old = load_meta(os.path.join(out_path, "metadata")) if append else None
     if append:
         first_index = int(old.get("index_offset", 0)) + len(old["timesteps"])
-    for idx, step_path in progress(enumerate(steps, first_index), show_tqdm, desc=name, leave=False):
+    for idx, step_path in progress(
+        enumerate(steps, first_index), show_tqdm, desc=name, leave=False
+    ):
         d = load_kinetic_step(step_path)
         # transform, statistics and bf16 cast on the default jax device
         df = spec_to_df(jnp.asarray(d["df"]))
@@ -841,12 +872,19 @@ def preprocess_gyaradax_kinetic(
         dumped = np.asarray(d["fluxes"], dtype=np.float64).reshape(n_species, len(FLUX_NAMES))
         if verify:
             got = flux_fn(d["df"])
-            if np.abs(got[:, 1] - dumped[:, 1]).max() > flux_rtol * max(np.abs(dumped[:, 1]).max(), 1e-12):
-                warnings.warn(f"{name} step {int(np.ravel(d['step'])[0])}: heat flux {got[:, 1]} != {dumped[:, 1]}")
+            if np.abs(got[:, 1] - dumped[:, 1]).max() > flux_rtol * max(
+                np.abs(dumped[:, 1]).max(), 1e-12
+            ):
+                warnings.warn(
+                    f"{name} step {int(np.ravel(d['step'])[0])}: heat flux {got[:, 1]}"
+                    f" != {dumped[:, 1]}"
+                )
         count = float(np.prod([df.shape[a] for a in df_axes]))
         df_stats.merge(
-            *(np.asarray(f(df, axis=df_axes, keepdims=True), np.float64)
-              for f in (jnp.mean, jnp.var, jnp.min, jnp.max)),
+            *(
+                np.asarray(f(df, axis=df_axes, keepdims=True), np.float64)
+                for f in (jnp.mean, jnp.var, jnp.min, jnp.max)
+            ),
             count,
         )
         phi_stats.push(phi)
@@ -855,8 +893,11 @@ def preprocess_gyaradax_kinetic(
                 payload, scale = np.asarray(jnp.asarray(arr).astype(jnp.bfloat16)).ravel(), None
             else:
                 payload, scale = quant.quantize(np.asarray(arr).ravel(), bits)
-            quant.write(os.path.join(out_path, "data", frame_name(kind, idx) + quant.SUFFIX[bits]),
-                        payload, scale)
+            quant.write(
+                os.path.join(out_path, "data", frame_name(kind, idx) + quant.SUFFIX[bits]),
+                payload,
+                scale,
+            )
         times.append(float(np.ravel(d["time"])[0]))
         solver_steps.append(int(np.ravel(d["step"])[0]))
         fluxes.append(dumped.reshape(-1))

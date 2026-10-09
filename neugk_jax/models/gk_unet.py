@@ -59,7 +59,12 @@ class SwinBlockDown(eqx.Module):
             dim, depth, num_heads, grid_size, window_size, key=k1, rms_norm=rms_norm, **layer_kw
         )
         self.downsample = PatchMerge(
-            dim, grid_size, key=k2, c_multiplier=c_multiplier, rms_norm=rms_norm, merge_mask=merge_mask
+            dim,
+            grid_size,
+            key=k2,
+            c_multiplier=c_multiplier,
+            rms_norm=rms_norm,
+            merge_mask=merge_mask,
         )
         self.resampled_grid_size = self.downsample.target_grid_size
         self.out_dim = self.downsample.out_dim
@@ -214,7 +219,7 @@ class SwinNDUnet(eqx.Module):
         padded_base = [
             s + p for s, p in zip(base_resolution, pad_amounts(base_resolution, patch_size))
         ]
-        # one key per stage: patch_embed, down blocks, middle, middle_upscale, up blocks, unpatch, cond_embed
+        # one key per stage: patch_embed, down, middle, middle_upscale, up, unpatch, cond_embed
         keys = jr.split(key, num_layers * 2 + 5)
 
         self.patch_embed = None

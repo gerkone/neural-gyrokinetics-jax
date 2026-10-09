@@ -169,8 +169,12 @@ def per_shard(fn, *arrays):
     first = arrays[0]
     if not isinstance(first, jax.Array) or len(first.sharding.device_set) == 1:
         return fn(*arrays)
-    pieces = [fn(*(s.data for s in shards)) for shards in zip(*(a.addressable_shards for a in arrays))]
-    return jax.make_array_from_single_device_arrays((first.shape[0], *pieces[0].shape[1:]), first.sharding, pieces)
+    pieces = [
+        fn(*(s.data for s in shards)) for shards in zip(*(a.addressable_shards for a in arrays))
+    ]
+    return jax.make_array_from_single_device_arrays(
+        (first.shape[0], *pieces[0].shape[1:]), first.sharding, pieces
+    )
 
 
 def _replicated_sharding(mesh: Mesh):

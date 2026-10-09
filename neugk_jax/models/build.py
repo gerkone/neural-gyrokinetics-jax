@@ -1,4 +1,4 @@
-"""Model construction from configs: ``Swin5DAE`` / ``Swin5DVQVAE``, ``DiT`` and ``GyroSwinMultitask``.
+"""Model construction from configs: ``Swin5DAE`` / ``Swin5DVQVAE``, ``DiT``, ``GyroSwinMultitask``.
 
 Every builder takes a YAML path, an OmegaConf config or a mapping with a ``model`` section
 (and a ``dataset`` section for the resolution and the zonal-flow layout); the run builders
@@ -79,7 +79,14 @@ _AE_PATCH_KEYS = {
     "unmerging_hidden_ratio",
     "c_multiplier",
 }
-_AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable", "input_norm"}
+_AE_BOTTLENECK_KEYS = {
+    "dim",
+    "depth",
+    "num_heads",
+    "normalized_latent",
+    "norm_learnable",
+    "input_norm",
+}
 _AE_STEM_KEYS = {
     "resolution",
     "n_species",
@@ -142,15 +149,28 @@ def build_ae_from_config(
     _check_ae(mcfg, bool(enc_cond or dec_cond))
     vit, patch, bn = mcfg.get("vit", {}), mcfg.get("patch", {}), mcfg.get("bottleneck", {})
     mup = mcfg.get("mup") or {}
-    dims = {"latent_dim": mcfg["latent_dim"], "num_heads": vit["num_heads"], "bottleneck_dim": bn.get("dim"), "bottleneck_num_heads": bn.get("num_heads", 2)}
+    dims = {
+        "latent_dim": mcfg["latent_dim"],
+        "num_heads": vit["num_heads"],
+        "bottleneck_dim": bn.get("dim"),
+        "bottleneck_num_heads": bn.get("num_heads", 2),
+    }
     readout_mult = 1.0
     if mup.get("enable"):
         if mcfg.get("zero_init_output"):
-            raise ValueError("model.zero_init_output with muP: the muP readout is zero-initialized instead")
-        dims = width_dims(width or mcfg["latent_dim"], mup.get("head_dim", 64), mup.get("bottleneck_ratio", 2))
-        n_layers = mcfg.get("num_layers", len(vit["depth"]) if isinstance(vit["depth"], (list, tuple)) else 4)
+            raise ValueError(
+                "model.zero_init_output with muP: the muP readout is zero-initialized instead"
+            )
+        dims = width_dims(
+            width or mcfg["latent_dim"], mup.get("head_dim", 64), mup.get("bottleneck_ratio", 2)
+        )
+        n_layers = mcfg.get(
+            "num_layers", len(vit["depth"]) if isinstance(vit["depth"], (list, tuple)) else 4
+        )
         dims["num_heads"] = [dims["num_heads"]] * int(n_layers)
-        readout_mult = float(mup.get("output_mult", 1.0)) * mup.get("base_width", 128) / dims["latent_dim"]
+        readout_mult = (
+            float(mup.get("output_mult", 1.0)) * mup.get("base_width", 128) / dims["latent_dim"]
+        )
     validate_keys("model.vit", vit, _AE_VIT_KEYS, _NO_PE)
     validate_keys("model.patch", patch, _AE_PATCH_KEYS)
     validate_keys("model.bottleneck", bn, _AE_BOTTLENECK_KEYS)
@@ -185,9 +205,7 @@ def build_ae_from_config(
         window_size=patch["window_size"],
         depth=depth,
         num_heads=dims["num_heads"],
-        num_layers=mcfg.get(
-            "num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4
-        ),
+        num_layers=mcfg.get("num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4),
         bottleneck_dim=dims["bottleneck_dim"],
         bottleneck_depth=bn.get("depth", 2),
         bottleneck_num_heads=dims["bottleneck_num_heads"],
@@ -225,7 +243,9 @@ def mup_multipliers(cfg, ds, model, mask) -> tuple:
     rc = run_config(cfg, ds)
     mup = rc["model"]["mup"]
     build = lambda w: build_ae_from_config(rc, key=jax.random.PRNGKey(0), width=w)
-    return build_multipliers(build, model, mask, int(mup.get("base_width", 128)), int(mup.get("delta_width", 256)))
+    return build_multipliers(
+        build, model, mask, int(mup.get("base_width", 128)), int(mup.get("delta_width", 256))
+    )
 
 
 def build_dit_from_config(cfg_path, ae, *, key):
@@ -411,7 +431,7 @@ def build_release_gyroswin(cfg_path, *, key, resolution: Optional[Sequence[int]]
 
 
 def run_config(cfg, ds=None) -> dict:
-    """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf.
+    """``{"model", "dataset", "training"}`` dict of a run config; ``ds`` fixes resolution and zf.
 
     ``model.stems`` take their resolution, species and channels from the dataset part of the
     same name (the dataset itself for a single stem).

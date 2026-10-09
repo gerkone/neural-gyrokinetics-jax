@@ -64,7 +64,9 @@ def metadata_stats(
                 mean, std, mn, mx = (np.expand_dims(a, 1) for a in (mean, std, mn, mx))
             one = RunningStats(prior_count=0.0)
             one.merge(mean, std**2, mn, mx, count=len(meta["timesteps"]))
-            out[k][fid] = {n: one.moments(np.float32, axes=axes)[n] for n in ("mean", "std", "min", "max")}
+            out[k][fid] = {
+                n: one.moments(np.float32, axes=axes)[n] for n in ("mean", "std", "min", "max")
+            }
             pooled.merge(mean, std**2, mn, mx, count=len(meta["timesteps"]))
         if pooled.count:
             out[k]["full"] = pooled.moments(np.float32, axes=axes)

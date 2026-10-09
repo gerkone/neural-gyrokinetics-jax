@@ -112,7 +112,11 @@ INDEX_KEYS = ("ixzero", "iyzero")
 
 def _species(geom: dict, i: int) -> dict:
     # zonal-mode indices stay integers through dtype casts of the whole geometry
-    return {k: v[i].astype(jnp.int32) if k in INDEX_KEYS else v[i] for k, v in geom.items() if k != "phi_diag"}
+    return {
+        k: v[i].astype(jnp.int32) if k in INDEX_KEYS else v[i]
+        for k, v in geom.items()
+        if k != "phi_diag"
+    }
 
 
 def _zonal_weights(signz, de, tmp, gamma, ints):
@@ -148,7 +152,9 @@ def solve_phi(geom: dict, spec: jnp.ndarray) -> jnp.ndarray:
         gt = _species(geom, 0)
         return _zonal_correction(gt, spec[0], _phi_adiabatic(gt, spec[0]))
     # gyaradax precompute_phi_kinetic weight, factored per species
-    weight = geom["signz"] * geom["de"] * geom["intmu"] * geom["intvp"] * geom["bessel"] * geom["bn"]
+    weight = (
+        geom["signz"] * geom["de"] * geom["intmu"] * geom["intvp"] * geom["bessel"] * geom["bn"]
+    )
     num = jnp.sum(weight[:, 0] * spec, axis=(0, 1, 2))
     return -num / geom["phi_diag"]
 
