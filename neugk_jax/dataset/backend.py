@@ -355,13 +355,16 @@ class KvikIOBackend(NumpyBackend):
         arr = jdlp.from_dlpack(gpu.reshape(shape))
         if bits == "bf16":
             half = lax.bitcast_convert_type(arr, jnp.bfloat16)
-            return half if self.keep_half else half.astype(jnp.float32)
-        if bits == "i8":
+            out = half if self.keep_half else half.astype(jnp.float32)
+        elif bits == "i8":
             scale = np.fromfile(path, dtype=np.float32, count=1)[0]
-            return arr.astype(jnp.float32) * jnp.float32(scale)
-        if bits == "fp16" and self.keep_half:
+            out = arr.astype(jnp.float32) * jnp.float32(scale)
+        elif bits == "fp16" and self.keep_half:
             return arr
-        return arr.astype(jnp.float32)
+        else:
+            out = arr.astype(jnp.float32)
+        # the cupy buffer is freed on return: every pending op reading it must have run
+        return out.block_until_ready()
 
     def _buffer(self, name: str, nbytes: int, pinned: bool = False) -> np.ndarray:
         # a host buffer per reader thread, grown on demand and reused across reads
@@ -403,7 +406,8 @@ class KvikIOBackend(NumpyBackend):
             jdlp.from_dlpack(shuffled), header.raw_bytes, header.chunk_bytes
         )
         half = half.reshape(shape)
-        return half if self.keep_half else half.astype(jnp.float32)
+        # the cupy buffer is freed on return: every pending op reading it must have run
+        return (half if self.keep_half else half.astype(jnp.float32)).block_until_ready()
 
     def _nvcomp_decode(self, comp, header, device_id: int):
         import cupy as cp
