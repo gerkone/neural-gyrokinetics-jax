@@ -3,6 +3,7 @@
 A quantized shard sits next to its fp32 ``foo.bin`` as ``foo.<bits>.bin``::
 
     fp16 / bf16:   raw 16-bit values, no header
+    zstd_bf16:     the bf16 values, losslessly compressed (see ``zframe``)
     i8:            float32 scale (4 bytes) || raw int8 values
     i4:            float32 scale (4 bytes) || raw uint8 nibble-packed
                    (two int4 values per byte: low nibble = index 2k,
@@ -17,7 +18,13 @@ import numpy as np
 
 from neugk_jax.utils import atomic_write
 
-SUFFIX = {"fp16": ".fp16.bin", "bf16": ".bf16.bin", "i8": ".i8.bin", "i4": ".i4.bin"}
+SUFFIX = {
+    "fp16": ".fp16.bin",
+    "bf16": ".bf16.bin",
+    "zstd_bf16": ".zstd_bf16.bin",
+    "i8": ".i8.bin",
+    "i4": ".i4.bin",
+}
 # bytes of the float32 scale in front of the integer payloads
 HEADER_BYTES = 4
 
@@ -38,18 +45,24 @@ def sibling(fp32_path: str, bits: str) -> str:
 def resolve(fp32_path: str, prefer: str) -> tuple[str, str]:
     """``(path, bits)`` to read: the ``prefer`` sibling when it exists, else the fp32 shard.
 
-    Without an fp32 shard the first existing quantized sibling is read.
+    ``zstd_bf16`` (opt-in) falls back to the ``bf16`` sibling, which holds the same values. Without an
+    fp32 shard the first existing quantized sibling is read.
     """
-    if prefer != "fp32":
-        cand = sibling(fp32_path, prefer)
+    for bits in {"fp32": (), "zstd_bf16": ("zstd_bf16", "bf16")}.get(prefer, (prefer,)):
+        cand = sibling(fp32_path, bits)
         if os.path.exists(cand):
-            return cand, prefer
+            return cand, bits
     if not os.path.exists(fp32_path):
         for bits in ("bf16", "fp16", "i8", "i4"):
             cand = sibling(fp32_path, bits)
             if os.path.exists(cand):
                 return cand, bits
     return fp32_path, "fp32"
+
+
+def values(bits: str) -> str:
+    """Precision of the values a ``bits`` shard holds."""
+    return "bf16" if bits == "zstd_bf16" else bits
 
 
 def quantize(arr_f32: np.ndarray, bits: str) -> tuple[np.ndarray, np.float32 | None]:
