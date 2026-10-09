@@ -118,7 +118,7 @@ class GyroSwinEvaluator(BaseEvaluator):
                     geom,
                     self.fields,
                 )
-                if plan.number == 0 and t == 0 and self.is_rank0:
+                if plan.number == self.plot_plan(epoch) and t == 0 and self.is_rank0:
                     plots = self._plots(pred_d, tgt_d, batch)
         host = jax.device_get(acc)
         sums = self.sum_processes(

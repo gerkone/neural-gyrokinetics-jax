@@ -201,7 +201,7 @@ class DiffusionEvaluator(BaseEvaluator):
                     fluxes.append((plan, eflux))
                 if self.eval_spectra:
                     self.spectra(spectra, pred_d, tgt_d, plan)
-            if plan.number == 0 and self.is_rank0:
+            if plan.number == self.plot_plan(epoch) and self.is_rank0:
                 gt = {"df": tgt_d[0]}
                 plots.update(
                     generate_val_plots(

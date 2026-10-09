@@ -1,4 +1,4 @@
-"""AE evaluator: reconstruction MSE and relative L2, optional flux integrals and spectra, cross-section plots.
+"""AE evaluator: reconstruction MSE and relative L2, optional integrals and spectra, plots.
 
 Metrics: ``df_mse`` (normalized), ``df_rel_l2`` (denormalized, zf recombined); with
 ``validation.eval_integrals`` also ``phi_int_mse``/``phi_int_rel_l2`` and
@@ -69,7 +69,7 @@ def ae_eval_step(model, batch, acc, norm, geom, tgt_int, extra=None):
 
 
 class AEEvaluator(BaseEvaluator):
-    """Reconstruction metrics over the validation set; ``cond_slots`` selects the model conditions."""
+    """Reconstruction metrics over the validation set; ``cond_slots`` picks the model conditions."""
 
     # per-sample metrics module of the denormalized pair, see ae_eval_step
     extra = None
@@ -111,7 +111,7 @@ class AEEvaluator(BaseEvaluator):
             self.observe(out, batch)
             if self.eval_spectra:
                 self.spectra(spectra, pred_d, tgt_d, plan)
-            if plan.number == 0 and self.is_rank0:
+            if plan.number == self.plot_plan(epoch) and self.is_rank0:
                 plots = self._plots(pred_d, tgt_d, phi, tgt_int, batch)
         metrics = self.finalize(self.reduce(acc), self.metric_keys)
         if self.eval_spectra:

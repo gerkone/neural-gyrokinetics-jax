@@ -144,6 +144,11 @@ class BaseEvaluator:
     def is_rank0(self) -> bool:
         return self.dist.is_rank0
 
+    def plot_plan(self, epoch: int) -> int:
+        """Number of this process's validation batch whose first sample is plotted at ``epoch``."""
+        numbers = [plan.number for plan in self.plans]
+        return int(numbers[np.random.default_rng(epoch).integers(len(numbers))]) if numbers else -1
+
     @property
     def geometry(self) -> dict:
         if self._geometry is None:
