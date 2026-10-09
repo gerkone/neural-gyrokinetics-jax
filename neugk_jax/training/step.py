@@ -1,8 +1,8 @@
-"""Training step: the optimizer update, its static spec, and the jitted step on a partitioned train state.
+"""Training step: the optimizer update, its static spec and the jitted step on a train state.
 
 ``PartitionedTrainStep`` splits the static structure of the model and optimizer state off once and
-runs a plain ``jax.jit`` on the arrays, a donated :class:`TrainState` with explicit shardings (as the
-MaxText train step). ``train_step`` is the same step under ``eqx.filter_jit``.
+runs a plain ``jax.jit`` on the arrays, a donated :class:`TrainState` with explicit shardings
+(as the MaxText train step). ``train_step`` is the same step under ``eqx.filter_jit``.
 """
 
 from __future__ import annotations
@@ -78,13 +78,26 @@ def _split(tree):
 
 
 class PartitionedTrainStep:
-    """``train_step`` as a plain ``jax.jit`` on a :class:`TrainState`, the static structure split once.
+    """``train_step`` as a plain ``jax.jit`` on a :class:`TrainState`, the structure split once.
 
     ``init`` partitions a model and optimizer state into a ``TrainState``, a call
     ``step(state, (batch, ctx, key), i) -> (state, logs)`` runs one update with the step key
     ``fold_in(key, i)`` derived inside the program, and ``restore`` rebuilds the model and optimizer
     state. ``sharding`` (the replicated sharding of the state) pins the state's input and output
     shardings; non-array inputs are static, as under ``eqx.filter_jit``.
+
+    ``eqx.filter_jit`` re-partitions and re-flattens the whole model and optimizer pytree of
+    ``Module`` nodes on every call, then rebuilds them from the outputs, and blocks until the step
+    is done. Here the structure is split once per run and a step only passes flat lists of arrays
+    through jax's C++ dispatch, so the host queues the next step while the device runs this one.
+    The same pattern is the recommended one in:
+
+    1. Equinox, "Low-overhead training loops":
+       https://docs.kidger.site/equinox/tricks/#low-overhead-training-loops
+    2. MaxText, the train step jitted on the state with explicit shardings and the state donated:
+       https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/utils/train_utils.py
+    3. Flax NNX, "Functional training loop" (``nnx.split`` once, plain ``jax.jit``, ``nnx.merge``
+       inside): https://flax.readthedocs.io/en/latest/guides/performance.html
     """
 
     def __init__(self, spec: StepSpec, model, opt_state, *, sharding: Optional[Any] = None):

@@ -276,10 +276,6 @@ class NumpyBackend(DataBackend):
         return arr
 
 
-# one nvcomp codec per (reader thread, device)
-_NVCOMP_CODECS: dict = {}
-
-
 def kvikio_available() -> bool:
     return all(importlib.util.find_spec(m) is not None for m in ("cupy", "kvikio"))
 
@@ -293,6 +289,9 @@ class KvikIOBackend(NumpyBackend):
     device (``"gpu"``) and unshuffled on the device. Requires the dataloader to run in-process.
     Same layout and options as ``NumpyBackend``.
     """
+
+    # one nvcomp codec per (reader thread, device), shared by all instances
+    _nvcomp_codecs: dict = {}
 
     def __init__(self, rank: int = 0, zstd_decode: str = "cpu", **kwargs):
         super().__init__(**kwargs)
@@ -392,7 +391,8 @@ class KvikIOBackend(NumpyBackend):
         header = zframe.parse_header(comp)
         if header.elem_bytes != 2 or header.raw_bytes != 2 * int(np.prod(shape)):
             raise IOError(
-                f"{path}: {header.raw_bytes} bytes of {header.elem_bytes}-byte values for shape {shape}"
+                f"{path}: {header.raw_bytes} bytes of {header.elem_bytes}-byte values"
+                f" for shape {shape}"
             )
         dev = self._target()
         with cp.cuda.Device(self.rank if dev is None else dev.local_hardware_id) as d:
@@ -413,16 +413,16 @@ class KvikIOBackend(NumpyBackend):
         from nvidia import nvcomp
 
         key = (threading.get_ident(), device_id)
-        if key not in _NVCOMP_CODECS:
-            if not _NVCOMP_CODECS:
+        if key not in self._nvcomp_codecs:
+            if not self._nvcomp_codecs:
                 # codecs must go before the cuda context at interpreter exit
-                atexit.register(_NVCOMP_CODECS.clear)
-            _NVCOMP_CODECS[key] = nvcomp.Codec(
+                atexit.register(self._nvcomp_codecs.clear)
+            self._nvcomp_codecs[key] = nvcomp.Codec(
                 algorithm="Zstd", bitstream_kind=nvcomp.BitstreamKind.RAW, device_id=device_id
             )
         o = header.offsets
         chunks = [nvcomp.as_array(comp[o[i] : o[i + 1]]) for i in range(header.n_chunks)]
-        return cp.concatenate([cp.asarray(c) for c in _NVCOMP_CODECS[key].decode(chunks)])
+        return cp.concatenate([cp.asarray(c) for c in self._nvcomp_codecs[key].decode(chunks)])
 
 
 class H5Backend(DataBackend):
