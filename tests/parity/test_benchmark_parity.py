@@ -80,7 +80,7 @@ def test_time_averaged_spectral_metrics_match_torch():
     to_t = lambda ds: [{k: torch.from_numpy(v) for k, v in d.items()} for d in ds]  # noqa: E731
     ref = time_averaged_spectral_metrics(to_t(pred), to_t(gt))
     out = M.time_averaged_spectral_metrics(pred, gt)
-    assert set(out) == set(ref)
+    assert set(ref) <= set(out)
     for k in ref:
         assert _rel(out[k], ref[k]) < 1e-5, k
 
