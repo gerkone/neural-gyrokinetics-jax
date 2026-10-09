@@ -94,10 +94,16 @@ class PartitionedTrainStep:
         def step(state, dyn, i, static):
             batch, ctx, key = eqx.combine(dyn, jax.tree_util.tree_unflatten(*static))
             model, opt_state = self.restore(state)
-            model, opt_state, logs = _train_step((batch, ctx, jr.fold_in(key, i)), model, opt_state, spec)
+            model, opt_state, logs = _train_step(
+                (batch, ctx, jr.fold_in(key, i)), model, opt_state, spec
+            )
             return self.init(model, opt_state), logs
 
-        shardings = {} if sharding is None else dict(in_shardings=(sharding, None, None), out_shardings=(sharding, None))
+        shardings = (
+            {}
+            if sharding is None
+            else dict(in_shardings=(sharding, None, None), out_shardings=(sharding, None))
+        )
         self._step = jax.jit(step, static_argnums=3, donate_argnums=0, **shardings)
 
     def init(self, model, opt_state) -> TrainState:
@@ -105,7 +111,9 @@ class PartitionedTrainStep:
 
     def restore(self, state: TrainState):
         model = eqx.combine(jax.tree_util.tree_unflatten(self._m_def, state.params), self._m_static)
-        opt_state = eqx.combine(jax.tree_util.tree_unflatten(self._o_def, state.opt_state), self._o_static)
+        opt_state = eqx.combine(
+            jax.tree_util.tree_unflatten(self._o_def, state.opt_state), self._o_static
+        )
         return model, opt_state
 
     def matches(self, model, opt_state) -> bool:
