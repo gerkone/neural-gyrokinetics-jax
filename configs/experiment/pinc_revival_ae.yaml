@@ -1,0 +1,12 @@
+# @package _global_
+# pinc_revival base ae: the decoder-conditioned 1000x swin5d ae pretrained on df
+#   python main.py experiment=pinc_revival_ae
+defaults:
+  - override /model: ae/pinc_ae
+  - override /dataset: cyclone_pinc
+  - override /training: pinc_ae
+
+workflow: pinc
+validation:
+  validate_every_n_epochs: 20
+  eval_integrals: true

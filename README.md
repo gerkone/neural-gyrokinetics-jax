@@ -19,9 +19,11 @@ public data tests.
 ## Layout
 
 - `neugk_jax/models/` — equinox modules (MLP, embeddings, patching, attention, Swin/ViT, gk_unet, DiT)
-- `neugk_jax/pinc/` — Swin5DAE (optionally encoder / decoder conditioned), the PINC-AE
-  LoRA fine-tune on the physics losses (`experiment=pinc_revival`) and Swin5DVQVAE with EMA VQ /
-  FSQ / LFQ quantizers (`experiment=vqvae`)
+- `neugk_jax/pinc/` — Swin5DAE (optionally encoder / decoder conditioned), its pretraining on the
+  pinc_revival set (`experiment=pinc_revival_ae`), the PINC-AE LoRA fine-tune on the physics losses
+  (`experiment=pinc_revival`), Swin5DVQVAE with EMA VQ / FSQ / LFQ quantizers (`experiment=vqvae`)
+  and the per-snapshot neural fields (`experiment=nf`): pools of NFs trained together per device,
+  density phase then the same PINC terms as the AE
 - `neugk_jax/diffusion/` — flow matching
 - `neugk_jax/gyroswin/` — GyroSwin multitask model, runner and rollout evaluator
 - `neugk_jax/dataset/` — CycloneDataset (ae / diff / next modes), binary and h5 backends
@@ -29,7 +31,10 @@ public data tests.
 - `neugk_jax/evaluate/` — base evaluator, flux integrals, spectral metrics
 - `configs/` — Hydra configs; `configs/checkpoints/` holds release model configs
 - `main.py` — Hydra entrypoint
-- `scripts/` — `translate_ckpt.py` (AE / DiT / GyroSwin), `eval_diffusion.py`, `export_pinc_torch.py`
+- `scripts/` — `translate_ckpt.py` (AE / DiT / GyroSwin), `eval_diffusion.py`, `export_pinc_torch.py`,
+  `release_checkpoint.py`, and the PINC benchmarks: `eval_compression.py` (codecs, neural fields and
+  autoencoders on the steady-state or transition snapshots), `eval_scaling.py`, `eval_interp.py`
+  (representation interpolation) and `eval_snapshots.py`
 - `docs/metrics.md` — validation metric definitions and renames
 - `tests/`
 
@@ -37,6 +42,14 @@ public data tests.
 
 Dataset paths are required: `export NEUGK_DATA=/path/to/preprocessed` (or `dataset.path=...`),
 and `experiment=diffusion` / `experiment=pinc_revival` need `ae_checkpoint=<ae run dir>`.
+
+```bash
+python main.py experiment=pinc_revival_ae logging=wandb                      # base ae
+python main.py experiment=pinc_revival ae_checkpoint=<base ae run> logging=wandb
+python main.py experiment=nf training.ckpt_dir=<nf dir>                       # restart resumes
+python scripts/eval_compression.py --methods nf,nf-pinc,zfp --ckpts <nf dir> --path <eval data> \
+    --ae PINC-AE=<pinc-ae run> --outdir <out> --gpus 0,1
+```
 
 ## Tests
 

@@ -13,3 +13,5 @@ amp:
 num_workers: 4  # sample-reading threads
 prefetch: 2     # batches loaded ahead of the step
 save_every_n_epochs: 1
+batch_transform: true  # readers serve raw frames; zf split and normalization run once per batch on device
+compute_dtype: null  # bf16: forward on a bf16 copy of the fp32 weights (torch autocast)

@@ -123,7 +123,8 @@ def test_stats_aggregate_in_stored_precision(tmp_path):
     np.testing.assert_array_equal(ds.stats["df"]["full"]["std"], np.sqrt(var))
 
 
-def test_pinc_runner_trains_only_adapters_and_validates(tmp_path):
+@pytest.mark.parametrize("stage", ["peft", "joint"])
+def test_pinc_runner_trains_and_validates(tmp_path, stage):
     from neugk_jax.pinc.peft import PINCPEFTRunner
     from neugk_jax.training.checkpoint import save_model_only
     from neugk_jax.training.ddp import local_view, shard_batch
@@ -151,9 +152,9 @@ def test_pinc_runner_trains_only_adapters_and_validates(tmp_path):
     cfg = OmegaConf.create(
         {
             "workflow": "pinc",
-            "stage": "peft",
+            "stage": stage,
             "output_path": str(tmp_path / "out"),
-            "ae_checkpoint": str(tmp_path / "base"),
+            "ae_checkpoint": str(tmp_path / "base") if stage == "peft" else None,
             "model": tiny_ae_model_cfg(
                 peft={"lora": lora}, loss_weights=weights, extra_loss_weights={"qspec": 0.0}
             ),
@@ -165,7 +166,8 @@ def test_pinc_runner_trains_only_adapters_and_validates(tmp_path):
     )
     r = PINCPEFTRunner(cfg, output_path=cfg.output_path)
     assert len(r.train_ds.files) == 2
-    assert sum(jax.tree_util.tree_leaves(r.trainable)) == 2 * len(TARGETS)
+    n_trainable = sum(jax.tree_util.tree_leaves(r.trainable))
+    assert n_trainable == 2 * len(TARGETS) if stage == "peft" else n_trainable > 2 * len(TARGETS)
     before = [np.asarray(v) for v in jax.tree_util.tree_leaves(local_view(r.dist, r.model))]
     batch = r.load_batch(r.train_ds, [0, 1] * r.dist.local_device_count, r.loader.read)
     model, _, logs = train_step(

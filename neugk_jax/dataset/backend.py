@@ -14,6 +14,7 @@ import importlib.util
 import os
 import pickle
 import re
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Sequence
 
@@ -250,8 +251,11 @@ class NumpyBackend(DataBackend):
         path, bits = quant.resolve(fp32, self.prefer_dtype)
         if bits != self.prefer_dtype:
             # no quantized sibling: quantize the fp32 shard on the fly
-            return self._output(quant.roundtrip(read_bin(fp32, shape), self.prefer_dtype))
+            return self._roundtrip(fp32, shape)
         return self._read_file(path, bits, shape)
+
+    def _roundtrip(self, fp32: str, shape: tuple):
+        return self._output(quant.roundtrip(read_bin(fp32, shape), self.prefer_dtype))
 
     def _read_file(self, path: str, bits: str, shape: tuple):
         if bits == "fp32":
@@ -278,11 +282,37 @@ class KvikIOBackend(NumpyBackend):
     def __init__(self, rank: int = 0, **kwargs):
         super().__init__(**kwargs)
         self.rank = rank
+        self._local = threading.local()
+        # return 16-bit shards as stored; the consumer upcasts (exactly) per batch
+        self.keep_half = False
+
+    @contextlib.contextmanager
+    def on_device(self, device):
+        """Reads of this thread land on the jax ``device`` (default: local device ``rank``)."""
+        prev = getattr(self._local, "device", None)
+        self._local.device = device
+        try:
+            yield
+        finally:
+            self._local.device = prev
+
+    def _target(self):
+        return getattr(self._local, "device", None)
 
     def _output(self, arr: np.ndarray):
+        import jax
+
+        return jax.device_put(arr, self._target())
+
+    def _roundtrip(self, fp32: str, shape: tuple):
+        if self.prefer_dtype not in ("bf16", "fp16"):
+            return super()._roundtrip(fp32, shape)
         import jax.numpy as jnp
 
-        return jnp.asarray(arr)
+        dtype = jnp.bfloat16 if self.prefer_dtype == "bf16" else jnp.float16
+        # on-device round-to-nearest-even, as ml_dtypes on the host
+        half = self._read_file(fp32, "fp32", shape).astype(dtype)
+        return half if self.keep_half else half.astype(jnp.float32)
 
     def _read_file(self, path: str, bits: str, shape: tuple):
         import cupy as cp
@@ -299,17 +329,21 @@ class KvikIOBackend(NumpyBackend):
         expected = header + n_elems * np.dtype(buf_dtype).itemsize
         if os.path.getsize(path) != expected:
             raise IOError(f"{path}: expected {expected} bytes, got {os.path.getsize(path)}")
-        with cp.cuda.Device(self.rank):
+        dev = self._target()
+        with cp.cuda.Device(self.rank if dev is None else dev.local_hardware_id):
             gpu = cp.empty(n_elems, dtype=buf_dtype)
             with kvikio.CuFile(path, "r") as fh:
                 # payload only, after the scale header
                 fh.read(gpu, file_offset=header)
         arr = jdlp.from_dlpack(gpu.reshape(shape))
         if bits == "bf16":
-            return lax.bitcast_convert_type(arr, jnp.bfloat16).astype(jnp.float32)
+            half = lax.bitcast_convert_type(arr, jnp.bfloat16)
+            return half if self.keep_half else half.astype(jnp.float32)
         if bits == "i8":
             scale = np.fromfile(path, dtype=np.float32, count=1)[0]
             return arr.astype(jnp.float32) * jnp.float32(scale)
+        if bits == "fp16" and self.keep_half:
+            return arr
         return arr.astype(jnp.float32)
 
 
@@ -380,7 +414,8 @@ def make_backend(
 ) -> DataBackend:
     """Backend named by ``dataset.backend`` (``kvikio``, ``numpy`` or ``h5``).
 
-    ``kvikio`` falls back to ``numpy`` when cupy or kvikio are not installed.
+    ``kvikio`` falls back to ``numpy`` when cupy or kvikio are not installed; ``io_threads``
+    (default 8) sets the kvikio threads splitting each read unless ``KVIKIO_NTHREADS`` is set.
     """
     name = dcfg.get("backend", "kvikio")
     if name == "h5":
@@ -391,5 +426,7 @@ def make_backend(
         lightweight_metadata=lightweight_metadata,
     )
     if name == "kvikio" and kvikio_available():
+        # read before kvikio's first import
+        os.environ.setdefault("KVIKIO_NTHREADS", str(int(dcfg.get("io_threads", 8))))
         return KvikIOBackend(rank=local_rank, **kwargs)
     return NumpyBackend(**kwargs)
