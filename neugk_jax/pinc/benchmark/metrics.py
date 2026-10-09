@@ -20,8 +20,8 @@ from neugk_jax.evaluate.fourier import df_to_spec, spec_to_phi
 from neugk_jax.evaluate.integrals import _pev_fluxes, _solve_fields
 
 EPS = 1e-8
-# spectral bins below this fraction of the ground-truth peak count as equal in the log distance
-LSD_FLOOR = 1e-2
+# spectral bins below this fraction of the ground-truth peak count as equal in the rmsle
+LOG_FLOOR = 1e-2
 
 
 @jax.jit
@@ -127,7 +127,7 @@ def _ranks(a):
     return np.argsort(np.argsort(a, kind="stable"), kind="stable").astype(a.dtype)
 
 
-def log_spectral_distance(p, g, floor: float = LSD_FLOOR) -> float:
+def rmsle(p, g, floor: float = LOG_FLOOR) -> float:
     """RMS of ``log10(p / g)`` over the bins, both clipped at ``floor`` times the peak of ``g``."""
     eps = floor * float(np.max(g))
     return float(
@@ -145,11 +145,11 @@ def wasserstein1(p, g) -> float:
 def time_averaged_spectral_metrics(pred_diags: Sequence[dict], gt_diags: Sequence[dict]) -> dict:
     """Errors of the time-averaged ky and heat-flux spectra and of the zonal-flow profiles.
 
-    Spectra: Pearson, Spearman, L1, rel-L1, rel-L2, the log-spectral distance (``_lsd``) and the
-    Wasserstein-1 distance along ky (``_w1``) over every ky, the last two also over ky > 0 with the
-    zonal mode excluded (``_lsd_nz``, ``_w1_nz``), and the mean gap of the sorted normalized values
-    (``_wd``). The zonal-flow profiles are scored per snapshot (rel-L2, energy ratio) and averaged
-    over time.
+    Spectra: Pearson, Spearman, L1, rel-L1, rel-L2, the root-mean-square log error (``_rmsle``)
+    and the Wasserstein-1 distance along ky (``_w1``) over every ky, the last two also over ky > 0
+    with the zonal mode excluded (``_rmsle_nz``, ``_w1_nz``), and the mean gap of the sorted
+    normalized values (``_wd``). The zonal-flow profiles are scored per snapshot (rel-L2, energy
+    ratio) and averaged over time.
     """
     out: dict[str, float] = {}
     for key in ("kyspec", "qspec"):
@@ -163,9 +163,9 @@ def time_averaged_spectral_metrics(pred_diags: Sequence[dict], gt_diags: Sequenc
         pn, gn = p / (p.sum() + 1e-12), g / (g.sum() + 1e-12)
         out[f"{key}_wd"] = float(np.abs(np.sort(pn) - np.sort(gn)).mean())
         pk, gk = p.reshape(-1).astype(np.float64), g.reshape(-1).astype(np.float64)
-        out[f"{key}_lsd"] = log_spectral_distance(pk, gk)
+        out[f"{key}_rmsle"] = rmsle(pk, gk)
         out[f"{key}_w1"] = wasserstein1(pk, gk)
-        out[f"{key}_lsd_nz"] = log_spectral_distance(pk[1:], gk[1:])
+        out[f"{key}_rmsle_nz"] = rmsle(pk[1:], gk[1:])
         out[f"{key}_w1_nz"] = wasserstein1(pk[1:], gk[1:])
     for key in ("zfphi", "zfflow", "zfshear"):
         rl2 = [
