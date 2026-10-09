@@ -166,8 +166,8 @@ def _add_logs(acc, logs):
     return jax.tree_util.tree_map(jnp.add, acc, logs)
 
 
-class FlatStep:
-    """``train_step`` as a plain ``jax.jit`` over flat lists of the model and optimizer-state arrays.
+class PartitionedTrainStep:
+    """``train_step`` as a plain ``jax.jit`` on the arrays of a model and optimizer state partitioned once.
 
     The static parts are split off once, so a step call only flattens two lists of arrays; the
     step key is ``fold_in(key, step)`` inside the program. ``matches`` tells whether a model and
@@ -452,24 +452,24 @@ class BaseRunner:
         acc, waits = None, []
         t_start = t_first = time.perf_counter()
         step0 = (epoch - 1) * self.steps_per_epoch
-        if getattr(self, "_flat_step", None) is None or not self._flat_step.matches(self.model, self.opt_state):
-            self._flat_step = FlatStep(self.spec, self.model, self.opt_state)
-        flat = self._flat_step
+        step = getattr(self, "_partitioned_step", None)
+        if step is None or not step.matches(self.model, self.opt_state):
+            step = self._partitioned_step = PartitionedTrainStep(self.spec, self.model, self.opt_state)
         step_key = replicate(self.dist, step_key)
-        m_leaves, o_leaves = flat.flatten(self.model, self.opt_state)
+        m_leaves, o_leaves = step.flatten(self.model, self.opt_state)
         try:
             for i, (_, batch, wait) in enumerate(batches):
                 waits.append(wait)
                 batch.pop("mask")
                 batch = self.place_batch(batch)
                 batch.update(self.step_extras(step0 + i))
-                m_leaves, o_leaves, logs = flat((batch, self.ctx, step_key), i, m_leaves, o_leaves)
+                m_leaves, o_leaves, logs = step((batch, self.ctx, step_key), i, m_leaves, o_leaves)
                 acc = logs if acc is None else _add_logs(acc, logs)
                 if i == 0:
                     jax.block_until_ready(acc)
                     t_first = time.perf_counter()
         finally:
-            self.model, self.opt_state = flat.unflatten(m_leaves, o_leaves)
+            self.model, self.opt_state = step.unflatten(m_leaves, o_leaves)
         n = len(waits)
         if acc is None:
             return {}, {}
