@@ -104,14 +104,6 @@ def init_linears(model, scheme, *, key):
     return eqx.tree_at(linears, model, new)
 
 
-def cast_floating(tree, dtype):
-    """``tree`` with its floating-point arrays cast to ``dtype`` (a compute copy of fp32 weights)."""
-    return jax.tree_util.tree_map(
-        lambda x: x.astype(dtype) if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating) else x,
-        tree,
-    )
-
-
 def zero_init_output(model, layer: int = -1):
     """Zero one ``Linear`` of every ``unpatch`` expansion (the last by default; ``0`` is the muP
     readout): the autoencoder starts at a zero output."""
@@ -264,6 +256,16 @@ class Gate(eqx.Module):
     def __call__(self, x: jax.Array, g: jax.Array) -> jax.Array:
         # x, g: (n, H, D); gate is sigmoid(linear(relu(g)))
         return x * jax.nn.sigmoid(self.proj(relu(g)))
+
+
+def cast_floating(tree, dtype):
+    """``tree`` with its floating-point arrays cast to ``dtype``."""
+
+    def cast(x):
+        floating = eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating)
+        return x.astype(dtype) if floating else x
+
+    return jax.tree_util.tree_map(cast, tree)
 
 
 def trainable_mask(model):

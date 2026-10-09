@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.evaluate.fourier import df_to_spec, phi_to_spec, spec_to_phi
+from neugk_jax.evaluate.fourier import df_to_spec, phi_to_spec, spec_to_phi, spec_to_phi_complex
 from neugk_jax.utils import recombine_zf
 
 REQUIRED_GEOMETRY = (
@@ -194,14 +194,17 @@ def flux_spectrum(geom: dict, df: jnp.ndarray) -> jnp.ndarray:
 def spectral_integrals(geom: dict, df: jnp.ndarray, *, ds: float) -> dict:
     """Jittable single-sample potential, fluxes and ky spectra from a spatial df.
 
-    Returns ``phi`` (dataset layout), ``pflux`` / ``eflux`` per species,
-    ``kyspec = ds * sum_(s, kx) |phi_k|^2`` and ``qspec``, the heat flux per species and ky.
+    Returns ``phi`` (dataset layout), ``phi_c`` (re, im of the complex potential of the
+    one-sided spectrum), ``pflux`` / ``eflux`` per species, ``kyspec = ds * sum_(s, kx)
+    |phi_k|^2`` and ``qspec``, the heat flux per species and ky.
     """
     spec = df_to_spec(_with_species(df))
     phi_s = solve_phi(geom, spec)
     fields = species_fluxes(geom, spec, phi_s, reduce=False)
+    phi_k = jnp.transpose(phi_s, (1, 0, 2))
     return {
-        "phi": spec_to_phi(jnp.transpose(phi_s, (1, 0, 2))),
+        "phi": spec_to_phi(phi_k),
+        "phi_c": spec_to_phi_complex(phi_k),
         "pflux": fields[:, 0].sum(axis=(-2, -1)),
         "eflux": fields[:, 1].sum(axis=(-2, -1)),
         "kyspec": ds * jnp.sum(jnp.real(phi_s) ** 2 + jnp.imag(phi_s) ** 2, axis=(0, 1)),

@@ -170,7 +170,11 @@ class BaseRunner:
         self.setup_optimizer()
         self.ctx = replicate(self.dist, self.step_context())
         self.spec = StepSpec(
-            type(self).__name__, self.loss_fn, self.optimizer, self.trainable, self.post_update
+            type(self).__name__,
+            self.loss_fn,
+            self.optimizer,
+            self.trainable,
+            self.post_update,
         )
         self._maybe_resume()
         self.evaluator = self.build_evaluator()

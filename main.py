@@ -11,7 +11,9 @@ Usage (one experiment preset per workflow, see ``configs/experiment``)::
     python main.py                                   # ae (default preset)
     python main.py experiment=diffusion ae_checkpoint=/path/to/ae_run_dir
     python main.py experiment=gyroswin
+    python main.py experiment=pinc_revival_ae
     python main.py experiment=pinc_revival ae_checkpoint=/path/to/pretrained_ae_run
+    python main.py experiment=nf training.ckpt_dir=/path/to/nf_ckpts
     python main.py experiment=vqvae model.vq.quantizer=fsq
     python main.py experiment=ae training.n_epochs=1 logging=wandb
     python main.py load_ckpt=true output_path=/path/to/run_dir   # resume in place
@@ -41,12 +43,14 @@ def dispatch_runner(cfg: DictConfig) -> None:
         write_stats(cfg.dataset)
         return
     vq = (cfg.get("model") or {}).get("model_type") == "vqvae"
-    if base == "pinc" and cfg.get("stage") == "peft":
+    if base == "pinc" and cfg.get("stage") in ("peft", "joint"):
         from neugk_jax.pinc.peft import PINCPEFTRunner as Runner
     elif base == "vqvae" or (base in ("ae", "pinc") and vq):
         from neugk_jax.pinc.runner import VQVAERunner as Runner
     elif base in ("ae", "pinc"):
         from neugk_jax.pinc.runner import AERunner as Runner
+    elif base == "nf":
+        from neugk_jax.pinc.nf_runner import NFRunner as Runner
     elif base == "diffusion":
         from neugk_jax.diffusion.runner import FlowMatchingRunner as Runner
     elif base == "gyroswin":
@@ -74,7 +78,11 @@ def resume_config(cfg: DictConfig) -> DictConfig:
     saved = OmegaConf.load(run / "config.yaml")
     cli = list(HydraConfig.get().overrides.task) if HydraConfig.initialized() else []
     _drop_cli_overridden(cli, saved)
-    return OmegaConf.merge(cfg, saved)
+    # keys the run added with + are absent from the struct base config
+    OmegaConf.set_struct(cfg, False)
+    merged = OmegaConf.merge(cfg, saved)
+    OmegaConf.set_struct(merged, True)
+    return merged
 
 
 def run_id() -> str:

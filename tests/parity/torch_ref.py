@@ -18,6 +18,7 @@ def torch_doubles_swin_shortcut() -> bool:
         drop_path=lambda x: x,
         forward_part1=torch.zeros_like,
         forward_part2=torch.zeros_like,
+        legacy_double_shortcut=getattr(SwinTransformerBlock, "legacy_double_shortcut", True),
     )
     x = torch.ones(2, 3)
     return bool(torch.allclose(SwinTransformerBlock.forward(blk, x), 2 * x))

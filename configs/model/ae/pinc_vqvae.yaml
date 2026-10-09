@@ -1,0 +1,24 @@
+# fsq vq-vae: the pinc_ae architecture, 576 codes of 16 bits per snapshot (77369x)
+defaults:
+  - /model/ae/pinc_ae@_here_
+  - _self_
+
+name: vqvae
+model_type: vqvae
+norm_fn: RMSNorm
+patch:
+  patch_size: [4, 0, 2, 5, 4]
+bottleneck:
+  dim: 32
+vq:
+  quantizer: fsq
+  levels: [8, 8, 8, 5, 5, 5]
+loss_weights:
+  df: 1.0
+  vq_commit: 1.0
+# pretraining is df only; the peft experiment sets the physics weights
+extra_loss_weights:
+  phi_int: 0.0
+  flux_int: 0.0
+  kyspec: 0.0
+  qspec: 0.0

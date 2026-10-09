@@ -8,6 +8,7 @@
 - ``attach_ae_lora(model, lora_cfg, key)`` — LoRA adapters on the AE linears of a peft config
 - ``ae_state_template(model)`` — checkpoint keys and shapes of a JAX AE
 - ``export_ae_state(model, template)`` — JAX AE (LoRA merged, or peft keys) to a torch state_dict
+- ``import_ae_lora(model, state)`` — torch peft adapters into a LoRA-attached JAX AE
 """
 
 from __future__ import annotations
@@ -379,6 +380,33 @@ def export_ae_state(
     if missing:
         raise KeyError(f"{len(missing)} torch keys not exported: {missing[:5]}")
     return out
+
+
+def import_ae_lora(model, torch_state: Mapping[str, np.ndarray], *, atol: float = 0.0):
+    """``model`` with the adapters of a torch peft AE state_dict; returns ``(model, names)``.
+
+    ``names`` maps each adapter path to its torch ``lora_{A,B}`` keys. Raises unless every adapter
+    is present and every ``base_layer`` matches the frozen JAX base within ``atol``.
+    """
+    from neugk_jax.models.lora import LoRALinear, get_path, module_paths, set_adapters
+
+    vq = _is_vq(model)
+    adapters, names = {}, {}
+    for path in module_paths(model, LoRALinear):
+        mod = _ae_module_name(path, vq=vq)
+        keys = (f"{mod}.lora_A.default.weight", f"{mod}.lora_B.default.weight")
+        missing = [k for k in keys if k not in torch_state]
+        if missing:
+            raise KeyError(f"{path}: no {missing[0]} in the torch state")
+        base = get_path(model, path).base
+        for leaf, k in ((base.weight, "weight"), (base.bias, "bias")):
+            if leaf is not None and not np.allclose(
+                np.asarray(leaf), torch_state[f"{mod}.base_layer.{k}"], rtol=0.0, atol=atol
+            ):
+                raise ValueError(f"{mod}.base_layer.{k} differs from the jax base")
+        adapters[path] = tuple(torch_state[k] for k in keys)
+        names[path] = keys
+    return set_adapters(model, adapters), names
 
 
 def save_torch_checkpoint(path: str, state: Mapping[str, np.ndarray], **meta) -> None:

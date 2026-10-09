@@ -1,0 +1,10 @@
+# base ae pretraining of the pinc_revival runs
+defaults:
+  - ae@_here_
+  - _self_
+
+batch_size: 32  # per device
+n_epochs: 400
+loss_type: mse
+num_workers: 8
+save_every_n_epochs: 5

@@ -15,7 +15,13 @@ import jax.random as jr
 from neugk_jax.losses import df_loss, part_weight, recon_loss
 from neugk_jax.models.build import ae_conditioning, build_ae, mup_multipliers
 from neugk_jax.models.utils import cast_floating
-from neugk_jax.pinc.eval import AEEvaluator, VQVAEEvaluator, reconstruct, select_conditions
+from neugk_jax.pinc.eval import (
+    MAX_HISTOGRAM_CODES,
+    AEEvaluator,
+    VQVAEEvaluator,
+    reconstruct,
+    select_conditions,
+)
 from neugk_jax.pinc.quantizers import VectorQuantizer
 from neugk_jax.pinc.vqvae import Swin5DVQVAE
 from neugk_jax.training.data import stack_fields
@@ -38,7 +44,9 @@ def read_loss_weights(mcfg, supported) -> dict[str, float]:
     if not weights:
         raise ValueError(f"model.loss_weights is required; weights over {tuple(supported)}")
     scheduled = [k for k, v in to_dict(mcfg.get("loss_scheduler")).items() if v]
-    unknown = sorted(set(weights) - set(supported)) + sorted(scheduled)
+    # zero weights switch a term off, whatever the workflow supports
+    unknown = sorted(k for k, v in weights.items() if float(v) != 0 and k not in supported)
+    unknown += sorted(scheduled)
     if unknown:
         raise ValueError(
             f"unsupported loss weights / schedules {unknown}; one of {tuple(supported)}"
@@ -68,7 +76,7 @@ class AERunner(BaseRunner):
         self.extra_zf = bool(self.cfg.model.get("extra_zf_loss", False)) and self.separate_zf
         # training.batch_transform: readers serve raw frames, normalized per batch in the step
         self.train_ds.batch_transform = bool(self.tcfg.get("batch_transform", False))
-        # training.compute_dtype: forward in bf16 on a cast copy of the fp32 weights (torch autocast)
+        # training.compute_dtype: forward in bf16 on a cast copy of the fp32 weights
         dt = self.tcfg.get("compute_dtype")
         self.compute_dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16}.get(dt) if dt else None
 
@@ -152,13 +160,15 @@ class VQVAERunner(AERunner):
     def loss_fn(self, model, batch, key):
         x = batch["df"]
         keys = jr.split(key, x.shape[0])
-        out = reconstruct(model, x, batch.get("conditioning"), keys, inference=False)
+        out = self.forward(model, x, batch.get("conditioning"), keys)
         losses = {
             "df": self.df_recon_loss(out["df"], x),
             "vq_commit": model.vq.batch_loss(out["vq_aux"]),
         }
-        used = jnp.bincount(out["vq_indices"].reshape(-1), length=model.codebook_size) > 0
-        aux = {**losses, "codebook_usage": jnp.mean(used.astype(jnp.float32))}
+        aux = dict(losses)
+        if model.codebook_size <= MAX_HISTOGRAM_CODES:
+            used = jnp.bincount(out["vq_indices"].reshape(-1), length=model.codebook_size) > 0
+            aux["codebook_usage"] = jnp.mean(used.astype(jnp.float32))
         if isinstance(model.vq, VectorQuantizer):
             aux["state"] = (out["vq_aux"]["z"], out["vq_indices"])
         return sum(w * losses[k] for k, w in self.loss_weights.items()), aux

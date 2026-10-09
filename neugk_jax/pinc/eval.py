@@ -127,6 +127,10 @@ class AEEvaluator(BaseEvaluator):
         return generate_val_plots(rollout, gt, "random draw", ts=self.plot_time(batch))
 
 
+# codebooks above this size skip the usage histograms (one bin per code)
+MAX_HISTOGRAM_CODES = 2**22
+
+
 @eqx.filter_jit
 def code_histogram(hist, indices, mask):
     counts = jax.vmap(lambda i: jnp.bincount(i.reshape(-1), length=hist.shape[0]))(indices)
@@ -144,10 +148,15 @@ class VQVAEEvaluator(AEEvaluator):
     """AE metrics plus the codebook usage and perplexity of the validation codes."""
 
     def observe(self, out: dict, batch: dict) -> None:
-        self._hist = code_histogram(self._hist, out["vq_indices"], batch["mask"])
+        if self._hist is not None:
+            self._hist = code_histogram(self._hist, out["vq_indices"], batch["mask"])
 
     def __call__(self, model: Any, *, epoch: int) -> tuple[dict[str, float], dict[str, Any]]:
-        self._hist = replicate_local(self.dist, jnp.zeros((model.codebook_size,), jnp.float32))
+        self._hist = None
+        if model.codebook_size <= MAX_HISTOGRAM_CODES:
+            self._hist = replicate_local(self.dist, jnp.zeros((model.codebook_size,), jnp.float32))
         metrics, plots = super().__call__(model, epoch=epoch)
+        if self._hist is None:
+            return metrics, plots
         hist = self.sum_process_arrays(np.asarray(jax.device_get(self._hist), np.float64))
         return {**metrics, **codebook_metrics(hist)}, plots

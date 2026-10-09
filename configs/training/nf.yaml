@@ -1,0 +1,40 @@
+pool_size: 16  # neural fields trained together per device
+density:
+  epochs: 20
+  lr: 7.0e-3
+  min_lr: 1.0e-12
+  weight_decay: 1.0e-8
+  batch_size: 4096  # grid points per step and field
+  subsample: [0.2, 1.0]  # fraction of the grid visited per epoch, linear over the epochs
+  scan_steps: 64
+pinc:
+  epochs: 100  # full-field steps
+  lr: 5.0e-4
+  min_lr: 1.0e-8
+  warmup: 20
+  weight_decay: 1.0e-12
+  # comparators of the shared pinc terms (neugk_jax.pinc.losses.compare)
+  loss_types:
+    potential: phi_c  # the (re, im) complex potential of the one-sided spectrum, also for psnr(phi)
+    phi_int: std_l1
+    flux_int: l1
+    kyspec: std_l1
+    qspec: l1
+  df_units: physical  # df mse in physical units or of the z-scored field
+  loss_weights:
+    df: 1.0
+    phi_int: 1.0
+    flux_int: 1.0
+    kyspec: 1.0
+    qspec: 1.0
+# checkpoint directory shared across restarts (finished snapshots are skipped); null: output_path
+ckpt_dir: null
+# directory of density fields (best_*) the pinc phase warm-starts from; null: ckpt_dir
+init_from: null
+# per-trajectory shared initialization of the density phase (weight-aligned fields), under ckpt_dir
+shared_init:
+  enabled: false
+  rounds: 4  # passes over the trajectory's snapshots
+  epochs: 2  # full-grid epochs per snapshot and pass
+  lr: 5.0e-3
+  weight_decay: 1.0e-2

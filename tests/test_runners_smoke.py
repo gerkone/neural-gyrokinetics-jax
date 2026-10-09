@@ -149,7 +149,8 @@ def test_experiment_presets_compose(experiment, monkeypatch, tmp_path):
         assert cfg.ae_checkpoint is None
     if experiment == "pinc_revival":
         assert cfg.stage == "peft" and cfg.model.legacy_swin_shortcut
-        assert cfg.model.peft.lora.strategy == "attention_mlp"
+        lora = cfg.model.peft.lora
+        assert (lora.strategy, lora.r, lora.lora_alpha) == ("comprehensive", 32, 32)
     assert cfg.dataset.path == str(tmp_path)
     stats = cfg.dataset.get("normalization_stats")
     assert stats is None or (stats.startswith(str(tmp_path)) and stats.endswith("_stats.pkl"))

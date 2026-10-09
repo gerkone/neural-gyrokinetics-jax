@@ -512,23 +512,28 @@ class CycloneDataset:
         ds = self.metadata[fid].get("ds")
         return None if ds is None else float(ds)
 
-    def spectral_stats(self, key: str) -> dict[str, np.ndarray]:
+    def spectral_stats(
+        self, key: str, fids: Optional[Sequence[int]] = None, offset: Optional[int] = None
+    ) -> dict[str, np.ndarray]:
         """Per-mode ``mean`` / ``std`` of ``log1p`` of a served spectrum (``kyspec``, ``fluxspec``).
 
-        Pooled over the trajectories from ``offset`` on, each weighted by its timestep count.
+        Pooled over the trajectories ``fids`` (default: all) from ``offset`` (default: the
+        dataset's) on, each weighted by its timestep count.
         """
-        missing = [self.files[f] for f, m in self.metadata.items() if key not in m]
+        offset = self.offset if offset is None else int(offset)
+        metas = [self.metadata[int(f)] for f in (self.metadata if fids is None else fids)]
+        missing = sum(key not in m for m in metas)
         if missing:
-            raise KeyError(f"no {key!r} in the metadata of {len(missing)} trajectories")
+            raise KeyError(f"no {key!r} in the metadata of {missing} trajectories")
         rms = RunningStats(prior_count=1e-4)
-        for meta in self.metadata.values():
-            spec = np.log1p(np.asarray(meta[key], dtype=np.float64)[self.offset :])
+        for meta in metas:
+            spec = np.log1p(np.asarray(meta[key], dtype=np.float64)[offset:])
             rms.merge(
                 spec.mean(axis=0),
                 spec.var(axis=0),
                 spec.min(axis=0),
                 spec.max(axis=0),
-                count=len(meta["timesteps"][self.offset :]),
+                count=len(meta["timesteps"][offset:]),
             )
         stats = rms.moments(np.float32)
         return {"mean": stats["mean"], "std": stats["std"]}

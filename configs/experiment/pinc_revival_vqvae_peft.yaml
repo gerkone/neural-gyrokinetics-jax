@@ -1,0 +1,24 @@
+# @package _global_
+# pinc-vq-vae peft: lora adapters on the frozen pinc_revival vq-vae, the pinc-ae recipe
+#   python main.py experiment=pinc_revival_vqvae_peft ae_checkpoint=<vq-vae run dir>
+defaults:
+  - override /model: ae/pinc_vqvae
+  - override /dataset: cyclone_pinc
+  - override /training: pinc_peft
+
+workflow: pinc
+stage: peft
+model:
+  loss_weights:
+    df: 1.0
+    vq_commit: 0.0  # fsq has no commitment loss
+  extra_loss_weights:
+    phi_int: 1.0
+    flux_int: 1.0
+    kyspec: 1.0
+    qspec: 1.0
+training:
+  batch_size: 12  # per device; 8 x 12 is the pinc-ae global batch of 96
+validation:
+  validate_every_n_epochs: 5
+  eval_integrals: true

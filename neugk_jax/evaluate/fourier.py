@@ -80,3 +80,10 @@ def crop_kx_df(df, n: int, reim_axis: int = 0):
 def crop_kx_phi(phi, n: int):
     """Real potential ``(x, s, y)`` resampled to its ``n`` central kx modes."""
     return _crop_modes(phi, n, axis=0).real.astype(phi.dtype)
+
+
+def spec_to_phi_complex(spec):
+    """Complex potential of a one-sided spectrum ``(kx, s, ky)`` as ``(2, x, s, y)`` (re, im)."""
+    xp = spec.__array_namespace__()
+    phys = xp.fft.ifftn(xp.fft.ifftshift(spec, axes=0), axes=(0, 2), norm="forward")
+    return xp.stack([phys.real, phys.imag])
