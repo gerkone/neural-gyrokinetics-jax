@@ -17,11 +17,6 @@ model:
     flux_int: 1.0
     kyspec: 1.0
     qspec: 1.0
-  peft:
-    lora:
-      r: 8
-      lora_alpha: 0.125
-      strategy: attention_mlp
 training:
   batch_size: 12  # per device; 8 x 12 is the pinc-ae global batch of 96
 validation:

@@ -20,7 +20,7 @@ extra_loss_weights:
   qspec: 1.0
 peft:
   lora:
-    r: 8
-    lora_alpha: 0.125
-    # attention qkv/proj and every mlp linear (116 adapters)
-    strategy: attention_mlp
+    r: 32
+    lora_alpha: 32
+    # every linear layer
+    strategy: comprehensive
