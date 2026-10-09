@@ -71,11 +71,15 @@ def cosine_basis(pos: jnp.ndarray, modes: Sequence[int]) -> jnp.ndarray:
     return phi
 
 
+def _cosines(u: jnp.ndarray, n: int, cut: int) -> jnp.ndarray:
+    """``(..., p, n)`` DCT-II cosines ``cos(m pi (u + 1) / 2)`` of the cell-centred coordinates ``u``, zero from ``cut``."""
+    m = jnp.arange(n)
+    return jnp.cos(m * jnp.pi * (u[..., None] + 1) / 2) * (m < cut)
+
+
 def _dct_modes(u: jnp.ndarray, n: int, cut: int) -> jnp.ndarray:
     """``(..., p, n)`` orthonormal DCT-II modes of the cell-centred coordinates ``u``, zero from ``cut``."""
-    m = jnp.arange(n)
-    c = jnp.cos(m * jnp.pi * (u[..., None] + 1) / 2) * jnp.where(m > 0, math.sqrt(2.0), 1.0)
-    return c * (m < cut)
+    return _cosines(u, n, cut) * jnp.where(jnp.arange(n) > 0, math.sqrt(2.0), 1.0)
 
 
 def _window_coords(ax) -> jnp.ndarray:
@@ -159,7 +163,7 @@ class CosineFilter(eqx.Module):
 
 class DCTBases(eqx.Module):
     """Per spatial and folded axis a ``(..., p, r)`` basis ``B_r(u) = sum_m A_mr c_m(u)`` of the
-    window-local coordinate ``u``, ``c_m`` the DCT-II modes cut at the ones the grid represents.
+    window-local coordinate ``u``, ``c_m`` the DCT-II cosines cut at the ones the grid represents.
 
     ``A`` is the identity (the first ``r`` modes), or with ``learned`` ``A = A0 + hyper(context)``,
     ``A0`` starting at the identity and the hypernetwork's last layer at zero. The context of a
@@ -223,7 +227,7 @@ class DCTBases(eqx.Module):
         out = []
         for k, (ax, r) in enumerate(zip(grid.axes, self.ranks)):
             u = _window_coords(ax)
-            modes = _dct_modes(u, self.n_modes, min(ax.cap, u.shape[-1]))
+            modes = _cosines(u, self.n_modes, min(ax.cap, u.shape[-1]))
             a = self.a0[k] if self.learned else jnp.eye(self.n_modes, r)
             if self.learned and self.hyper[k] is not None:
                 ctx = self._context(grid, k, geometry)
