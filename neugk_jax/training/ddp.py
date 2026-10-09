@@ -179,6 +179,10 @@ def _replicated_sharding(mesh: Mesh):
     return NamedSharding(mesh, P())
 
 
+def replicated_sharding(dist: DistributedInfo):
+    return _replicated_sharding(dist.mesh)
+
+
 def _put(tree, sharding):
     return jax.tree_util.tree_map(
         lambda x: jax.device_put(x, sharding) if _is_array(x) else x, tree

@@ -141,8 +141,8 @@ def test_partitioned_step_matches_filter_jit_step(tmp_path):
     from helpers import make_traj, tiny_ae_cfg
 
     from neugk_jax.pinc.runner import AERunner
-    from neugk_jax.training.ddp import replicate, shard_batch
-    from neugk_jax.training.runner import PartitionedTrainStep, train_step
+    from neugk_jax.training.ddp import replicate, replicated_sharding, shard_batch
+    from neugk_jax.training.step import PartitionedTrainStep, train_step
 
     res = (4, 4, 4, 16, 8)
     make_traj(tmp_path, "iteration_0", n_t=5, resolution=res)
@@ -153,13 +153,13 @@ def test_partitioned_step_matches_filter_jit_step(tmp_path):
     key = replicate(r.dist, jr.PRNGKey(3))
     copy = lambda t: jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True) if eqx.is_array(x) else x, t)
     model, opt = copy(r.model), copy(r.opt_state)
-    step = PartitionedTrainStep(r.spec, r.model, r.opt_state)
-    m_leaves, o_leaves = step.flatten(copy(r.model), copy(r.opt_state))
+    step = PartitionedTrainStep(r.spec, r.model, r.opt_state, sharding=replicated_sharding(r.dist))
+    state = step.init(copy(r.model), copy(r.opt_state))
     for i in range(3):
         model, opt, logs = train_step((batch, r.ctx, jr.fold_in(key, i)), model, opt, r.spec)
-        m_leaves, o_leaves, step_logs = step((batch, r.ctx, key), i, m_leaves, o_leaves)
+        state, step_logs = step(state, (batch, r.ctx, key), i)
         assert all(np.array_equal(logs[k], step_logs[k]) for k in logs)
-    step_model, step_opt = step.unflatten(m_leaves, o_leaves)
+    step_model, step_opt = step.restore(state)
     for a, b in zip(jax.tree_util.tree_leaves((model, opt)), jax.tree_util.tree_leaves((step_model, step_opt))):
         assert np.array_equal(np.asarray(a), np.asarray(b))
     assert step.matches(step_model, step_opt)

@@ -38,7 +38,7 @@ def test_ae_runner_constructs_and_steps(cyclone_dir):
     r = AERunner(cfg, output_path=cfg.output_path)
     assert len(r.train_ds) > 0
     assert r.opt_state is not None
-    from neugk_jax.training.runner import train_step
+    from neugk_jax.training.step import train_step
 
     batch = r.load_batch(r.train_ds, [0], r.loader.read)
     r.model, r.opt_state, logs = train_step(
@@ -124,7 +124,7 @@ def test_fm_runner_constructs_and_steps(cyclone_dir, tmp_path):
     # the latent table is device resident and matches the dataset's cached latents
     assert r.ctx["latents"].shape == (len(r.train_ds), *r.latent_shape)
     assert np.allclose(np.asarray(r.ctx["latents"][1]), r.train_ds[1].df)
-    from neugk_jax.training.runner import train_step
+    from neugk_jax.training.step import train_step
 
     batch = r.load_batch(r.train_ds, [0, 1], r.loader.read)
     assert set(batch) == {"idx"}

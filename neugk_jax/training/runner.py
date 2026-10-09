@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Optional
 
 import equinox as eqx
 import jax
@@ -35,12 +34,14 @@ from neugk_jax.training.ddp import (
     init_distributed,
     local_view,
     replicate,
+    replicated_sharding,
     row_devices,
     shard_batch,
 )
 from neugk_jax.training.logging import Logger
 from neugk_jax.training.schedulers import warmup_cosine
-from neugk_jax.utils import count_trace, progress, to_dict
+from neugk_jax.training.step import PartitionedTrainStep, StepSpec
+from neugk_jax.utils import progress, to_dict
 
 
 def weight_decay_mask(params, exclude):
@@ -117,102 +118,9 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
     )
 
 
-def train_update(model, opt_state, loss_fn, optimizer, mask, *, has_aux: bool = False):
-    """One optimizer step on the leaves ``mask`` marks trainable; buffers stay fixed."""
-    params, static = eqx.partition(model, mask)
-    out, grads = eqx.filter_value_and_grad(
-        lambda p: loss_fn(eqx.combine(p, static)), has_aux=has_aux
-    )(params)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    return eqx.combine(eqx.apply_updates(params, updates), static), opt_state, out
-
-
-@dataclass(frozen=True, eq=False)
-class StepSpec:
-    """Static part of a train step: loss hook, optimizer, trainable mask and post-update hook."""
-
-    name: str
-    loss_fn: Callable
-    optimizer: Any
-    mask: Any
-    post_update: Callable
-
-
-def _train_step(inputs, model, opt_state, spec: StepSpec):
-    """``inputs = (batch, ctx, key)``; ``ctx`` holds the run-constant device tables (not donated).
-
-    A ``"state"`` entry of the loss aux is not logged but handed to
-    ``spec.post_update(model, state, key) -> (model, logs)`` after the optimizer step.
-    """
-    count_trace(f"train_step:{spec.name}")
-    batch, ctx, key = inputs
-
-    def loss(m):
-        return spec.loss_fn(m, {**ctx, **batch}, key)
-
-    model, opt_state, (value, aux) = train_update(
-        model, opt_state, loss, spec.optimizer, spec.mask, has_aux=True
-    )
-    aux = dict(aux)
-    model, extra = spec.post_update(model, aux.pop("state", None), jr.fold_in(key, 1))
-    return model, opt_state, {"total": value, **aux, **extra}
-
-
-train_step = eqx.filter_jit(_train_step, donate="all-except-first")
-
-
 @partial(jax.jit, donate_argnums=(0, 1))
 def _add_logs(acc, logs):
     return jax.tree_util.tree_map(jnp.add, acc, logs)
-
-
-class PartitionedTrainStep:
-    """``train_step`` as a plain ``jax.jit`` on the arrays of a model and optimizer state partitioned once.
-
-    The static parts are split off once, so a step call only flattens two lists of arrays; the
-    step key is ``fold_in(key, step)`` inside the program. ``matches`` tells whether a model and
-    optimizer state have the structure this step was built for.
-    """
-
-    def __init__(self, spec: StepSpec, model, opt_state):
-        (m_leaves, self.m_def, self.m_static), (o_leaves, self.o_def, self.o_static) = (
-            self._split(model),
-            self._split(opt_state),
-        )
-
-        def step(dyn, static, i, m_leaves, o_leaves):
-            batch, ctx, key = eqx.combine(dyn, jax.tree_util.tree_unflatten(static[0], static[1]))
-            model, opt_state = self.unflatten(m_leaves, o_leaves)
-            model, opt_state, logs = _train_step((batch, ctx, jr.fold_in(key, i)), model, opt_state, spec)
-            return self._split(model)[0], self._split(opt_state)[0], logs
-
-        self._step = jax.jit(step, static_argnums=1, donate_argnums=(3, 4))
-
-    @staticmethod
-    def _split(tree):
-        params, static = eqx.partition(tree, eqx.is_array)
-        leaves, treedef = jax.tree_util.tree_flatten(params)
-        return leaves, treedef, static
-
-    def matches(self, model, opt_state) -> bool:
-        (_, m_def, m_static), (_, o_def, o_static) = self._split(model), self._split(opt_state)
-        return (m_def, o_def) == (self.m_def, self.o_def) and bool(
-            eqx.tree_equal((m_static, o_static), (self.m_static, self.o_static))
-        )
-
-    def flatten(self, model, opt_state):
-        return self._split(model)[0], self._split(opt_state)[0]
-
-    def unflatten(self, m_leaves, o_leaves):
-        model = eqx.combine(jax.tree_util.tree_unflatten(self.m_def, m_leaves), self.m_static)
-        opt_state = eqx.combine(jax.tree_util.tree_unflatten(self.o_def, o_leaves), self.o_static)
-        return model, opt_state
-
-    def __call__(self, inputs, i, m_leaves, o_leaves):
-        # non-array inputs are static, as under eqx.filter_jit
-        dyn, static = eqx.partition(inputs, eqx.is_array)
-        leaves, treedef = jax.tree_util.tree_flatten(static)
-        return self._step(dyn, (treedef, tuple(leaves)), np.int32(i), m_leaves, o_leaves)
 
 
 def configure_compilation_cache(cfg) -> None:
@@ -454,22 +362,24 @@ class BaseRunner:
         step0 = (epoch - 1) * self.steps_per_epoch
         step = getattr(self, "_partitioned_step", None)
         if step is None or not step.matches(self.model, self.opt_state):
-            step = self._partitioned_step = PartitionedTrainStep(self.spec, self.model, self.opt_state)
+            step = self._partitioned_step = PartitionedTrainStep(
+                self.spec, self.model, self.opt_state, sharding=replicated_sharding(self.dist)
+            )
         step_key = replicate(self.dist, step_key)
-        m_leaves, o_leaves = step.flatten(self.model, self.opt_state)
+        state = step.init(self.model, self.opt_state)
         try:
             for i, (_, batch, wait) in enumerate(batches):
                 waits.append(wait)
                 batch.pop("mask")
                 batch = self.place_batch(batch)
                 batch.update(self.step_extras(step0 + i))
-                m_leaves, o_leaves, logs = step((batch, self.ctx, step_key), i, m_leaves, o_leaves)
+                state, logs = step(state, (batch, self.ctx, step_key), i)
                 acc = logs if acc is None else _add_logs(acc, logs)
                 if i == 0:
                     jax.block_until_ready(acc)
                     t_first = time.perf_counter()
         finally:
-            self.model, self.opt_state = step.unflatten(m_leaves, o_leaves)
+            self.model, self.opt_state = step.restore(state)
         n = len(waits)
         if acc is None:
             return {}, {}

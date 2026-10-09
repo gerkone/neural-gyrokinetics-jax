@@ -189,7 +189,7 @@ def test_cross_losses_rejected(cyclone_dir):
 
 def test_weight_schedule_does_not_retrace(cyclone_dir, monkeypatch):
     import neugk_jax.gyroswin.runner as runner_mod
-    from neugk_jax.training.runner import train_step
+    from neugk_jax.training.step import train_step
     from neugk_jax.utils import TRACE_COUNTS
 
     calls = []

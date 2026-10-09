@@ -127,7 +127,7 @@ def test_pinc_runner_trains_only_adapters_and_validates(tmp_path):
     from neugk_jax.pinc.peft import PINCPEFTRunner
     from neugk_jax.training.checkpoint import save_model_only
     from neugk_jax.training.ddp import local_view, shard_batch
-    from neugk_jax.training.runner import train_step
+    from neugk_jax.training.step import train_step
 
     for i, f in enumerate((2.0, 3.0, 0.5)):
         _make_traj(tmp_path, f"iteration_{i}", n_t=6, flux=f)
