@@ -21,13 +21,31 @@ FS = 1.1
 FONT = "'Courier New', 'Liberation Mono', 'Nimbus Mono PS', monospace"
 INK, MUTED, LINE, CARD = "#0f172a", "#64748b", "#e2e8f0", "#f8fafc"
 ARROWS = ["#64748b", "#b45309", "#1d4ed8", "#047857"]
-ACCENT = {"tile": ("#475569", "#f1f5f9"), "basis": ("#b45309", "#fef3c7"), "enc": ("#1d4ed8", "#dbeafe"), "dec": ("#047857", "#d1fae5"), "back": ("#64748b", "#f1f5f9")}
+ACCENT = {
+    "tile": ("#475569", "#f1f5f9"),
+    "basis": ("#b45309", "#fef3c7"),
+    "enc": ("#1d4ed8", "#dbeafe"),
+    "dec": ("#047857", "#d1fae5"),
+    "back": ("#64748b", "#f1f5f9"),
+}
 # card tints: the sidebar colour, faint
-TINT = {"tile": ("#f5f7fa", "#e2e8f0"), "basis": ("#fffaf0", "#f3e3c3"), "enc": ("#f4f8ff", "#d6e2fb"), "dec": ("#f2fbf7", "#cdebdc"), "back": ("#f3f5f8", "#cbd5e1")}
+TINT = {
+    "tile": ("#f5f7fa", "#e2e8f0"),
+    "basis": ("#fffaf0", "#f3e3c3"),
+    "enc": ("#f4f8ff", "#d6e2fb"),
+    "dec": ("#f2fbf7", "#cdebdc"),
+    "back": ("#f3f5f8", "#cbd5e1"),
+}
 
 
 def tex_svgs(texs):
-    out = subprocess.run(["node", str(HERE / "tex2svg.js")], input=json.dumps(texs), capture_output=True, text=True, check=True)
+    out = subprocess.run(
+        ["node", str(HERE / "tex2svg.js")],
+        input=json.dumps(texs),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     return json.loads(out.stdout)
 
 
@@ -41,7 +59,9 @@ class Canvas:
     def text(self, x, y, s, size=14, color=INK, weight=400, anchor="start", italic=False):
         style = " font-style='italic'" if italic else ""
         size *= FS
-        self.add(f"<text x='{x:.1f}' y='{y:.1f}' font-family=\"{FONT}\" font-size='{size}' font-weight='{weight}' fill='{color}' text-anchor='{anchor}'{style}>{s}</text>")
+        self.add(
+            f"<text x='{x:.1f}' y='{y:.1f}' font-family=\"{FONT}\" font-size='{size}' font-weight='{weight}' fill='{color}' text-anchor='{anchor}'{style}>{s}</text>"
+        )
 
     def math(self, x, y, tex, size=17, color=INK, anchor="start"):
         size *= FS
@@ -51,7 +71,9 @@ class Canvas:
 
     def rect(self, x, y, w, h, fill, stroke="none", r=0, sw=1, dash=None):
         d = f" stroke-dasharray='{dash}'" if dash else ""
-        self.add(f"<rect x='{x:.1f}' y='{y:.1f}' width='{w:.1f}' height='{h:.1f}' rx='{r}' fill='{fill}' stroke='{stroke}' stroke-width='{sw}'{d}/>")
+        self.add(
+            f"<rect x='{x:.1f}' y='{y:.1f}' width='{w:.1f}' height='{h:.1f}' rx='{r}' fill='{fill}' stroke='{stroke}' stroke-width='{sw}'{d}/>"
+        )
 
     def line(self, x1, y1, x2, y2, color=MUTED, sw=1.5, dash=None, arrow=False):
         d = f" stroke-dasharray='{dash}'" if dash else ""
@@ -69,7 +91,9 @@ class Canvas:
         n = np.array([-u[1], u[0]])
         b = np.array([x, y]) - u * size
         p1, p2 = b + n * size * 0.45, b - n * size * 0.45
-        self.top.append(f"<path d='M {x:.1f} {y:.1f} L {p1[0]:.1f} {p1[1]:.1f} L {p2[0]:.1f} {p2[1]:.1f} z' fill='{color}' stroke='{color}' stroke-width='1.5' stroke-linejoin='round'/>")
+        self.top.append(
+            f"<path d='M {x:.1f} {y:.1f} L {p1[0]:.1f} {p1[1]:.1f} L {p2[0]:.1f} {p2[1]:.1f} z' fill='{color}' stroke='{color}' stroke-width='1.5' stroke-linejoin='round'/>"
+        )
 
     def arrow(self, x1, y, x2, color=MUTED):
         self.line(x1, y, x2, y, color=color, sw=4.2, arrow=True)
@@ -89,7 +113,9 @@ class Canvas:
             b = p1 + (p2 - p1) / np.linalg.norm(p2 - p1) * r
             d += f" L {a[0]:.1f} {a[1]:.1f} Q {p1[0]:.1f} {p1[1]:.1f} {b[0]:.1f} {b[1]:.1f}"
         d += f" L {end[0]:.1f} {end[1]:.1f}"
-        self.top.append(f"<path d='{d}' fill='none' stroke='{color}' stroke-width='{sw}' stroke-linecap='round' stroke-linejoin='round'/>")
+        self.top.append(
+            f"<path d='{d}' fill='none' stroke='{color}' stroke-width='{sw}' stroke-linecap='round' stroke-linejoin='round'/>"
+        )
         self.head(pts[-1][0], pts[-1][1], u, color, size=22)
 
     def render(self, height):
@@ -111,14 +137,20 @@ def place_math(svg, x, y, size, color, anchor):
     va = re.search(r"vertical-align: (-?[\d.]+)ex", svg)
     drop = -float(va.group(1)) * ex if va else 0.0
     x0 = x - w / 2 if anchor == "middle" else (x - w if anchor == "end" else x)
-    inner = re.sub(r'^<svg[^>]*>', "", svg)[: -len("</svg>")]
+    inner = re.sub(r"^<svg[^>]*>", "", svg)[: -len("</svg>")]
     vb = re.search(r'viewBox="([^"]+)"', svg).group(1)
     return f"<svg x='{x0:.1f}' y='{y - h + drop:.1f}' width='{w:.1f}' height='{h:.1f}' viewBox='{vb}' color='{color}' style='color:{color}' overflow='visible'>{inner}</svg>"
 
 
 def cmap(v):
     # diverging blue - white - red for a value in [-1, 1]
-    stops = [(-1.0, (37, 78, 168)), (-0.5, (116, 158, 214)), (0.0, (247, 247, 245)), (0.5, (229, 135, 104)), (1.0, (170, 32, 42))]
+    stops = [
+        (-1.0, (37, 78, 168)),
+        (-0.5, (116, 158, 214)),
+        (0.0, (247, 247, 245)),
+        (0.5, (229, 135, 104)),
+        (1.0, (170, 32, 42)),
+    ]
     v = float(np.clip(v, -1, 1))
     for (a, ca), (b, cb) in zip(stops, stops[1:]):
         if v <= b:
@@ -146,7 +178,9 @@ def dots(cv, x, y, a, cell, scale=None):
     for i in range(rows):
         for j in range(cols):
             cx, cy = x + (j + 0.5) * cell, y + (i + 0.5) * cell
-            cv.add(f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='{cell * 0.36:.1f}' fill='{cmap(a[i, j] / s)}' stroke='#94a3b8' stroke-width='0.8'/>")
+            cv.add(
+                f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='{cell * 0.36:.1f}' fill='{cmap(a[i, j] / s)}' stroke='#94a3b8' stroke-width='0.8'/>"
+            )
     return cols * cell, rows * cell
 
 
@@ -172,7 +206,9 @@ def mlp_glyph(cv, x, y, color, widths=(5, 7, 7, 5), dx=26, dy=13):
                 cv.line(p[0], p[1], q[0], q[1], color="#e5d3b3", sw=0.6)
     for col in pts:
         for p in col:
-            cv.add(f"<circle cx='{p[0]:.1f}' cy='{p[1]:.1f}' r='3.6' fill='white' stroke='{color}' stroke-width='1.3'/>")
+            cv.add(
+                f"<circle cx='{p[0]:.1f}' cy='{p[1]:.1f}' r='3.6' fill='white' stroke='{color}' stroke-width='1.3'/>"
+            )
     return (len(widths) - 1) * dx
 
 
@@ -221,6 +257,9 @@ def main(data, out):
     order_psi = np.argsort(-psi.reshape(len(psi), -1).std(1))
     cm = tuple(int(v) for v in d["code_modes"])
     n_k = int(np.prod(cm))
+    rank, n_c, dim = int(d["rank"]), int(d["channels"]), int(d["token_dim"])
+    n_f, n_co, hid = int(d["n_features"]), int(d["n_coords"]), int(d["hidden"])
+    width = n_k * n_c * rank
     sx = [(ks * cm[2] + kxm) * cm[3] for ks in range(cm[1]) for kxm in range(cm[2])]
     big = 26
     cx = M + CW / 2
@@ -235,9 +274,13 @@ def main(data, out):
     gx, gy = cx - total / 2, y + 96
     pw, ph = heat(cv, gx, gy, plane, cell, gap=0.6, r=1)
     for j in range(0, plane.shape[1] + 1, px):
-        cv.line(gx + j * cell - 0.3, gy - 4, gx + j * cell - 0.3, gy + ph + 4, color="#334155", sw=1)
+        cv.line(
+            gx + j * cell - 0.3, gy - 4, gx + j * cell - 0.3, gy + ph + 4, color="#334155", sw=1
+        )
     for i in range(0, plane.shape[0] + 1, ps):
-        cv.line(gx - 4, gy + i * cell - 0.3, gx + pw + 4, gy + i * cell - 0.3, color="#334155", sw=1)
+        cv.line(
+            gx - 4, gy + i * cell - 0.3, gx + pw + 4, gy + i * cell - 0.3, color="#334155", sw=1
+        )
     hx, hy = gx + tok[2] * px * cell, gy + tok[1] * ps * cell
     cv.rect(hx - 2, hy - 2, px * cell + 3.4, ps * cell + 3.4, "none", stroke=INK, sw=3.4, r=2)
     cv.text(gx + pw / 2, gy + ph + 38, "x", size=big, color=MUTED, anchor="middle")
@@ -254,27 +297,59 @@ def main(data, out):
 
     # 2: coordinate basis; decoder row on top so the connectors do not cross
     h2 = 500
-    card(cv, y, h2, "basis", "Coordinate basis", "functions on the patch, from the point coordinates only")
+    card(
+        cv,
+        y,
+        h2,
+        "basis",
+        "Coordinate basis",
+        "functions on the patch, from the point coordinates only",
+    )
     c = 14
     n_w = group_width(2, px, c)
     row_w = 330 + 60 + 150 + 50 + n_w + 70 + n_w + 70 + n_w
     x0 = cx - row_w / 2
     rows = [
-        (y + 140, order_psi, psi, r"\psi_r(p)", r"\varphi_k\psi_r", "dec", "filter MLP (dec)", "85 → 256 → 256 → 128", f"synthesis basis: {n_k} × 128"),
-        (y + 320, order, k_maps, r"K_r(p)", r"b_{kr}", "enc", "filter MLP (enc)", "85 → 256 → 256 → 256", f"projection basis: {n_k} × 256"),
+        (
+            y + 140,
+            order_psi,
+            psi,
+            r"\psi_r(p)",
+            r"\varphi_k\psi_r",
+            "dec",
+            "filter MLP (dec)",
+            f"{n_f} → {hid} → {hid} → {rank}",
+            f"synthesis basis: {n_k} × {rank}",
+        ),
+        (
+            y + 320,
+            order,
+            k_maps,
+            r"K_r(p)",
+            r"b_{kr}",
+            "enc",
+            "filter MLP (enc)",
+            f"{n_f} → {hid} → {hid} → {rank}",
+            f"projection basis: {n_k} × {rank}",
+        ),
     ]
     pmid = (rows[0][0] + rows[1][0]) / 2 + ps * c / 2
     cv.math(x0, pmid - 18, r"p", size=34)
-    cv.math(x0, pmid + 22, r"(u_s, u_x, u_y, v_\parallel, \mu, c)", size=20, color=MUTED)
-    cv.math(x0, pmid + 66, r"85 = 5 \cdot 16 + 2 + 3", size=20, color=INK)
-    cv.text(x0, pmid + 94, "5 coords × 16 cosines", size=16, color=MUTED)
-    cv.text(x0, pmid + 115, "+ 2 channels", size=16, color=MUTED)
-    cv.text(x0, pmid + 136, "+ 3 patch scales", size=16, color=MUTED)
+    cv.math(x0, pmid + 22, r"(u_s, u_x, u_y, v_\parallel, \mu)", size=20, color=MUTED)
+    n_sc = n_f - n_co * 16
+    cv.math(x0, pmid + 66, rf"{n_f} = {n_co} \cdot 16 + {n_sc}", size=20, color=INK)
+    cv.text(x0, pmid + 94, f"{n_co} coords × 16 cosines", size=16, color=MUTED)
+    cv.text(x0, pmid + 115, f"+ {n_sc} patch scales", size=16, color=MUTED)
     outs = {}
     for ry, idx, maps, tex, out_tex, key, mlp_name, mlp_shape, basis_name in rows:
         mid = ry + ps * c / 2
         x = x0 + 330
-        cv.elbow([(x0 + 262, pmid), (x0 + 288, pmid), (x0 + 288, mid), (x + 58, mid)], basis_c, r=12, sw=4.2)
+        cv.elbow(
+            [(x0 + 262, pmid), (x0 + 288, pmid), (x0 + 288, mid), (x + 58, mid)],
+            basis_c,
+            r=12,
+            sw=4.2,
+        )
         x += 64
         mlp_glyph(cv, x, mid, basis_c, widths=(3, 4, 4, 3), dx=40, dy=13)
         cv.text(x + 60, ry - 40, mlp_name, size=21, weight=600, anchor="middle")
@@ -295,23 +370,39 @@ def main(data, out):
         x += 50
         group(cv, x, ry, [phi[sx[1]] * maps[idx[0]], phi[sx[3]] * maps[idx[1]]], c)
         label(cv, x + n_w / 2, ry + ps * c + 34, out_tex, size=24, color=INK)
-        cv.text(x + n_w / 2, ry - 16, basis_name.split(":")[0], size=17, color=MUTED, anchor="middle")
-        cv.text(x + n_w / 2, ry + ps * c + 64, basis_name.split(": ")[1], size=17, color=MUTED, anchor="middle")
+        cv.text(
+            x + n_w / 2, ry - 16, basis_name.split(":")[0], size=17, color=MUTED, anchor="middle"
+        )
+        cv.text(
+            x + n_w / 2,
+            ry + ps * c + 64,
+            basis_name.split(": ")[1],
+            size=17,
+            color=MUTED,
+            anchor="middle",
+        )
         outs[key] = (x + n_w, mid)
-    cv.text(cx, y + h2 - 22, "computed per point: the same weights on every grid, resolution and data type", size=20, color=MUTED, anchor="middle")
+    cv.text(
+        cx,
+        y + h2 - 22,
+        "computed per point, one basis for every channel: the same weights on every grid",
+        size=20,
+        color=MUTED,
+        anchor="middle",
+    )
     y2_end = y + h2
     y += h2 + 44
 
     # 3: encoder
     h3 = 270
-    card(cv, y, h3, "enc", "Encoder", "a linear combination of the patch values")
+    card(cv, y, h3, "enc", "Encoder", "a linear combination of the patch values, per channel c")
     c = 22
     ey = y + 110
     mid = ey + ps * c / 2
     row_w = px * c + 40 + px * c + 60 + 360 + 50 + 130 + 50 + 40
     x = cx - row_w / 2
     dots(cv, x, ey, d["truth"], c)
-    label(cv, x + px * c / 2, ey + ps * c + 36, r"x_p", size=26, color=INK)
+    label(cv, x + px * c / 2, ey + ps * c + 36, r"x_{pc}", size=26, color=INK)
     cv.math(x + px * c + 10, mid + 10, r"\times", size=28, color=enc_c)
     bx = x + px * c + 40
     heat(cv, bx, ey, phi[sx[1]] * k_maps[order[0]], c)
@@ -320,13 +411,20 @@ def main(data, out):
     x = bx + px * c + 14
     cv.arrow(x, mid, x + 40, color=enc_c)
     x += 56
-    cv.math(x, mid + 12, r"h_{kr} = \sum_p w_p\, b_{kr}(p)\, x_p", size=28)
-    cv.text(x + 150, mid + 60, f"{n_k * 256} projections", size=19, color=MUTED, anchor="middle")
+    cv.math(x, mid + 12, r"h_{kcr} = \sum_p w_p\, b_{kr}(p)\, x_{pc}", size=28)
+    cv.text(
+        x + 150,
+        mid + 60,
+        f"{n_k} × {n_c} × {rank} = {width} projections",
+        size=19,
+        color=MUTED,
+        anchor="middle",
+    )
     x += 360
     cv.arrow(x, mid, x + 40, color=enc_c)
     x += 50
     matrix(cv, x, mid - 50, 110, 100, enc_c, ACCENT["enc"][1], r"W")
-    cv.text(x + 55, mid + 78, "6144 → 1024", size=19, color=MUTED, anchor="middle")
+    cv.text(x + 55, mid + 78, f"{width} → {dim}", size=19, color=MUTED, anchor="middle")
     x += 120
     cv.arrow(x, mid, x + 40, color=enc_c)
     x += 50
@@ -364,12 +462,12 @@ def main(data, out):
     cv.arrow(x, mid, x + 40, color=dec_c)
     x += 50
     matrix(cv, x, mid - 50, 110, 100, dec_c, ACCENT["dec"][1], r"B")
-    cv.text(x + 55, mid + 78, "1024 → 3072", size=19, color=MUTED, anchor="middle")
+    cv.text(x + 55, mid + 78, f"{dim} → {width}", size=19, color=MUTED, anchor="middle")
     x += 120
     cv.arrow(x, mid, x + 40, color=dec_c)
     x += 50
     vstrip(cv, x, mid - 60, d["codes"], 26, 120)
-    label(cv, x + 13, mid + 98, r"c_{kr}", size=26, color=INK)
+    label(cv, x + 13, mid + 98, r"c_{kcr}", size=26, color=INK)
     x += 36
     cv.arrow(x, mid, x + 40, color=dec_c)
     x += 56
@@ -385,18 +483,52 @@ def main(data, out):
     cv.math(x, mid + 12, r"=", size=30, color=dec_c)
     x += 44
     dots(cv, x, dy, d["recon"], c, scale=scale)
-    label(cv, x + px * c / 2, dy + ps * c + 36, r"u_p", size=26, color=INK)
-    label(cv, t0 + terms_w / 2, dy + ps * c + 40, r"u_p = \sum_{k,r} c_{kr}\, \varphi_k(p)\,\psi_r(p)", size=26, color=INK)
+    label(cv, x + px * c / 2, dy + ps * c + 36, r"u_{pc}", size=26, color=INK)
+    label(
+        cv,
+        t0 + terms_w / 2,
+        dy + ps * c + 40,
+        r"u_{pc} = \sum_{k,r} c_{kcr}\, \varphi_k(p)\,\psi_r(p)",
+        size=26,
+        color=INK,
+    )
     dec_in = (t0 + terms_w / 2, dy - 6)
-    cv.text(cx, y + h4 - 22, "the patch as a linear combination of basis functions", size=22, color=MUTED, anchor="middle")
+    cv.text(
+        cx,
+        y + h4 - 22,
+        "the patch as a linear combination of basis functions",
+        size=22,
+        color=MUTED,
+        anchor="middle",
+    )
     y += h4 + 34
 
     # connectors
     lane1, lane2 = M + CW + 22, M + CW + 50
-    cv.elbow([(outs["enc"][0] + 10, outs["enc"][1]), (lane1, outs["enc"][1]), (lane1, y2_end + 22), (enc_in[0], y2_end + 22), enc_in], enc_c)
-    cv.elbow([(outs["dec"][0] + 10, outs["dec"][1]), (lane2, outs["dec"][1]), (lane2, yb_end + 11), (dec_in[0], yb_end + 11), dec_in], dec_c)
+    cv.elbow(
+        [
+            (outs["enc"][0] + 10, outs["enc"][1]),
+            (lane1, outs["enc"][1]),
+            (lane1, y2_end + 22),
+            (enc_in[0], y2_end + 22),
+            enc_in,
+        ],
+        enc_c,
+    )
+    cv.elbow(
+        [
+            (outs["dec"][0] + 10, outs["dec"][1]),
+            (lane2, outs["dec"][1]),
+            (lane2, yb_end + 11),
+            (dec_in[0], yb_end + 11),
+            dec_in,
+        ],
+        dec_c,
+    )
     side = M - 20
-    cv.elbow([back_out, (side, back_out[1]), (side, dec_zmid[1]), (dec_zmid[0] - 4, dec_zmid[1])], MUTED)
+    cv.elbow(
+        [back_out, (side, back_out[1]), (side, dec_zmid[1]), (dec_zmid[0] - 4, dec_zmid[1])], MUTED
+    )
 
     Path(out).write_text(cv.render(y))
     print(out, W, y)
