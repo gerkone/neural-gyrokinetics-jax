@@ -11,8 +11,10 @@ Modes (``python -m neugk_jax.dataset.preprocess --mode=<mode>``):
 * ``gyaradax``: gyaradax run folders (``step_*.npz`` + ``config.yaml`` + ``geometry.pkl``)
   to the same layout, with heat-flux verification.
 * ``quantize``: side-by-side quantized siblings of the fp32 shards (``.bf16.bin``,
-  ``.fp16.bin``, ``.i8.bin``, ``.i4.bin``, layout in :mod:`neugk_jax.dataset.quant`) read
-  by the dataloader's ``prefer_dtype`` path.
+  ``.zstd16.bin``, ``.fp16.bin``, ``.i8.bin``, ``.i4.bin``, layout in
+  :mod:`neugk_jax.dataset.quant`) read by the dataloader's ``prefer_dtype`` path. ``zstd16``
+  also packs frames that only have a ``.bf16.bin``; ``--remove-source`` then deletes each
+  ``.bf16.bin`` once its ``.zstd16.bin`` is verified.
 
 Usage::
 
@@ -25,6 +27,8 @@ Usage::
     python -m neugk_jax.dataset.preprocess --mode=quantize \\
         --path /path/to/out/preprocessed_kvikio \\
         --trajs 'iteration_{0-299}_ifft_realpotens' --bits bf16 --num-workers 8
+    python -m neugk_jax.dataset.preprocess --mode=quantize \\
+        --path /path/to/out/preprocessed_kvikio --bits zstd16 --remove-source --num-workers 32
 
 ``--root`` (raw GKW root holding ``<raw-subdir>/<run>``), ``--target-dir`` and ``--path``
 default to ``$NEUGK_RAW_ROOT``, ``$NEUGK_TARGET_DIR`` and
@@ -81,34 +85,63 @@ def resolve_traj_dirs(root_dir: str, spec=None) -> list[str]:
 
 
 def _src_bins(data_dir: str) -> list[str]:
-    """List fp32 .bin sources (timestep + poten) inside ``traj/data``."""
+    """fp32 ``.bin`` paths of the frames (timestep + poten) in ``traj/data``.
+
+    A frame stored only as its ``.bf16.bin`` is listed under its fp32 name too.
+    """
     if not os.path.isdir(data_dir):
         return []
-    out = []
+    out = set()
     for name in os.listdir(data_dir):
-        if not name.endswith(".bin"):
-            continue
-        if any(name.endswith(suf) for suf in quant.SUFFIX.values()):
-            continue
         if not (name.startswith("timestep_") or name.startswith("poten_")):
             continue
-        out.append(os.path.join(data_dir, name))
+        if name.endswith(quant.SUFFIX["bf16"]):
+            name = name.removesuffix(quant.SUFFIX["bf16"]) + ".bin"
+        elif not name.endswith(".bin") or any(name.endswith(s) for s in quant.SUFFIX.values()):
+            continue
+        out.add(os.path.join(data_dir, name))
     return sorted(out)
 
 
-def _quantize_file(src: str, bits: str, force: bool) -> tuple[str, int, str]:
-    dst = quant.sibling(src, bits)
-    if os.path.exists(dst) and not force:
+def _fsync(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _quantize_file(
+    src: str, bits: str, force: bool, remove_source: bool = False
+) -> tuple[str, int, str]:
+    dst, bf16 = quant.sibling(src, bits), quant.sibling(src, "bf16")
+    if os.path.exists(dst) and not force and not remove_source:
         return src, 0, "skip"
-    payload, scale = quant.quantize(np.fromfile(src, dtype=np.float32), bits)
-    return src, quant.write(dst, payload, scale), "written"
+    if os.path.exists(src):
+        payload, scale = quant.quantize(np.fromfile(src, dtype=np.float32), bits)
+    elif quant.values(bits) == "bf16" and os.path.exists(bf16):
+        payload, scale = np.fromfile(bf16, dtype=quant.payload_dtype("bf16")), None
+    else:
+        return src, 0, "no fp32 source"
+    n, status = 0, "skip"
+    if force or not os.path.exists(dst):
+        n, status = quant.write(dst, payload, scale), "written"
+    if remove_source and os.path.exists(bf16):
+        if not np.array_equal(quant.read(dst, bits, payload.size), payload.astype(np.float32)):
+            raise IOError(f"{dst}: decoded shard differs from {bf16}")
+        _fsync(dst)
+        _fsync(os.path.dirname(dst))
+        os.remove(bf16)
+    return src, n, status
 
 
-def _process_traj(traj_dir: str, bits: str, force: bool) -> tuple[str, int, int, int]:
+def _process_traj(
+    traj_dir: str, bits: str, force: bool, remove_source: bool = False
+) -> tuple[str, int, int, int]:
     files = _src_bins(os.path.join(traj_dir, "data"))
     n_written = n_skipped = bytes_written = 0
     for src in files:
-        _, n, status = _quantize_file(src, bits, force=force)
+        _, n, status = _quantize_file(src, bits, force=force, remove_source=remove_source)
         if status == "written":
             n_written += 1
             bytes_written += n
@@ -120,7 +153,13 @@ def _process_traj(traj_dir: str, bits: str, force: bool) -> tuple[str, int, int,
 
 
 def run_quantize(
-    *, path: str, trajs: str | Sequence[str], bits: str, num_workers: int = 4, force: bool = False
+    *,
+    path: str,
+    trajs: str | Sequence[str],
+    bits: str,
+    num_workers: int = 4,
+    force: bool = False,
+    remove_source: bool = False,
 ) -> None:
     traj_dirs = [d for d in resolve_traj_dirs(path, trajs) if os.path.isdir(d)]
     if not traj_dirs:
@@ -130,7 +169,7 @@ def run_quantize(
     t0 = time.perf_counter()
     total_w = total_s = total_b = 0
     with ThreadPoolExecutor(max_workers=max(1, num_workers)) as ex:
-        futures = {ex.submit(_process_traj, d, bits, force): d for d in traj_dirs}
+        futures = {ex.submit(_process_traj, d, bits, force, remove_source): d for d in traj_dirs}
         for i, fut in enumerate(as_completed(futures), 1):
             d, nw, ns, bw = fut.result()
             total_w += nw
@@ -392,6 +431,16 @@ def _write_bin(path: str, arr: np.ndarray) -> None:
         np.ascontiguousarray(arr).tofile(path)
 
 
+def _write_frame(path: str, arr: np.ndarray, bits: str) -> None:
+    """Frame ``arr`` under its fp32 name ``path``, or as its ``bits`` sibling."""
+    if bits == "fp32":
+        _write_bin(path, arr)
+        return
+    dst = quant.sibling(path, bits)
+    if not os.path.exists(dst):
+        quant.write(dst, *quant.quantize(np.asarray(arr, np.float32).ravel(), bits))
+
+
 def _merge_old_metadata(traj_dir: str, metadata: dict) -> dict:
     old = load_meta(os.path.join(traj_dir, "metadata"))
     if old is None:
@@ -414,6 +463,7 @@ def preprocess(
     x64: bool = True,
     show_tqdm: bool = False,
     position: int = 0,
+    bits: str = "fp32",
 ) -> tuple[str, bool]:
     """Convert one raw GKW run into the kvikio layout. Returns ``(out_path, skipped)``.
 
@@ -422,6 +472,7 @@ def preprocess(
     potential matches the field solve of the df. ``phi_source`` picks the stored potential:
     ``"field_solve"`` (the field solve of the stored df) or ``"gkw"`` (the ``Poten`` dump).
     ``max_timesteps`` truncates the trajectory (data, series and statistics consistently).
+    ``bits`` is the stored frame format (``fp32`` or a :mod:`~neugk_jax.dataset.quant` format).
     """
     assert spatial_ifft, "only the real-space (ifft) layout is supported"
     assert phi_source in ("field_solve", "gkw"), phi_source
@@ -532,8 +583,9 @@ def preprocess(
         flux_stats.push(fluxes[idx])
         phi_stats.push(phi)
         if not metadata_only:
-            _write_bin(os.path.join(out_path, "data", frame_name("timestep", idx) + ".bin"), knth)
-            _write_bin(os.path.join(out_path, "data", frame_name("poten", idx) + ".bin"), phi)
+            data = os.path.join(out_path, "data")
+            _write_frame(os.path.join(data, frame_name("timestep", idx) + ".bin"), knth, bits)
+            _write_frame(os.path.join(data, frame_name("poten", idx) + ".bin"), phi, bits)
 
     metadata.update(_stats_dict("df", df_stats, np.float32))
     metadata.update(_stats_dict("phi", phi_stats, np.float32))
@@ -621,6 +673,7 @@ def preprocess_gyaradax(
     metadata_only: bool = False,
     show_tqdm: bool = False,
     x64: bool = True,
+    bits: str = "fp32",
 ) -> str:
     """Convert a gyaradax run folder (``step_*.npz`` + ``config.yaml`` + ``geometry.pkl``).
 
@@ -693,10 +746,9 @@ def preprocess_gyaradax(
         phi_stats.push(phi)
         flux_stats.push(reported)
         if not metadata_only:
-            _write_bin(
-                os.path.join(out_path, "data", frame_name("timestep", idx) + ".bin"), df_real
-            )
-            _write_bin(os.path.join(out_path, "data", frame_name("poten", idx) + ".bin"), phi)
+            data = os.path.join(out_path, "data")
+            _write_frame(os.path.join(data, frame_name("timestep", idx) + ".bin"), df_real, bits)
+            _write_frame(os.path.join(data, frame_name("poten", idx) + ".bin"), phi, bits)
 
     metadata = {
         "timesteps": np.asarray(times),
@@ -889,7 +941,7 @@ def preprocess_gyaradax_kinetic(
         )
         phi_stats.push(phi)
         for kind, arr in (("timestep", df), ("poten", phi)):
-            if bits == "bf16":
+            if quant.values(bits) == "bf16":
                 payload, scale = np.asarray(jnp.asarray(arr).astype(jnp.bfloat16)).ravel(), None
             else:
                 payload, scale = quant.quantize(np.asarray(arr).ravel(), bits)
@@ -986,6 +1038,7 @@ def _run_preprocess(args) -> None:
         max_timesteps=args.max_timesteps,
         x64=not args.fp32,
         show_tqdm=args.tqdm,
+        bits=args.bits or "fp32",
     )
 
     def one(i_name):
@@ -1076,11 +1129,19 @@ def main(argv: Iterable[str] | None = None) -> None:
     g.add_argument(
         "--bits",
         choices=tuple(quant.SUFFIX),
-        default="bf16",
-        help="quantization target (fp16 / bf16 / i8 / i4)",
+        default=None,
+        help="stored format (fp16 / bf16 / zstd16 / i8 / i4): the quantize target (default bf16), "
+        "else the frame format of preprocess / gyaradax (default fp32)",
     )
     g.add_argument("--force", action="store_true", help="overwrite existing quantized shards")
+    g.add_argument(
+        "--remove-source",
+        action="store_true",
+        help="zstd16 only: delete each .bf16.bin once its .zstd16.bin is verified",
+    )
     args = ap.parse_args(argv)
+    if args.remove_source and args.bits != "zstd16":
+        ap.error("--remove-source only applies to --bits zstd16")
     required = {
         "quantize": ("path",),
         "rewrite-phi": ("path",),
@@ -1098,9 +1159,10 @@ def main(argv: Iterable[str] | None = None) -> None:
         run_quantize(
             path=args.path,
             trajs=args.trajs or ["iteration_{0-299}_ifft_realpotens"],
-            bits=args.bits,
+            bits=args.bits or "bf16",
             num_workers=args.num_workers,
             force=args.force,
+            remove_source=args.remove_source,
         )
     elif args.mode == "preprocess":
         _run_preprocess(args)
@@ -1124,6 +1186,7 @@ def main(argv: Iterable[str] | None = None) -> None:
                 metadata_only=args.metadata_only,
                 show_tqdm=args.tqdm,
                 x64=not args.fp32,
+                bits=args.bits or "fp32",
             )
             meta = load_meta(os.path.join(out, "metadata"))
             print(

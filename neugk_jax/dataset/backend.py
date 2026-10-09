@@ -267,9 +267,6 @@ class NumpyBackend(DataBackend):
     def _read_file(self, path: str, bits: str, shape: tuple):
         if bits == "fp32":
             return read_bin(path, shape)
-        if bits == "zstd16":
-            raw = zframe.decode(np.fromfile(path, dtype=np.uint8))
-            return raw.view(quant.payload_dtype("bf16")).astype(np.float32).reshape(shape)
         return quant.read(path, bits, int(np.prod(shape))).reshape(shape)
 
     def _output(self, arr: np.ndarray):

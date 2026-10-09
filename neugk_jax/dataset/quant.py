@@ -16,6 +16,7 @@ import os
 
 import numpy as np
 
+from neugk_jax.dataset import zframe
 from neugk_jax.utils import atomic_write
 
 SUFFIX = {
@@ -72,6 +73,7 @@ def quantize(arr_f32: np.ndarray, bits: str) -> tuple[np.ndarray, np.float32 | N
     formats (the dtype itself encodes magnitude). For int8/int4 it's the
     per-tensor symmetric quantization scale (``max(|x|) / qmax``).
     """
+    bits = values(bits)
     if bits == "fp16":
         return arr_f32.astype(np.float16), None
     if bits == "bf16":
@@ -98,6 +100,7 @@ def dequantize(
     payload: np.ndarray, scale: np.float32 | None, bits: str, n_elems: int
 ) -> np.ndarray:
     """Inverse of :func:`quantize` — returns fp32."""
+    bits = values(bits)
     if bits in ("fp16", "bf16"):
         return payload.astype(np.float32)
     if bits == "i8":
@@ -116,7 +119,7 @@ def dequantize(
 
 
 def payload_dtype(bits: str):
-    if bits == "bf16":
+    if values(bits) == "bf16":
         from ml_dtypes import bfloat16
 
         return bfloat16
@@ -124,9 +127,12 @@ def payload_dtype(bits: str):
 
 
 def write(dst: str, payload: np.ndarray, scale: np.float32 | None) -> int:
-    """Atomic write of one quantized shard. Returns bytes written."""
+    """Atomic write of one quantized shard (zstd-packed for ``.zstd16.bin``); returns its bytes."""
 
     def dump(f):
+        if dst.endswith(SUFFIX["zstd16"]):
+            f.write(zframe.encode(payload))
+            return
         if scale is not None:
             f.write(np.float32(scale).tobytes())
         f.write(payload.tobytes())
@@ -137,6 +143,11 @@ def write(dst: str, payload: np.ndarray, scale: np.float32 | None) -> int:
 
 def read(path: str, bits: str, n_elems: int) -> np.ndarray:
     """Read and dequantize a quantized shard of ``n_elems`` values."""
+    if bits == "zstd16":
+        payload = zframe.decode(np.fromfile(path, dtype=np.uint8)).view(payload_dtype(bits))
+        if payload.size != n_elems:
+            raise IOError(f"{path}: expected {n_elems} zstd16 values, got {payload.size}")
+        return dequantize(payload, None, bits, n_elems)
     with open(path, "rb") as f:
         scale = (
             np.frombuffer(f.read(HEADER_BYTES), dtype=np.float32)[0] if has_header(bits) else None
