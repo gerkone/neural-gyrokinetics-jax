@@ -95,6 +95,8 @@ def _embed_grid(base_resolution, patch_size, in_channels, grid):
     patch = _normalize_patch(patch_size)
     grid_size = tuple(s // p for s, p in zip(base_resolution, patch))
     points = PointGrid(base_resolution, patch, in_channels, grid)
+    # the quadrature mean shrinks incoherent patches by ~1/sqrt(P): this restores a linear embedding's
+    # token scale, fixed by the construction grid so the projections stay resolution-consistent
     gain = math.sqrt(math.prod(points.patch) * math.prod(points.n_fold))
     return patch, grid_size, points, gain
 
