@@ -13,6 +13,8 @@ from neugk_jax.models.build import build_ae_from_config
 from neugk_jax.models.gk_unet import SwinNDUnet, patching_options
 from neugk_jax.models.patching import (
     PATCHINGS,
+    DCTPatchEmbed,
+    DCTUnpatch,
     FieldPatchEmbed,
     FieldUnpatch,
     LinearUnpatch,
@@ -21,11 +23,10 @@ from neugk_jax.models.patching import (
     SmoothPatchEmbed,
     fold_patches,
 )
-from neugk_jax.models.patching.field import DCTBases, tucker_project, tucker_synthesize
 from neugk_jax.pinc import Swin5DAE
 
 BASE = (8, 4, 4, 8, 4)
-SMALL = {"smooth": dict(rank=8, hidden=8), "dct": dict(hidden=8)}
+SMALL = {"smooth": dict(rank=8), "dct": dict(hidden=8)}
 KINDS = ["smooth", "dct"]
 
 
@@ -137,10 +138,6 @@ def test_adiabatic_5d_grid(kind):
     assert out.shape == x.shape
     # zero-initialized code layer: the reconstruction starts at zero
     assert float(jnp.abs(out).max()) == 0.0
-    # the per-sample geometry enters the smooth filters; the dct hypernetworks start at zero
-    z0 = ae.encode(x)
-    z1 = ae.encode(x, geometry=jnp.asarray([0.12, 1.2, 30.0]))
-    assert (float(jnp.abs(z1 - z0).max()) > 0) == (kind == "smooth")
     grads = eqx.filter_grad(lambda m: jnp.mean((m(x)["df"] - x) ** 2))(ae)
     leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))
     assert all(bool(jnp.isfinite(g).all()) for g in leaves)
@@ -176,9 +173,7 @@ def test_one_basis_for_every_channel(kind):
     embed, unpatch = field_pair(kind, zero_init=False)
     x = jr.normal(jr.PRNGKey(2), (4, 10, 3))
     # smooth projections are (code mode, channel, rank), dct cores (*ranks, channel)
-    shape, axis = (
-        ((2, 2, -1, 3, 8), -2) if kind == "smooth" else ((2, 2, *embed.basis.ranks, 3), -1)
-    )
+    shape, axis = ((2, 2, -1, 3, 8), -2) if kind == "smooth" else ((2, 2, *embed.ranks, 3), -1)
     h, rolled = (
         embed.project(fold_patches(v, embed.grid.patch)).reshape(shape)
         for v in (x, jnp.roll(x, 1, -1))
@@ -191,24 +186,10 @@ def test_cell_centred_coordinates_keep_physical_positions():
     # a patch of 10 cells at spacing 1 and of 5 cells at spacing 2 cover the same interval
     fine = PointGrid((10,), (10,), 1, {"axes": [{"kind": "relative", "spacing": 1.0}]})
     coarse = PointGrid((5,), (5,), 1, {"axes": [{"kind": "relative", "spacing": 2.0}]})
-    x_fine = np.asarray(fine.offsets[:, 0]) * fine.half[0] * fine.spacing[0]
-    x_coarse = np.asarray(coarse.offsets[:, 0]) * coarse.half[0] * coarse.spacing[0]
+    x_fine = np.asarray(fine.pos[:, 0]) * fine.half[0] * fine.spacing[0]
+    x_coarse = np.asarray(coarse.pos[:, 0]) * coarse.half[0] * coarse.spacing[0]
     np.testing.assert_allclose(x_coarse, (x_fine[0::2] + x_fine[1::2]) / 2, atol=1e-6)
     np.testing.assert_allclose(fine.scale(), coarse.scale(), atol=1e-6)
-
-
-def test_filter_features_do_not_depend_on_the_grid():
-    # the cell centres of a 4-point patch are also points of a 12-point patch: same features there
-    coarse = PointGrid(
-        (4,), (4,), 1, {"axes": [{"kind": "relative", "spacing": 0.3, "reference": 0.6}]}
-    )
-    fine = PointGrid(
-        (12,), (12,), 1, {"axes": [{"kind": "relative", "spacing": 0.1, "reference": 0.6}]}
-    )
-    f_coarse, f_fine = coarse.features(None, 16), fine.features(None, 16)
-    np.testing.assert_allclose(f_coarse, f_fine[1::3], atol=1e-6)
-    # dct bases still stop at the modes a grid can hold
-    assert coarse.axes[0].cap == 4 and fine.axes[0].cap == 12
 
 
 def test_build_from_config():
@@ -221,7 +202,7 @@ def test_build_from_config():
         unmerging_hidden_ratio=2.0,
         c_multiplier=2,
         type="smooth",
-        field={"rank": 16, "hidden": 16},
+        field={"rank": 16},
         grid=grid_5d(),
     )
     cfg = {
@@ -247,42 +228,32 @@ def test_unknown_option_raises():
         unet("dct", code_modes=(1, 1))
 
 
-def test_fixed_dct_at_full_rank_is_exact():
-    # orthonormal dct modes at full rank: projection then synthesis is the identity on every patch
-    grid = PointGrid((6, 4, 10), (3, 2, 5), 2, {"axes": [{"kind": "relative"}] * 3})
-    bases = DCTBases(
-        grid, grid.patch, key=jr.PRNGKey(0), hidden=8, modes=16, learned=False, position=False
+def dct_on(grid_shape, patch, ranks, spec):
+    """A dct embedding of one channel on its own grid."""
+    return DCTPatchEmbed(
+        grid_shape, patch, 1, 4, key=jr.PRNGKey(0), ranks=ranks, hidden=8, grid=spec
     )
-    p = fold_patches(jr.normal(jr.PRNGKey(1), (6, 4, 10, 2)), grid.patch)
+
+
+def test_dct_at_full_rank_starts_exact():
+    # orthonormal dct modes at full rank: projection then synthesis is the identity on every patch
+    spec, patch = {"axes": [{"kind": "relative"}] * 3}, (3, 2, 5)
+    embed = dct_on((6, 4, 10), patch, patch, spec)
+    unpatch = DCTUnpatch(
+        4, (2, 2, 2), key=jr.PRNGKey(1), expand_by=patch, out_channels=1, ranks=patch, grid=spec
+    )
+    p = fold_patches(jr.normal(jr.PRNGKey(1), (6, 4, 10, 1)), patch)
     with jax.default_matmul_precision("highest"):
-        b = bases(grid)
-        back = tucker_synthesize(tucker_project(p, grid, b), grid, b, grid.patch)
+        back = unpatch.synthesize(embed.project(p))
     np.testing.assert_allclose(back, p, atol=1e-4)
 
 
 def test_dct_modes_stop_at_the_band():
     # data resolving 5 modes per patch, sampled on 10 points: modes above the band are cut
-    fine = PointGrid((10,), (10,), 1, {"axes": [{"kind": "relative", "band": 5}]})
-    assert fine.axes[0].cap == 5 and fine.bands[0] == 5
-    b = DCTBases(fine, (10,), key=jr.PRNGKey(0), hidden=8, modes=16, learned=False, position=False)
-    b = b(fine)[0]
+    embed = dct_on((10,), (10,), (10,), {"axes": [{"kind": "relative", "band": 5}]})
+    assert embed.grid.axes[0].cap == 5
+    b = embed.basis()[0]
     assert float(jnp.abs(b[:, 5:]).max()) == 0.0 and float(jnp.abs(b[:, :5]).max()) > 0
-
-
-def test_learned_dct_starts_as_the_fixed_dct():
-    grid = PointGrid((6, 10), (3, 5), 2, {"axes": [{"kind": "relative"}] * 2})
-    kw = dict(hidden=8, modes=16, position=False)
-    with jax.default_matmul_precision("highest"):
-        fixed = DCTBases(grid, (3, 4), key=jr.PRNGKey(0), learned=False, **kw)(grid)
-        learned = DCTBases(grid, (3, 4), key=jr.PRNGKey(1), learned=True, **kw)(grid)
-    for a, b in zip(fixed, learned):
-        np.testing.assert_allclose(a, b, atol=1e-5)
-
-
-def test_fixed_dct_has_no_learned_basis():
-    embed, _ = field_pair("dct", ranks=[2, 4], learned=False)
-    assert jax.tree_util.tree_leaves(eqx.filter(embed.basis, eqx.is_inexact_array)) == []
-    assert embed(jr.normal(jr.PRNGKey(2), (4, 10, 3))).shape == (2, 2, 8)
 
 
 def test_learned_dct_off_init_on_a_refined_grid():
@@ -293,32 +264,9 @@ def test_learned_dct_off_init_on_a_refined_grid():
     assert z.shape == (2, 2, 8) and unpatch.with_grid(fine)(z).shape == (4, 20, 3)
 
 
-def test_patch_position_starts_as_the_shared_model():
-    base = field_pair("dct", zero_init=False, ranks=[2, 4])
-    pos = field_pair("dct", zero_init=False, ranks=[2, 4], position=True)
-    x = jr.normal(jr.PRNGKey(2), (4, 10, 3))
-    # tf32 tolerance: the per-token bases contract in another order
-    z = base[0](x)
-    assert jnp.allclose(z, pos[0](x), atol=1e-3)
-    assert jnp.allclose(base[1](z), pos[1](z), atol=1e-3)
-
-
-def test_patch_position_gives_each_token_its_bases():
-    embed, _ = field_pair("dct", ranks=[2, 4], position=True)
-    embed = shifted(embed)
-    bases = embed.basis(embed.grid)
-    assert bases[1].shape == (2, 5, 4)
-    assert not jnp.allclose(bases[1][0], bases[1][1])
-    assert embed(jr.normal(jr.PRNGKey(2), (4, 10, 3))).shape == (2, 2, 8)
-
-
-def test_patch_position_needs_the_learned_dct():
-    with pytest.raises(ValueError):
-        field_pair("dct", learned=False, position=True)
-
-
-def test_band_limited_smooth_projects_the_same_on_a_finer_grid():
-    embed, _ = field_pair("smooth", grid=refined(0.2), zero_init=False, band_limited=True)
+def test_smooth_projects_the_same_on_a_finer_grid():
+    # band-limited filters: exact quadrature on every grid that resolves the modes of the field
+    embed, _ = field_pair("smooth", grid=refined(0.2), zero_init=False)
     a = jr.normal(jr.PRNGKey(3), (2, 3, 3))
 
     def field(q):
@@ -337,8 +285,8 @@ def test_band_limited_smooth_projects_the_same_on_a_finer_grid():
     assert float(jnp.linalg.norm(h[0] - h[1]) / jnp.linalg.norm(h[0])) < 1e-3
 
 
-def test_band_limited_smooth_on_the_5d_grid():
-    kw = {**SMALL["smooth"], "band_limited": True, "grid": grid_5d()}
+def test_smooth_on_the_5d_grid():
+    kw = {**SMALL["smooth"], "grid": grid_5d()}
     ae = small_ae(patching="smooth", patching_kwargs=kw)
     x = jr.normal(jr.PRNGKey(1), (2, *BASE))
     grads = eqx.filter_grad(lambda m: jnp.mean((m(x)["df"] - x) ** 2))(ae)

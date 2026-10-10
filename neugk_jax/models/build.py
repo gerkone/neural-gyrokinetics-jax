@@ -391,8 +391,8 @@ def run_config(cfg, ds=None) -> dict:
 def field_grid(ds, fold_mu: bool = True) -> dict:
     """Field patching grid of a ``(vp, mu, s, x, y)`` dataset (its first trajectory).
 
-    vpar and mu are absolute (their nodes, uniform weights, mu folded into the channels with
-    ``fold_mu``), s, x and y relative with their grid spacings (x, y from the box lengths).
+    vpar and mu are absolute (their nodes, uniform weights, mu by its square root and folded into the
+    channels with ``fold_mu``), s, x and y relative with their grid spacings (x, y from the box lengths).
     """
     g = ds.metadata[0]["geometry"]
     nx, ny = (int(r) for r in ds.resolution[3:])
@@ -401,7 +401,13 @@ def field_grid(ds, fold_mu: bool = True) -> dict:
     )
     nodes = lambda k: [float(v) for v in np.asarray(g[k], np.float64).ravel()]
     vpar = {"kind": "absolute", "nodes": nodes("vpgr")}
-    mu = {"kind": "absolute", "nodes": nodes("mugr")}
+    v = np.sqrt(np.asarray(g["mugr"], np.float64).ravel())
+    # sqrt(mu) nodes are cell centres: the range ends at the last cell edge
+    mu = {
+        "kind": "absolute",
+        "nodes": [float(a) for a in v],
+        "range": (0.0, float(1.5 * v[-1] - 0.5 * v[-2])),
+    }
     rel = [
         {"kind": "relative", "spacing": s}
         for s in (float(np.asarray(g["ints"]).ravel()[0]), lx / nx, ly / ny)

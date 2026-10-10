@@ -12,8 +12,8 @@ patch:
   c_multiplier: 1
   # linear | smooth | dct (field patching: patch / unpatch weights generated from the point coordinates)
   type: linear
-  # field patching options (smooth: rank, hidden, depth, code_modes, band_limited; dct: ranks, learned, position); merging_depth / unmerging_depth 1 make the heads linear
-  field: {rank: 96, hidden: 256, depth: 2}
+  # field patching options (smooth: rank, code_modes; dct: ranks, hidden, modes); merging_depth / unmerging_depth 1 make the heads linear
+  field: {rank: 96}
 vit:
   num_heads: [16]
   depth: [8]
