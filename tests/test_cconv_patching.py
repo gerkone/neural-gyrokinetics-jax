@@ -182,6 +182,17 @@ def test_one_basis_for_every_channel(kind):
     assert unpatch(embed(x)).shape == x.shape
 
 
+@pytest.mark.parametrize("kind", KINDS)
+def test_tokens_keep_the_scale_of_the_linear_embedding(kind):
+    # 80 points per patch: the projections are scaled by sqrt(80), fixed on another grid
+    embed, _ = field_pair(kind, patch=(4, 20), base=(8, 40), zero_init=False)
+    linear = PatchEmbed((8, 40), (4, 20), 3, 8, key=jr.PRNGKey(0), mlp_depth=1)
+    x = jr.normal(jr.PRNGKey(2), (8, 40, 3))
+    ratio = float(jnp.std(embed(x)) / jnp.std(linear(x)))
+    assert embed.gain == pytest.approx(np.sqrt(80)) and 1 / 3 < ratio < 3
+    assert embed.with_grid(PointGrid((8, 80), (4, 40), 3)).gain == embed.gain
+
+
 def test_cell_centred_coordinates_keep_physical_positions():
     # a patch of 10 cells at spacing 1 and of 5 cells at spacing 2 cover the same interval
     fine = PointGrid((10,), (10,), 1, {"axes": [{"kind": "relative", "spacing": 1.0}]})
