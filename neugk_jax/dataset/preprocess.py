@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import multiprocessing
 import os
 import pickle
 import re
@@ -46,7 +47,7 @@ import shutil
 import sys
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -168,7 +169,9 @@ def run_quantize(
     print(f"quantizing {len(traj_dirs)} trajectories to {bits} from {path}")
     t0 = time.perf_counter()
     total_w = total_s = total_b = 0
-    with ThreadPoolExecutor(max_workers=max(1, num_workers)) as ex:
+    # processes: the zstd16 encode and its check hold the GIL
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=max(1, num_workers), mp_context=ctx) as ex:
         futures = {ex.submit(_process_traj, d, bits, force, remove_source): d for d in traj_dirs}
         for i, fut in enumerate(as_completed(futures), 1):
             d, nw, ns, bw = fut.result()
