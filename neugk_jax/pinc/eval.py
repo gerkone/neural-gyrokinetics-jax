@@ -2,8 +2,10 @@
 
 Metrics: ``df_mse`` (normalized), ``df_rel_l2`` (denormalized, zf recombined); with
 ``validation.eval_integrals`` also ``phi_int_mse``/``phi_int_rel_l2`` and
-``flux_int_mse``/``flux_int_rel_err`` of the integrals of the denormalized reconstruction
-against those of the target (cached after the first epoch). ``VQVAEEvaluator`` adds the
+``flux_int_mse``/``flux_int_rel_err`` (heat flux, species mean) of the integrals of the
+denormalized reconstruction against those of the target (cached after the first epoch), and for
+several species the heat flux error of each (``flux_int_rel_err_<species>``) and the particle flux
+error ``pflux_int_rel_err``. ``VQVAEEvaluator`` adds the
 ``codebook_usage`` (fraction of codes hit) and ``codebook_perplexity`` of the validation codes.
 """
 
@@ -38,17 +40,31 @@ def reconstruct(model, x, cond, keys=None, *, inference: bool) -> dict:
     return jax.vmap(one)(x, cond, keys)
 
 
+def species_names(ds) -> tuple[str, ...]:
+    """Names of the species of a several-species dataset (``()`` for one), ion / electron by
+    the metadata indices, else ``s<i>``."""
+    if int(getattr(ds, "n_species", 1)) < 2:
+        return ()
+    names = [f"s{i}" for i in range(ds.n_species)]
+    meta = ds.metadata[0]
+    for key, name in (("ion_species_index", "ion"), ("electron_species_index", "electron")):
+        if key in meta:
+            names[int(meta[key])] = name
+    return tuple(names)
+
+
 @traced_jit("ae_target_integrals")
 def target_integrals(x, fids, norm, geom):
-    phi, (_, eflux, _) = integrate(geom, fids, norm.denormalize("df", x, fids))
-    return phi, eflux
+    phi, (pflux, eflux, _) = integrate(geom, fids, norm.denormalize("df", x, fids))
+    return phi, eflux, pflux
 
 
 @traced_jit("ae_eval_step")
-def ae_eval_step(model, batch, acc, norm, geom, tgt_int, extra=None):
+def ae_eval_step(model, batch, acc, norm, geom, tgt_int, extra=None, species=()):
     """Reconstruct one batch, add its masked metric sums to ``acc``; returns the denormalized pair.
 
-    ``extra(pred_d, tgt_d, geom_rows)`` adds per-sample metrics of the denormalized pair.
+    ``extra(pred_d, tgt_d, geom_rows)`` adds per-sample metrics of the denormalized pair;
+    ``species`` names the species of the per-species flux errors.
     """
     x, fids, mask = batch["df"], batch["file_index"], batch["mask"]
     out = reconstruct(model, x, batch.get("conditioning"), inference=True)
@@ -57,12 +73,17 @@ def ae_eval_step(model, batch, acc, norm, geom, tgt_int, extra=None):
     values = recon_metrics(pred, x, pred_d, tgt_d)
     phi = None
     if tgt_int is not None:
-        phi_t, eflux_t = tgt_int
-        phi, (_, eflux, _) = integrate(geom, fids, pred_d)
+        phi_t, eflux_t, pflux_t = tgt_int
+        phi, (pflux, eflux, _) = integrate(geom, fids, pred_d)
         values["phi_int_mse"] = per_sample_mse(phi, phi_t)
         values["phi_int_rel_l2"] = per_sample_rel_l2(phi, phi_t)
         values["flux_int_mse"] = (eflux - eflux_t) ** 2
         values["flux_int_rel_err"] = rel_err(eflux, eflux_t)
+        for i, name in enumerate(species):
+            values[f"flux_int_rel_err_{name}"] = rel_err(eflux[:, i], eflux_t[:, i])
+        if species:
+            # ambipolar: one particle flux, the species mean
+            values["pflux_int_rel_err"] = rel_err(pflux.mean(-1), pflux_t.mean(-1))
     if extra is not None:
         values.update(extra(pred_d, tgt_d, take_rows(geom, fids)))
     return accumulate(acc, values, mask), pred_d, tgt_d, phi, out
@@ -79,8 +100,11 @@ class AEEvaluator(BaseEvaluator):
         self.cond_slots = cond_slots
         self.eval_spectra = self.spectra_available(bool(self.vcfg.get("eval_spectra", False)))
         keys = ["df_mse", "df_rel_l2"]
+        self.species = species_names(self.ds) if self.eval_integrals else ()
         if self.eval_integrals:
             keys += ["phi_int_mse", "phi_int_rel_l2", "flux_int_mse", "flux_int_rel_err"]
+        if self.species:
+            keys += [f"flux_int_rel_err_{s}" for s in self.species] + ["pflux_int_rel_err"]
         self.metric_keys = tuple(keys)
         self._tgt_int: dict[int, tuple] = {}
 
@@ -106,7 +130,7 @@ class AEEvaluator(BaseEvaluator):
                     )
                 tgt_int = self.place(self._tgt_int[plan.number])
             acc, pred_d, tgt_d, phi, out = ae_eval_step(
-                model, batch, acc, self.norm, geom, tgt_int, self.extra
+                model, batch, acc, self.norm, geom, tgt_int, self.extra, self.species
             )
             self.observe(out, batch)
             if self.eval_spectra:
