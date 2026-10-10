@@ -254,14 +254,15 @@ class CConvUnpatch(GridDecoderBase):
     """Unpatch (as ``LinearUnpatch``) as a transposed strided continuous convolution: every patch is
     synthesized from per-token codes and the kernel at its points.
 
-    The head ``expansion`` (last layer zero-initialized with ``zero_init``) maps the token to the
-    codes; subclasses give :meth:`kernel` and :meth:`synthesize`.
+    The head ``expansion`` (last layer zero-initialized with ``zero_init``) maps the token, scaled by
+    ``in_mult``, to the codes; subclasses give :meth:`kernel` and :meth:`synthesize`.
     """
 
     grid: eqx.AbstractVar[PointGrid]
     expansion: eqx.AbstractVar[MLP]
     modulation: eqx.AbstractVar[Optional[eqx.Module]]
     out_dim: eqx.AbstractVar[int]
+    in_mult: eqx.AbstractVar[float]
 
     with_grid = _with_grid
 
@@ -280,7 +281,9 @@ class CConvUnpatch(GridDecoderBase):
         if self.modulation is not None:
             z = self.modulation(z, cond)
         grid = self.grid
-        out = self.synthesize(self.expansion(z), geometry)
+        # the head is bias-free and leaky-relu: the same as scaling the input of its last linear
+        codes = self.expansion(z if self.in_mult == 1.0 else z * self.in_mult)
+        out = self.synthesize(codes, geometry)
         return unfold_patches(
             out, grid.patch, out_channels=grid.n_channels * math.prod(grid.n_fold)
         )
@@ -360,6 +363,7 @@ class BandLimitedUnpatch(CConvUnpatch):
     expansion: MLP
     modulation: Optional[eqx.Module]
     out_dim: int = eqx.field(static=True)
+    in_mult: float = eqx.field(static=True)
     expand_by: tuple[int, ...] = eqx.field(static=True)
     target_grid_size: tuple[int, ...] = eqx.field(static=True)
     code_modes: tuple[int, ...] = eqx.field(static=True)
@@ -381,10 +385,12 @@ class BandLimitedUnpatch(CConvUnpatch):
         use_conv: bool = False,
         patch_skip: bool = False,
         cond_dim: Optional[int] = None,
+        in_mult: float = 1.0,
         grid: Optional[Mapping] = None,
     ):
         k_exp, k_filter, k_mod = jr.split(key, 3)
         self.out_dim = out_channels
+        self.in_mult = float(in_mult)
         flags = (norm, use_conv, patch_skip)
         self.expand_by, self.target_grid_size, self.grid, self.modulation = _unpatch_init(
             dim, grid_size, expand_by, out_channels, grid, cond_dim, k_mod, flags
@@ -482,6 +488,7 @@ class TuckerUnpatch(CConvUnpatch):
     expansion: MLP
     modulation: Optional[eqx.Module]
     out_dim: int = eqx.field(static=True)
+    in_mult: float = eqx.field(static=True)
     expand_by: tuple[int, ...] = eqx.field(static=True)
     target_grid_size: tuple[int, ...] = eqx.field(static=True)
     ranks: tuple[int, ...] = eqx.field(static=True)
@@ -505,10 +512,12 @@ class TuckerUnpatch(CConvUnpatch):
         use_conv: bool = False,
         patch_skip: bool = False,
         cond_dim: Optional[int] = None,
+        in_mult: float = 1.0,
         grid: Optional[Mapping] = None,
     ):
         k_exp, k_bases, k_mod = jr.split(key, 3)
         self.out_dim = out_channels
+        self.in_mult = float(in_mult)
         flags = (norm, use_conv, patch_skip)
         self.expand_by, self.target_grid_size, self.grid, self.modulation = _unpatch_init(
             dim, grid_size, expand_by, out_channels, grid, cond_dim, k_mod, flags

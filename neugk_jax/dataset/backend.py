@@ -9,6 +9,7 @@ GPU-direct. :func:`make_backend` builds the backend of a ``dataset`` config.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import importlib.util
 import os
@@ -20,7 +21,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from neugk_jax.dataset import quant
+from neugk_jax.dataset import quant, zframe
 from neugk_jax.utils import atomic_write
 
 # metadata keys left out of metadata_light (the per-element df and phi moments)
@@ -197,11 +198,12 @@ class NumpyBackend(DataBackend):
             ├── poten_00000.bin
             └── ...
 
-    ``prefer_dtype`` (``fp16``/``bf16``/``i8``/``i4``) reads the quantized sibling when
-    present and otherwise the fp32 shard round-tripped through that dtype, so the model sees
-    the same precision either way. ``lightweight_metadata`` reads ``metadata_light`` (no
-    per-element moments) when it exists. ``split_into_bands`` names the zonal-flow band
-    layout written by ``preprocess --split-into-bands``.
+    ``prefer_dtype`` (``fp16``/``bf16``/``zstd16``/``i8``/``i4``) reads the quantized sibling
+    when present and otherwise the fp32 shard round-tripped through that dtype, so the model
+    sees the same precision either way; ``zstd16`` is the losslessly compressed ``bf16``.
+    ``lightweight_metadata`` reads ``metadata_light`` (no per-element moments) when it exists.
+    ``split_into_bands`` names the zonal-flow band layout written by
+    ``preprocess --split-into-bands``.
     """
 
     def __init__(
@@ -213,6 +215,7 @@ class NumpyBackend(DataBackend):
         lightweight_metadata: bool = False,
     ):
         self.prefer_dtype = prefer_dtype or "fp32"
+        self._zstd_announced = False
         self.real_potens = real_potens
         self.split_into_bands = split_into_bands
         self.lightweight_metadata = lightweight_metadata
@@ -249,13 +252,17 @@ class NumpyBackend(DataBackend):
     def _read(self, handle: str, kind: str, t: int, shape: tuple):
         fp32 = os.path.join(handle, "data", frame_name(kind, t) + ".bin")
         path, bits = quant.resolve(fp32, self.prefer_dtype)
-        if bits != self.prefer_dtype:
+        if bits == "zstd16" and not self._zstd_announced:
+            self._zstd_announced = True
+            decode = getattr(self, "zstd_decode", "cpu")
+            print(f"[data] reading zstd16 shards ({decode} decode), first: {path}", flush=True)
+        if bits == "fp32" and self.prefer_dtype != "fp32":
             # no quantized sibling: quantize the fp32 shard on the fly
             return self._roundtrip(fp32, shape)
         return self._read_file(path, bits, shape)
 
     def _roundtrip(self, fp32: str, shape: tuple):
-        return self._output(quant.roundtrip(read_bin(fp32, shape), self.prefer_dtype))
+        return self._output(quant.roundtrip(read_bin(fp32, shape), quant.values(self.prefer_dtype)))
 
     def _read_file(self, path: str, bits: str, shape: tuple):
         if bits == "fp32":
@@ -275,13 +282,20 @@ class KvikIOBackend(NumpyBackend):
 
     Shards are read into a cupy buffer on device ``rank`` and handed to jax zero-copy over
     DLPack (fp32 / fp16 / bf16 / i8); i4 shards and on-the-fly quantization go through the
-    host. Requires the dataloader to run in-process. Same layout and options as
-    ``NumpyBackend``.
+    host. ``zstd16`` shards are decompressed on the host (``zstd_decode="cpu"``) or by nvCOMP on the
+    device (``"gpu"``) and unshuffled on the device. Requires the dataloader to run in-process.
+    Same layout and options as ``NumpyBackend``.
     """
 
-    def __init__(self, rank: int = 0, **kwargs):
+    # one nvcomp codec per (reader thread, device), shared by all instances
+    _nvcomp_codecs: dict = {}
+
+    def __init__(self, rank: int = 0, zstd_decode: str = "cpu", **kwargs):
         super().__init__(**kwargs)
+        if zstd_decode not in ("cpu", "gpu"):
+            raise ValueError(f"zstd_decode={zstd_decode!r}; one of cpu, gpu")
         self.rank = rank
+        self.zstd_decode = zstd_decode
         self._local = threading.local()
         # return 16-bit shards as stored; the consumer upcasts (exactly) per batch
         self.keep_half = False
@@ -305,11 +319,12 @@ class KvikIOBackend(NumpyBackend):
         return jax.device_put(arr, self._target())
 
     def _roundtrip(self, fp32: str, shape: tuple):
-        if self.prefer_dtype not in ("bf16", "fp16"):
+        prefer = quant.values(self.prefer_dtype)
+        if prefer not in ("bf16", "fp16"):
             return super()._roundtrip(fp32, shape)
         import jax.numpy as jnp
 
-        dtype = jnp.bfloat16 if self.prefer_dtype == "bf16" else jnp.float16
+        dtype = jnp.bfloat16 if prefer == "bf16" else jnp.float16
         # on-device round-to-nearest-even, as ml_dtypes on the host
         half = self._read_file(fp32, "fp32", shape).astype(dtype)
         return half if self.keep_half else half.astype(jnp.float32)
@@ -322,6 +337,8 @@ class KvikIOBackend(NumpyBackend):
         import kvikio
 
         n_elems = int(np.prod(shape))
+        if bits == "zstd16":
+            return self._read_zstd(path, shape)
         if bits == "i4":
             return self._output(quant.read(path, bits, n_elems).reshape(shape))
         header = quant.HEADER_BYTES if quant.has_header(bits) else 0
@@ -338,13 +355,75 @@ class KvikIOBackend(NumpyBackend):
         arr = jdlp.from_dlpack(gpu.reshape(shape))
         if bits == "bf16":
             half = lax.bitcast_convert_type(arr, jnp.bfloat16)
-            return half if self.keep_half else half.astype(jnp.float32)
-        if bits == "i8":
+            out = half if self.keep_half else half.astype(jnp.float32)
+        elif bits == "i8":
             scale = np.fromfile(path, dtype=np.float32, count=1)[0]
-            return arr.astype(jnp.float32) * jnp.float32(scale)
-        if bits == "fp16" and self.keep_half:
+            out = arr.astype(jnp.float32) * jnp.float32(scale)
+        elif bits == "fp16" and self.keep_half:
             return arr
-        return arr.astype(jnp.float32)
+        else:
+            out = arr.astype(jnp.float32)
+        # the cupy buffer is freed on return: every pending op reading it must have run
+        return out.block_until_ready()
+
+    def _buffer(self, name: str, nbytes: int, pinned: bool = False) -> np.ndarray:
+        # a host buffer per reader thread, grown on demand and reused across reads
+        buf = getattr(self._local, name, None)
+        if buf is None or buf.size < nbytes:
+            if pinned:
+                import cupyx
+
+                buf = cupyx.empty_pinned(nbytes, dtype=np.uint8)
+            else:
+                buf = np.empty(nbytes, np.uint8)
+            setattr(self._local, name, buf)
+        return buf[:nbytes]
+
+    def _read_zstd(self, path: str, shape: tuple):
+        import cupy as cp
+        import jax.dlpack as jdlp
+        import jax.numpy as jnp
+
+        comp = self._buffer("zcomp", os.path.getsize(path))
+        with open(path, "rb", buffering=0) as f:
+            if f.readinto(comp) != comp.size:
+                raise IOError(f"{path}: short read")
+        header = zframe.parse_header(comp)
+        if header.elem_bytes != 2 or header.raw_bytes != 2 * int(np.prod(shape)):
+            raise IOError(
+                f"{path}: {header.raw_bytes} bytes of {header.elem_bytes}-byte values"
+                f" for shape {shape}"
+            )
+        dev = self._target()
+        with cp.cuda.Device(self.rank if dev is None else dev.local_hardware_id) as d:
+            if self.zstd_decode == "gpu":
+                shuffled = self._nvcomp_decode(cp.asarray(comp), header, d.id)
+            else:
+                host = self._buffer("zraw", header.raw_bytes, pinned=True)
+                shuffled = cp.asarray(zframe.decode(comp, header, out=host, unshuffle=False))
+            cp.cuda.get_current_stream().synchronize()
+        half = zframe.bf16_from_shuffled(
+            jdlp.from_dlpack(shuffled), header.raw_bytes, header.chunk_bytes
+        )
+        half = half.reshape(shape)
+        # the cupy buffer is freed on return: every pending op reading it must have run
+        return (half if self.keep_half else half.astype(jnp.float32)).block_until_ready()
+
+    def _nvcomp_decode(self, comp, header, device_id: int):
+        import cupy as cp
+        from nvidia import nvcomp
+
+        key = (threading.get_ident(), device_id)
+        if key not in self._nvcomp_codecs:
+            if not self._nvcomp_codecs:
+                # codecs must go before the cuda context at interpreter exit
+                atexit.register(self._nvcomp_codecs.clear)
+            self._nvcomp_codecs[key] = nvcomp.Codec(
+                algorithm="Zstd", bitstream_kind=nvcomp.BitstreamKind.RAW, device_id=device_id
+            )
+        o = header.offsets
+        chunks = [nvcomp.as_array(comp[o[i] : o[i + 1]]) for i in range(header.n_chunks)]
+        return cp.concatenate([cp.asarray(c) for c in self._nvcomp_codecs[key].decode(chunks)])
 
 
 class H5Backend(DataBackend):
@@ -428,5 +507,5 @@ def make_backend(
     if name == "kvikio" and kvikio_available():
         # read before kvikio's first import
         os.environ.setdefault("KVIKIO_NTHREADS", str(int(dcfg.get("io_threads", 8))))
-        return KvikIOBackend(rank=local_rank, **kwargs)
+        return KvikIOBackend(rank=local_rank, zstd_decode=dcfg.get("zstd_decode", "cpu"), **kwargs)
     return NumpyBackend(**kwargs)

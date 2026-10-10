@@ -7,13 +7,15 @@ fixed-shape padded batches and no retracing across epochs.
 
 from __future__ import annotations
 
+import pickle
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
-from helpers import make_traj
+from helpers import make_geometry, make_traj
 from omegaconf import OmegaConf
 
 from neugk_jax.evaluate import AEEvaluator, DiffusionEvaluator
@@ -120,7 +122,7 @@ def test_ae_integrals_use_denormalized_df(tmp_path):
     )
     gt = precompute_geometry(raw.metadata[0]["geometry"])
     solve = jax.jit(flux_integral)
-    eflux = np.asarray([float(solve(gt, jnp.asarray(raw[i].df))[1][1]) for i in range(len(raw))])
+    eflux = np.asarray([float(solve(gt, jnp.asarray(raw[i].df))[1][1][0]) for i in range(len(raw))])
 
     ev = AEEvaluator(_cfg(eval_integrals=True), val_ds=ds, batch_size=2)
     metrics, _ = ev(Scaled(2.0), epoch=1)
@@ -129,6 +131,53 @@ def test_ae_integrals_use_denormalized_df(tmp_path):
     assert metrics["flux_int_mse"] == pytest.approx(float(np.mean((3 * eflux) ** 2)), rel=1e-3)
     identity, _ = ev(Scaled(1.0), epoch=2)
     assert identity["flux_int_mse"] == pytest.approx(0.0, abs=1e-10)
+
+
+def test_ae_integrals_per_species(tmp_path):
+    """Several species: a 2x reconstruction gives 4x the heat flux of each species and of the
+    particle flux."""
+    from neugk_jax.dataset import CycloneDataset, NumpyBackend
+
+    resolution = (4, 4, 4, 16, 8)
+    traj = tmp_path / "iteration_0_ifft_realpotens"
+    (traj / "data").mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    for t in range(2):
+        rng.standard_normal((2, 2, *resolution)).astype(np.float32).tofile(
+            traj / "data" / f"timestep_{t:05d}.bin"
+        )
+    geometry = make_geometry(resolution)
+    geometry.update(
+        signz=np.array([1.0, -1.0]),
+        mas=np.array([1.0, 2.7e-4]),
+        tmp=np.ones(2),
+        de=np.ones(2),
+        vthrat=np.array([1.0, 60.0]),
+    )
+    meta = {
+        "timesteps": np.arange(2, dtype=np.float64),
+        "flux": rng.standard_normal((2, 6)),
+        "n_species": 2,
+        "ion_species_index": 0,
+        "electron_species_index": 1,
+        "ion_temp_grad": np.array([4.0]),
+        "density_grad": np.array([1.0]),
+        "s_hat": np.array([0.8]),
+        "q": np.array([1.4]),
+        "df_shape": (2, 2, *resolution),
+        "resolution": np.array(resolution),
+        "ds": np.float64(0.0625),
+        "geometry": geometry,
+    }
+    with open(traj / "metadata.pkl", "wb") as f:
+        pickle.dump(meta, f)
+    ds = CycloneDataset(
+        path=str(tmp_path), trajectories="iteration_0", species_axis=True, backend=NumpyBackend()
+    )
+    ev = AEEvaluator(_cfg(eval_integrals=True), val_ds=ds, batch_size=2)
+    metrics, _ = ev(Scaled(2.0), epoch=1)
+    for key in ("flux_int_rel_err_ion", "flux_int_rel_err_electron", "pflux_int_rel_err"):
+        assert metrics[key] == pytest.approx(3.0, rel=1e-3), key
 
 
 def test_integrals_reject_incomplete_geometry(tiny_setup):
@@ -171,7 +220,7 @@ def test_ae_evaluator_padded_last_batch_and_no_retrace(tiny_setup):
 
 
 def test_diffusion_evaluator_samples_and_scores(tiny_setup):
-    """Samples decode to df, are scored against the df targets and flux-aggregated per trajectory."""
+    """Samples decode to df, scored against the df targets and flux-aggregated per trajectory."""
     from neugk_jax.diffusion.dit import DiT
 
     ds, ae = tiny_setup

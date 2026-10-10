@@ -50,8 +50,8 @@ def test_h5_loader_reads_the_release_snapshot(hf_sample, raw):
     stats = hf_sample.stats
     ds = _dataset(hf_sample)
     assert ds.resolution == (32, 8, 16, 85, 32) and len(ds.files) == 1
-    # one snapshot leaves no next-step target, so the index is empty
-    assert len(ds) == 0
+    # a single snapshot is served on its own (only next-step samples would need a second frame)
+    assert len(ds) == 1
     meta = ds.metadata[0]
     assert float(meta["flux"][0]) == pytest.approx(float(raw["meta"]["fluxes"][0]))
     assert ds.get_ds(0) == pytest.approx(0.0625)
@@ -77,16 +77,16 @@ def test_flux_integral_reproduces_gkw_flux(hf_sample, raw):
     solve = jax.jit(flux_integral)
     phi, (pflux, eflux, _) = solve(gt, jnp.asarray(raw["df"]))
     gkw = float(raw["meta"]["fluxes"][0])
-    assert float(eflux) == pytest.approx(gkw, rel=1e-4)
+    assert float(eflux[0]) == pytest.approx(gkw, rel=1e-4)
     # the solved-phi particle flux vanishes analytically
-    assert abs(float(pflux)) <= 1e-6 * gkw
+    assert abs(float(pflux[0])) <= 1e-6 * gkw
     assert phi.shape == (85, 16, 32) and np.isfinite(np.asarray(phi)).all()
 
 
 @needs_gyaradax
 def test_spectral_fields_sum_to_the_flux(hf_sample, raw):
     from neugk_jax.evaluate import metrics as m
-    from neugk_jax.evaluate.integrals import gyaradax_spectral_fields
+    from neugk_jax.evaluate.integrals import gyaradax_spectral_fields, precompute_geometry
 
     ds = _dataset(hf_sample)
     geom = {k: np.asarray(v, np.float64) for k, v in ds.metadata[0]["geometry"].items()}
@@ -96,7 +96,7 @@ def test_spectral_fields_sum_to_the_flux(hf_sample, raw):
     assert np.all(d["kyspec"] >= 0) and all(np.isfinite(d[k]).all() for k in d)
     # per-sample geometry gives the shared-geometry fields
     phi_s, ef_s = gyaradax_spectral_fields(df, geom)
-    stacked = {k: np.stack([v, v]) for k, v in geom.items()}
+    stacked = {k: np.stack([v, v]) for k, v in precompute_geometry(geom, np.float64).items()}
     phi_p, ef_p = gyaradax_spectral_fields(np.concatenate([df, df]), stacked, per_sample=True)
     np.testing.assert_allclose(phi_p[1], phi_s[0], rtol=1e-10, atol=1e-14)
     np.testing.assert_allclose(ef_p[0], ef_s[0], rtol=1e-10, atol=1e-14)

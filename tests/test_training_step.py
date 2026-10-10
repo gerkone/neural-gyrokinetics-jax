@@ -12,7 +12,8 @@ from omegaconf import OmegaConf
 from neugk_jax.models.embeddings import APE
 from neugk_jax.models.swin import swin_layer
 from neugk_jax.models.utils import trainable_mask
-from neugk_jax.training.runner import build_optimizer, train_update
+from neugk_jax.training.runner import build_optimizer
+from neugk_jax.training.step import train_update
 
 
 def test_buffers_frozen_under_weight_decay():

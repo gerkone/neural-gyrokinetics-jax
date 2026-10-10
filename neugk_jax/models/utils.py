@@ -79,6 +79,53 @@ class Linear(eqx.Module):
         return y
 
 
+def init_linears(model, scheme, *, key):
+    """Every ``Linear`` of ``model`` re-initialized as in the torch reference: ``kaiming_uniform``
+    (relu gain, fan in) or ``xavier_uniform`` weights and zero biases; ``None`` / ``"torch"``
+    keep the default init."""
+    if scheme in (None, "torch"):
+        return model
+    if scheme not in ("kaiming_uniform", "xavier_uniform"):
+        raise NotImplementedError(f"init_weights={scheme!r}")
+
+    def linears(m):
+        nodes = jax.tree_util.tree_leaves(m, is_leaf=lambda x: isinstance(x, Linear))
+        return [n for n in nodes if isinstance(n, Linear) and n.weight is not None]
+
+    new = []
+    for lin, k in zip(linears(model), jr.split(key, len(linears(model)))):
+        fan_out, fan_in = lin.weight.shape
+        bound = (6 / (fan_in if scheme == "kaiming_uniform" else fan_in + fan_out)) ** 0.5
+        w = jr.uniform(k, lin.weight.shape, lin.weight.dtype, -bound, bound)
+        lin = eqx.tree_at(lambda n: n.inner.weight, lin, w)
+        if lin.bias is not None:
+            lin = eqx.tree_at(lambda n: n.inner.bias, lin, jnp.zeros_like(lin.bias))
+        new.append(lin)
+    return eqx.tree_at(linears, model, new)
+
+
+def zero_init_output(model, layer: int = -1):
+    """Zero one ``Linear`` of every ``unpatch`` expansion (the last by default; the muP readout is
+    ``0`` of a linear unpatch, ``-1`` of a cconv one): the autoencoder starts at a zero output."""
+
+    def outputs(m):
+        found = {}
+        is_lin = lambda x: isinstance(x, Linear)
+        for path, node in jax.tree_util.tree_flatten_with_path(m, is_leaf=is_lin)[0]:
+            name = jax.tree_util.keystr(path)
+            if is_lin(node) and node.weight is not None and ".unpatch.expansion." in name:
+                found.setdefault(name.split(".unpatch.")[0], []).append(node)
+        return [nodes[layer] for nodes in found.values()]
+
+    new = []
+    for lin in outputs(model):
+        lin = eqx.tree_at(lambda n: n.inner.weight, lin, jnp.zeros_like(lin.weight))
+        if lin.bias is not None:
+            lin = eqx.tree_at(lambda n: n.inner.bias, lin, jnp.zeros_like(lin.bias))
+        new.append(lin)
+    return eqx.tree_at(outputs, model, new)
+
+
 class LayerNorm(eqx.Module):
     """Wrapper around ``eqx.nn.LayerNorm``.
 
@@ -163,7 +210,7 @@ class DiTModulation(eqx.Module):
         self.proj = Linear(cond_dim, 6 * dim, key=key)
 
     def __call__(self, cond: jax.Array):
-        # cond: (..., cond_dim) → 6 tensors of shape (..., dim); SiLU already applied in ContinuousConditionEmbed
+        # cond (..., cond_dim) -> 6 tensors (..., dim); ContinuousConditionEmbed applied the silu
         return jnp.split(self.proj(cond), 6, axis=-1)
 
 

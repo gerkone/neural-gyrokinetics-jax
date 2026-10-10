@@ -10,9 +10,10 @@ from __future__ import annotations
 import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 
-from neugk_jax.losses import df_loss, recon_loss
-from neugk_jax.models.build import ae_conditioning, build_ae
+from neugk_jax.losses import df_loss, part_weight, recon_loss
+from neugk_jax.models.build import ae_conditioning, build_ae, mup_multipliers
 from neugk_jax.models.utils import cast_floating
 from neugk_jax.pinc.eval import (
     MAX_HISTOGRAM_CODES,
@@ -24,6 +25,7 @@ from neugk_jax.pinc.eval import (
 from neugk_jax.pinc.quantizers import VectorQuantizer
 from neugk_jax.pinc.vqvae import Swin5DVQVAE
 from neugk_jax.training.data import stack_fields
+from neugk_jax.training.ddp import per_shard
 from neugk_jax.training.runner import BaseRunner, conditioning_slots
 from neugk_jax.utils import to_dict
 
@@ -37,7 +39,7 @@ def train_dtype(cfg):
 
 
 def read_loss_weights(mcfg, supported) -> dict[str, float]:
-    """Nonzero ``model.loss_weights`` + ``model.extra_loss_weights``; raises unless all are supported."""
+    """Nonzero ``model.loss_weights`` + ``model.extra_loss_weights``; raises on unsupported ones."""
     weights = {**to_dict(mcfg.get("loss_weights")), **to_dict(mcfg.get("extra_loss_weights"))}
     if not weights:
         raise ValueError(f"model.loss_weights is required; weights over {tuple(supported)}")
@@ -78,11 +80,19 @@ class AERunner(BaseRunner):
         dt = self.tcfg.get("compute_dtype")
         self.compute_dtype = {"bf16": jnp.bfloat16, "fp16": jnp.float16}.get(dt) if dt else None
 
+    def host_batch(self, batch: dict) -> dict:
+        # data type of a one-type batch, read on the host
+        if self.train_ds.batch_transform and "data_type" in batch:
+            batch["part"] = int(np.asarray(batch.pop("data_type")).ravel()[0])
+        return batch
+
     def place_batch(self, batch: dict) -> dict:
         # eager ops, bit-identical to the per-sample transform (a jitted fusion is not)
         if not self.train_ds.batch_transform:
             return batch
-        return {**batch, "df": self.train_ds.transform(batch["df"], batch["file_index"])}
+        part = batch.pop("part", None)
+        ds = self.train_ds if part is None else list(self.train_ds.parts.values())[part]
+        return {**batch, "df": per_shard(ds.transform, batch["df"], batch["file_index"])}
 
     def forward(self, model, x, cond, keys) -> dict:
         """Training reconstruction, in ``compute_dtype`` when set; the outputs come back fp32."""
@@ -103,8 +113,16 @@ class AERunner(BaseRunner):
             raise ValueError(f"{type(self).__name__} cannot train a vq-vae; use workflow=vqvae")
         return model
 
+    def optimizer_multipliers(self):
+        # model.mup: per-leaf lr / weight decay of the muP adam
+        if not (self.cfg.model.get("mup") or {}).get("enable"):
+            return None
+        return mup_multipliers(self.cfg, self.train_ds, self.model, self.trainable)
+
     def load_batch(self, ds, indices, read) -> dict:
         fields = ("df", "file_index", "conditioning")
+        if hasattr(ds, "parts"):
+            fields += ("data_type", "loss_weight")
         return select_conditions(stack_fields(read(ds, indices), fields), self.cond_slots)
 
     def df_recon_loss(self, pred, x):
@@ -117,7 +135,7 @@ class AERunner(BaseRunner):
         keys = jr.split(key, x.shape[0])
         pred = self.forward(model, x, batch.get("conditioning"), keys)["df"]
         loss = self.df_recon_loss(pred, x)
-        return loss, {"df": loss}
+        return loss * part_weight(batch), {"df": loss}
 
     def evaluator_kwargs(self) -> dict:
         return {**super().evaluator_kwargs(), "cond_slots": self.cond_slots}

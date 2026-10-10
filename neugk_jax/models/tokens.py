@@ -25,14 +25,18 @@ from neugk_jax.models.ops import (
 from neugk_jax.models.utils import MLP, Linear, leaky_relu, make_norm
 
 
-def merge_grid(grid_size: Sequence[int]) -> tuple[int, ...]:
-    return tuple((g + 1) // 2 if g > 2 else g for g in grid_size)
+def merge_grid(
+    grid_size: Sequence[int], merge_mask: Optional[Sequence[bool]] = None
+) -> tuple[int, ...]:
+    mask = merge_mask if merge_mask is not None else [True] * len(grid_size)
+    return tuple((g + 1) // 2 if g > 2 and m else g for g, m in zip(grid_size, mask))
 
 
 class TokenMerge(TokenResamplerBase):
     """Fold with patch=2 + norm + linear up-project.
 
-    Halves every spatial axis with more than 2 patches; channels become ``dim * c_multiplier``.
+    Halves every spatial axis with more than 2 patches whose ``merge_mask`` entry is set (all by
+    default); channels become ``dim * c_multiplier``.
     """
 
     proj: Linear
@@ -49,10 +53,11 @@ class TokenMerge(TokenResamplerBase):
         key,
         c_multiplier: int = 2,
         rms_norm: bool = False,
+        merge_mask: Optional[Sequence[bool]] = None,
     ):
-        self.patch_size = tuple(2 if g > 2 else 1 for g in grid_size)
+        self.target_grid_size = merge_grid(grid_size, merge_mask)
         # odd-length axes round up; forward pads them to the next multiple
-        self.target_grid_size = merge_grid(grid_size)
+        self.patch_size = tuple(2 if t < g else 1 for g, t in zip(grid_size, self.target_grid_size))
         in_features = dim * math.prod(self.patch_size)
         self.out_dim = dim * c_multiplier
         self.norm = make_norm(in_features, rms=rms_norm)
@@ -106,6 +111,7 @@ class TokenExpand(TokenResamplerBase):
     expand_by: tuple[int, ...] = eqx.field(static=True)
     out_dim: int = eqx.field(static=True)
     use_conv: bool = eqx.field(static=True)
+    in_mult: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -124,6 +130,7 @@ class TokenExpand(TokenResamplerBase):
         use_conv: bool = False,
         patch_skip: bool = False,
         cond_dim: Optional[int] = None,
+        in_mult: float = 1.0,
     ):
         gs = tuple(grid_size)
         if isinstance(expand_by, int):
@@ -145,6 +152,8 @@ class TokenExpand(TokenResamplerBase):
             self.out_dim = max(1, dim // c_multiplier)
 
         self.use_conv = use_conv
+        # input scale of the expansion (muP readout multiplier)
+        self.in_mult = float(in_mult)
         kexp, kpc, kmod = jr.split(key, 3)
         if use_conv:
             self.expansion = StridedConvTranspose(dim, self.out_dim, eb, key=kexp)
@@ -164,17 +173,27 @@ class TokenExpand(TokenResamplerBase):
         # norm runs over out_dim channels after unfold
         self.norm = make_norm(self.out_dim, rms=rms_norm) if norm else None
 
-    def __call__(self, x: jnp.ndarray, cond: Optional[jnp.ndarray] = None) -> jnp.ndarray:
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        cond: Optional[jnp.ndarray] = None,
+        target_grid_size: Optional[Sequence[int]] = None,
+    ) -> jnp.ndarray:
+        """``target_grid_size`` overrides the crop of the constructor (same expansion)."""
         # order: proj_concat (skip residual) -> film -> expansion -> crop -> norm
+        target = self.target_grid_size if target_grid_size is None else tuple(target_grid_size)
         if self.proj_concat is not None:
             x = leaky_relu(self.proj_concat(x))
         if self.modulation is not None:
             x = self.modulation(x, cond)
-        x = self.expansion(x)
+        x = self.expansion(x if self.in_mult == 1.0 else x * self.in_mult)
         if not self.use_conv:
             x = unfold_patches(x, self.expand_by, out_channels=self.out_dim)
+        grid = x.shape[: len(target)]
+        if any(t > g for t, g in zip(target, grid)):
+            raise ValueError(f"expanded grid {grid} is smaller than the target {target}")
         # crop any overshoot from ceiling the expand factor
-        x = unpad(x, self.target_grid_size)
+        x = unpad(x, target)
         if self.norm is not None:
             x = self.norm(x)
         return x

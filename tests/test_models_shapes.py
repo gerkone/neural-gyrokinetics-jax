@@ -169,6 +169,81 @@ def test_swin5d_ae_decouple_mu():
     assert out["df"].shape == x.shape
 
 
+def test_swin5d_ae_bottleneck_input_norm():
+    base = (4, 4, 4, 16, 8)
+    kw = dict(
+        space=5,
+        decouple_mu=True,
+        dim=16,
+        base_resolution=base,
+        in_channels=2,
+        out_channels=2,
+        patch_size=(2, 0, 2, 4, 2),
+        window_size=(2, 0, 2, 2, 2),
+        depth=1,
+        num_heads=2,
+        num_layers=1,
+        bottleneck_dim=8,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
+        key=jr.PRNGKey(0),
+    )
+    plain, normed = Swin5DAE(**kw), Swin5DAE(**kw, input_norm=True)
+    assert plain.input_norm is None and normed.input_norm is not None
+    # the merged tokens enter the bottleneck at unit rms
+    z = jr.normal(jr.PRNGKey(2), (*plain.bottleneck_grid_size, plain.backbone.down_dims[-1])) * 7.0
+    rms = jnp.sqrt(jnp.mean(normed.bottleneck_input(z) ** 2, axis=-1))
+    assert jnp.allclose(rms, 1.0, atol=1e-3)
+    x = jr.normal(jr.PRNGKey(1), (2, *base))
+    assert normed(x)["df"].shape == x.shape
+    assert not jnp.allclose(normed.encode(x), plain.encode(x))
+
+
+def test_swin5d_ae_bf16_compute_copy():
+    import equinox as eqx
+
+    from neugk_jax.models.utils import cast_floating
+
+    base = (4, 4, 4, 16, 8)
+    ae = Swin5DAE(
+        space=5,
+        decouple_mu=True,
+        dim=16,
+        base_resolution=base,
+        in_channels=2,
+        out_channels=2,
+        patch_size=(2, 0, 2, 4, 2),
+        window_size=(2, 0, 2, 2, 2),
+        depth=1,
+        num_heads=2,
+        num_layers=1,
+        bottleneck_dim=8,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
+        key=jr.PRNGKey(0),
+    )
+    x = jr.normal(jr.PRNGKey(1), (2, *base))
+    ref = ae(x)["df"]
+    low = cast_floating(ae, jnp.bfloat16)(x.astype(jnp.bfloat16))["df"]
+    assert low.dtype == jnp.bfloat16
+    assert float(jnp.linalg.norm(low.astype(jnp.float32) - ref) / jnp.linalg.norm(ref)) < 3e-2
+    # gradients reach the fp32 weights through the cast copy
+    loss = lambda m: jnp.mean(
+        (cast_floating(m, jnp.bfloat16)(x.astype(jnp.bfloat16))["df"].astype(jnp.float32) - x) ** 2
+    )
+    grads = eqx.filter_grad(loss)(ae)
+    leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))
+    assert leaves and all(g.dtype == jnp.float32 and bool(jnp.isfinite(g).all()) for g in leaves)
+
+
 def test_dit_forward():
     grid = (2, 4, 2)
     z_dim = 16
@@ -210,3 +285,147 @@ def test_swin5d_ae_vmapped_batch():
     batch = jr.normal(jr.PRNGKey(1), (3, 2, *base))
     out = jax.vmap(lambda x: ae(x)["df"])(batch)
     assert out.shape == batch.shape
+
+
+def test_kinetic_ae_stem_decodes_on_own_grid(monkeypatch):
+    from neugk_jax.pinc import KineticSwin5DAE
+
+    # kinetic and adiabatic stems with different token grids along x (8 vs 7)
+    stems = {
+        "kinetic": {"resolution": [4, 4, 4, 24, 8], "n_species": 2, "patch_size": [2, 0, 2, 3, 2]},
+        "adiabatic": {
+            "resolution": [4, 4, 4, 14, 8],
+            "n_species": 1,
+            "patch_size": [2, 0, 2, 2, 2],
+        },
+    }
+    m = KineticSwin5DAE(
+        stems=stems,
+        decouple_mu=True,
+        dim=16,
+        in_channels=2,
+        out_channels=2,
+        window_size=(2, 0, 2, 4, 2),
+        depth=1,
+        num_heads=2,
+        num_layers=1,
+        bottleneck_dim=8,
+        bottleneck_depth=1,
+        bottleneck_num_heads=2,
+        merging_depth=1,
+        unmerging_depth=1,
+        merging_hidden_ratio=2.0,
+        unmerging_hidden_ratio=2.0,
+        key=jr.PRNGKey(0),
+    )
+    upscaled = []
+    call = TokenExpand.__call__
+
+    def record(self, x, cond=None, target_grid_size=None):
+        out = call(self, x, cond, target_grid_size)
+        if self is m.middle_upscale:
+            upscaled.append(out.shape)
+        return out
+
+    monkeypatch.setattr(TokenExpand, "__call__", record)
+    for name in ("adiabatic", "kinetic"):
+        bb = m.stem_backbone(name)
+        assert bb.grid_sizes[-1][1:] == m.backbone.grid_sizes[-1][1:]
+        x = jr.normal(jr.PRNGKey(1), (2, stems[name]["n_species"], *stems[name]["resolution"]))
+        assert m(x, stem=name)["df"].shape == x.shape
+        assert upscaled.pop()[:-1] == tuple(bb.grid_sizes[-2]), name
+    assert m.stem_backbone("adiabatic").grid_sizes[-2][1:] != m.backbone.grid_sizes[-2][1:]
+
+
+def _cconv_grid(n_vpar, n_mu, dx):
+    nodes = lambda n, hi: [hi * (i + 0.5) / n for i in range(n)]
+    return {
+        "axes": [
+            {"kind": "absolute", "nodes": [v - 1.5 for v in nodes(n_vpar, 3.0)]},
+            {"kind": "relative", "spacing": 0.06},
+            {"kind": "relative", "spacing": dx},
+            {"kind": "relative", "spacing": 0.2},
+        ],
+        "folded": [{"kind": "absolute", "nodes": nodes(n_mu, 2.0)}],
+    }
+
+
+def test_kinetic_ae_one_cconv_patching_for_both_stems():
+    import equinox as eqx
+
+    from neugk_jax.models.build import build_ae_from_config
+    from neugk_jax.models.patching import BandLimitedPatchEmbed, BandLimitedUnpatch
+    from neugk_jax.training.runner import is_hidden_matrix
+
+    # kinetic and adiabatic grids as in the full data, scaled down: other mu / s / x extents
+    stems = {
+        "kinetic": {
+            "resolution": [8, 3, 10, 22, 8],
+            "n_species": 2,
+            "patch_size": [4, 0, 5, 11, 4],
+            "in_channels": 2,
+            "grid": _cconv_grid(8, 3, 0.6),
+        },
+        "adiabatic": {
+            "resolution": [8, 2, 8, 10, 8],
+            "n_species": 1,
+            "in_channels": 2,
+            "grid": _cconv_grid(8, 2, 0.5),
+        },
+    }
+    patch = dict(
+        patch_size=[4, 0, 4, 5, 4],
+        window_size=[2, 0, 2, 2, 2],
+        merging_depth=2,
+        unmerging_depth=2,
+        merging_hidden_ratio=1.0,
+        unmerging_hidden_ratio=1.0,
+        c_multiplier=1,
+        type="cconv",
+        field={"rank": 4},
+    )
+    mup = dict(enable=True, head_dim=16, bottleneck_ratio=2, base_width=16, delta_width=32)
+    cfg = {
+        "model": {
+            "latent_dim": 32,
+            "num_layers": 1,
+            "init_weights": "kaiming_uniform",
+            "patch": patch,
+            "stems": stems,
+            "mup": mup,
+            "vit": {"num_heads": [2], "depth": [2], "drop_path": 0.0},
+            "bottleneck": {"dim": 8, "depth": 1, "num_heads": 2},
+        },
+        "dataset": {"separate_zf": False},
+    }
+    m = build_ae_from_config(cfg, key=jr.PRNGKey(0))
+    assert isinstance(m.backbone.patch_embed, BandLimitedPatchEmbed)
+    assert isinstance(m.backbone.unpatch, BandLimitedUnpatch)
+    # one set of patching weights: the adiabatic stem holds only its point grids
+    side = m.stem_backbones["adiabatic"]
+    assert side.patch_embed.filter is None and side.unpatch.expansion.layers[0].weight is None
+    adiabatic = m.stem_backbone("adiabatic")
+    assert adiabatic.unpatch.filter is m.backbone.unpatch.filter
+    assert adiabatic.unpatch.grid.n_fold == (2,) and m.backbone.unpatch.grid.n_fold == (3,)
+    # muP readout: the last linear of the cconv head, zero at init, input scaled by base / width
+    head = m.backbone.unpatch.expansion.layers
+    assert m.backbone.unpatch.in_mult == 0.5
+    assert float(jnp.abs(head[-1].weight).max()) == 0.0 < float(jnp.abs(head[0].weight).max())
+    # muon leaves the patching weights to adam
+    params = jax.tree_util.tree_flatten_with_path(eqx.filter(m, eqx.is_inexact_array))[0]
+    patching = [(p, v) for p, v in params if "patch" in jax.tree_util.keystr(p)]
+    assert patching and not any(is_hidden_matrix(p, v) for p, v in patching)
+    readout = lambda t: t.backbone.unpatch.expansion.layers[-1].inner.weight
+    m = eqx.tree_at(readout, m, 0.1 * jr.normal(jr.PRNGKey(2), head[-1].weight.shape))
+    for name, spec in stems.items():
+        x = jr.normal(jr.PRNGKey(1), (2, spec["n_species"], *spec["resolution"]))
+        assert m(x)["df"].shape == x.shape
+        grads = eqx.filter_grad(lambda mm: jnp.mean((mm(x, stem=name)["df"] - x) ** 2))(m)
+        leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))
+        assert all(bool(jnp.isfinite(g).all()) for g in leaves), name
+        # every stem trains the shared filters and heads
+        bb = grads.backbone
+        for w in (bb.patch_embed.filter, bb.patch_embed.mix.layers[0].weight):
+            assert float(jnp.abs(w).max()) > 0, name
+        for w in (bb.unpatch.filter, bb.unpatch.expansion.layers[0].weight):
+            assert float(jnp.abs(w).max()) > 0, name

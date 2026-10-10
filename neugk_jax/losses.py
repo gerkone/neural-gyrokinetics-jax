@@ -28,6 +28,12 @@ def per_sample_rel_norm_mse(p, t, eps: float = 1e-4):
     return jnp.sum(_flat(p - t) ** 2, axis=-1) / (jnp.sum(_flat(t) ** 2, axis=-1) + eps)
 
 
+def part_weight(batch) -> jnp.ndarray:
+    """Loss weight of a one-part batch of a dataset mix (1 without one)."""
+    w = batch.get("loss_weight")
+    return jnp.float32(1.0) if w is None else jnp.mean(w)
+
+
 def rel_err(p, t, eps: float = 1e-12):
     return jnp.abs(p - t) / (jnp.abs(t) + eps)
 

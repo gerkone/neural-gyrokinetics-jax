@@ -175,7 +175,7 @@ def test_gkw_text_readers(tmp_path):
     assert P.read_dump_time(str(tmp_path / "K01.dat")) == 1.25
 
 
-@pytest.mark.parametrize("bits", ["bf16", "fp16", "i8", "i4"])
+@pytest.mark.parametrize("bits", ["bf16", "zstd16", "fp16", "i8", "i4"])
 def test_quantize_roundtrip(tmp_path, bits):
     from neugk_jax.dataset import quant
 
@@ -184,11 +184,32 @@ def test_quantize_roundtrip(tmp_path, bits):
     dst = quant.sibling(str(tmp_path / "timestep_00000.bin"), bits)
     quant.write(dst, payload, scale)
     y = quant.read(dst, bits, x.size)
-    tol = {"bf16": 1e-2, "fp16": 1e-3, "i8": 2e-2, "i4": 0.3}[bits]
+    tol = {"bf16": 1e-2, "zstd16": 1e-2, "fp16": 1e-3, "i8": 2e-2, "i4": 0.3}[bits]
     assert np.max(np.abs(y - x)) <= tol * np.max(np.abs(x))
     np.testing.assert_array_equal(quant.roundtrip(x, bits), y)
     with pytest.raises(IOError):
         quant.read(dst, bits, x.size + 2)
+
+
+def test_quantize_zstd16_packs_bf16_only_frames_and_removes_them(tmp_path):
+    import ml_dtypes
+
+    from neugk_jax.dataset import quant
+
+    data = tmp_path / "iteration_0_ifft_realpotens" / "data"
+    data.mkdir(parents=True)
+    x = np.random.default_rng(7).standard_normal(5000).astype(ml_dtypes.bfloat16)
+    for name in ("timestep_00000", "poten_00000"):
+        x.tofile(data / f"{name}.bf16.bin")
+    P.run_quantize(
+        path=str(tmp_path), trajs=["iteration_0_ifft_realpotens"], bits="zstd16", remove_source=True
+    )
+    assert sorted(p.name for p in data.iterdir()) == [
+        "poten_00000.zstd16.bin",
+        "timestep_00000.zstd16.bin",
+    ]
+    y = quant.read(str(data / "timestep_00000.zstd16.bin"), "zstd16", x.size)
+    np.testing.assert_array_equal(y, x.astype(np.float32))
 
 
 def test_field_solver_spectrum_sums_to_flux_and_matches_flux_integral():
@@ -205,7 +226,7 @@ def test_field_solver_spectrum_sums_to_flux_and_matches_flux_integral():
     np.testing.assert_allclose(solver.flux_spectrum(df).sum(), eflux, rtol=1e-10)
     phi32, (_, ef32, _) = jax.jit(flux_integral)(precompute_geometry(geom), jnp.asarray(df))
     np.testing.assert_allclose(phi, np.asarray(phi32), rtol=1e-4, atol=1e-5 * np.abs(phi).max())
-    np.testing.assert_allclose(eflux, float(ef32), rtol=1e-4)
+    np.testing.assert_allclose(eflux, float(ef32[0]), rtol=1e-4)
 
 
 def _synthetic_traj(root, n=3):

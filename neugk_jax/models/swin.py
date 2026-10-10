@@ -124,6 +124,7 @@ def swin_layer(
     norm_affine: bool = False,
     rms_norm: bool = False,
     legacy_double_shortcut: bool = False,
+    attention: str = "einsum",
 ) -> BlockStack:
     """``depth`` Swin blocks alternating non-shifted / shifted windows."""
     common = dict(
@@ -135,6 +136,7 @@ def swin_layer(
         use_rpb=use_rpb,
         gated_attention=gated_attention,
         rms_norm=rms_norm,
+        attention=attention,
     )
 
     def plain(i, k):

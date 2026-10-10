@@ -14,13 +14,32 @@ from neugk_jax.models.utils import Gate, Linear, RMSNorm, dropout, split_key
 
 
 def einsum_attention(q, k, v, scale, bias=None, attn_drop=0.0, key=None, inference=True):
-    """Softmax attention of ``q`` (..., n, heads, head_dim) over ``k``/``v`` (..., m, heads, head_dim)."""
+    """Softmax attention of ``q`` (..., n, heads, dim) over ``k``/``v`` (..., m, heads, dim)."""
     logits = jnp.einsum("...nhd,...mhd->...hnm", q, k) * scale
     if bias is not None:
         logits = logits + bias
     attn = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(v.dtype)
     attn = dropout(attn, attn_drop, key=key, inference=inference)
     return jnp.einsum("...hnm,...mhd->...nhd", attn, v)
+
+
+def fused_attention(q, k, v, scale, bias=None):
+    """:func:`einsum_attention` as the fused cuDNN kernel (bf16 q/k/v/bias, output in q's dtype)."""
+    dt = jnp.bfloat16
+    b = None
+    if bias is not None:
+        # tie the bias to q's vmapped axes, the batching rule folds them into one batch dim
+        tie = jnp.zeros((), dt) * jax.lax.stop_gradient(q[:1, :1, :1]).astype(dt).reshape(())
+        b = (jnp.broadcast_to(bias, (q.shape[-2], q.shape[-3], k.shape[-3])).astype(dt) + tie)[None]
+    out = jax.nn.dot_product_attention(
+        q[None].astype(dt),
+        k[None].astype(dt),
+        v[None].astype(dt),
+        bias=b,
+        scale=scale,
+        implementation="cudnn",
+    )
+    return out[0].astype(q.dtype)
 
 
 class MultiHeadSelfAttention(eqx.Module):
@@ -48,6 +67,7 @@ class MultiHeadSelfAttention(eqx.Module):
     scale: float = eqx.field(static=True)
     attn_drop: float = eqx.field(static=True)
     proj_drop: float = eqx.field(static=True)
+    attention: str = eqx.field(static=True)
 
     def __init__(
         self,
@@ -55,6 +75,7 @@ class MultiHeadSelfAttention(eqx.Module):
         num_heads: int,
         *,
         key,
+        attention: str = "einsum",
         qkv_bias: bool = True,
         qk_norm: bool = False,
         use_rpb: bool = False,
@@ -80,6 +101,9 @@ class MultiHeadSelfAttention(eqx.Module):
         self.gate = Gate(self.head_dim, key=kgate) if gated_attention else None
         self.attn_drop = attn_drop
         self.proj_drop = proj_drop
+        if attention not in ("einsum", "cudnn"):
+            raise ValueError(f"attention={attention!r}; one of einsum, cudnn")
+        self.attention = attention
 
     def __call__(
         self,
@@ -102,7 +126,10 @@ class MultiHeadSelfAttention(eqx.Module):
             rpb_bias = self.rpb()  # shape: (heads, sl, sl)
             attn_bias = rpb_bias if attn_bias is None else attn_bias + rpb_bias
         ka, kp = split_key(key, 2)
-        out = einsum_attention(q, k, v, self.scale, attn_bias, self.attn_drop, ka, inference)
+        if self.attention == "cudnn" and (inference or not self.attn_drop):
+            out = fused_attention(q, k, v, self.scale, attn_bias)
+        else:
+            out = einsum_attention(q, k, v, self.scale, attn_bias, self.attn_drop, ka, inference)
         # out: (n, H, D); apply optional headwise gate before flattening to (n, dim)
         if self.gate is not None:
             out = self.gate(out, q)

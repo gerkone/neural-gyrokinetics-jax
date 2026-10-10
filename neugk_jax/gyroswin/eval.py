@@ -5,7 +5,8 @@ trajectory; step ``t`` targets are the next-step targets at ``timestep_index + t
 Logs ``{field}_x{t}`` per step (relative-norm MSE for df/phi, MSE for flux/fluxavg,
 optional ``phi_int`` (MSE of the integrated phi) and ``flux_int_rel_err``
 (``|eflux - flux| / |flux|`` of the integrated heat flux)), ``df_rel_l2_x{t}``/
-``phi_rel_l2_x{t}`` and the step means ``{field}``. Batches keep one shape; rollout steps beyond a trajectory are masked.
+``phi_rel_l2_x{t}`` and the step means ``{field}``. Batches keep one shape; rollout steps beyond
+a trajectory are masked.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ def gyroswin_eval_step(model, x, cond, tgt, fids, live, t, acc, norm, geom, fiel
     if geom is not None:
         phi_i, (_, eflux, _) = integrate(geom, fids, pred_d["df"], pred_d["phi"])
         values["phi_int"] = per_sample_mse(phi_i, tgt_d["phi"].reshape(phi_i.shape))
-        values["flux_int_rel_err"] = rel_err(eflux, tgt_d["flux"].reshape(-1))
+        values["flux_int_rel_err"] = rel_err(eflux, tgt_d["flux"].reshape(eflux.shape))
     out = {k: acc[k].at[t].add(jnp.sum(v * live)) for k, v in values.items()}
     out["_n"] = acc["_n"].at[t].add(jnp.sum(live))
     return preds["df"], out, pred_d, tgt_d
@@ -117,7 +118,7 @@ class GyroSwinEvaluator(BaseEvaluator):
                     geom,
                     self.fields,
                 )
-                if plan.number == 0 and t == 0 and self.is_rank0:
+                if plan.number == self.plot_plan(epoch) and t == 0 and self.is_rank0:
                     plots = self._plots(pred_d, tgt_d, batch)
         host = jax.device_get(acc)
         sums = self.sum_processes(

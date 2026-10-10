@@ -1,0 +1,16 @@
+# @package _global_
+# diffusion_species on the three-part mix of ae_species_stable:
+#   python main.py experiment=diffusion_species_stable ae_checkpoint=<ae_species_stable run dir>
+defaults:
+  - ae_species_stable
+  - override /model: diff/flow_matching
+  - override /training: diffusion
+
+workflow: diffusion
+ae_legacy_swin_shortcut: false
+latent_scale: null
+dataset:
+  latents_cache_train: null
+  latents_cache_val: null
+model:
+  conditioning: [dg, etg, itg, kinetic, q, s_hat, temp_ratio]

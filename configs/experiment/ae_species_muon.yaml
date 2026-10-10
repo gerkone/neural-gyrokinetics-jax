@@ -1,0 +1,24 @@
+# @package _global_
+# ae_species_mup with muon on the hidden matrices, all the data: python main.py experiment=ae_species_muon
+defaults:
+  - ae_species_mup
+
+training:
+  optimizer: muon
+  muon_learning_rate: 0.02
+  batch_size: 4
+  n_epochs: 200
+  # reader threads and batches in flight
+  num_workers: 32
+  prefetch: 8
+dataset:
+  # kvikio threads splitting each read
+  io_threads: 32
+model:
+  latent_dim: 1536
+  hidden_mlp_ratio: 4.0
+  # latent stays at 512 channels (compression as at width 1024)
+  mup: {bottleneck_ratio: 3}
+validation:
+  # one sample per device
+  batch_size: 1

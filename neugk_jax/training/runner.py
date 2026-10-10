@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Optional
 
 import equinox as eqx
 import jax
@@ -21,8 +21,10 @@ import jax.random as jr
 import numpy as np
 import optax
 from omegaconf import OmegaConf
+from optax.contrib import MuonDimensionNumbers, muon
 
-from neugk_jax.dataset.factory import build_splits
+from neugk_jax.dataset.factory import build_splits, save_run_stats
+from neugk_jax.evaluate.base import MultiEvaluator
 from neugk_jax.models.utils import trainable_mask
 from neugk_jax.training.checkpoint import AsyncCheckpointer, CheckpointState, load_checkpoint
 from neugk_jax.training.data import BatchLoader, stack_fields, train_plans
@@ -32,12 +34,14 @@ from neugk_jax.training.ddp import (
     init_distributed,
     local_view,
     replicate,
+    replicated_sharding,
     row_devices,
     shard_batch,
 )
 from neugk_jax.training.logging import Logger
 from neugk_jax.training.schedulers import warmup_cosine
-from neugk_jax.utils import count_trace, progress, to_dict
+from neugk_jax.training.step import PartitionedTrainStep, StepSpec
+from neugk_jax.utils import progress, to_dict
 
 
 def weight_decay_mask(params, exclude):
@@ -53,10 +57,24 @@ def weight_decay_mask(params, exclude):
     return jax.tree_util.tree_map_with_path(keep, params)
 
 
-def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999, mask=None):
+def is_hidden_matrix(path, leaf, patching: bool = False) -> bool:
+    """A weight matrix (out, in) with both sides >= 16 and not a position bias; a patch / unpatch
+    matrix only with ``patching``."""
+    name = jax.tree_util.keystr(path).lower()
+    excluded = ("rpb",) if patching else ("patch_embed", "unpatch", "rpb")
+    return leaf.ndim == 2 and min(leaf.shape) >= 16 and not any(k in name for k in excluded)
+
+
+def build_optimizer(
+    schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999, mask=None, multipliers=None
+):
     """Clip + Adam chain over the ``mask`` leaves (default ``trainable_mask``).
 
-    ``decoupled`` selects AdamW, else Adam with coupled L2 decay.
+    ``decoupled`` selects AdamW, else Adam with coupled L2 decay. ``training.optimizer: muon``
+    updates the hidden weight matrices with Muon at ``muon_learning_rate`` (same schedule shape),
+    with ``training.muon_patching`` also the patch embedding / unpatch matrices.
+    ``multipliers`` (muP ``(lr_mult, wd_mult)`` pytrees over the trainable leaves) scale the
+    learning rate and the coupled decay of every leaf; with muon only the lr of its adam leaves.
     """
     wd = tcfg.get("weight_decay", 0.0)
     params = eqx.filter(model, trainable_mask(model) if mask is None else mask)
@@ -66,6 +84,50 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
         if tcfg.get("clip_grad", True)
         else optax.identity()
     )
+    if tcfg.get("optimizer", "adam") == "muon":
+        ratio = float(tcfg.muon_learning_rate) / float(tcfg.learning_rate)
+        out_in = MuonDimensionNumbers(reduction_axis=1, output_axis=0)
+        hidden = partial(is_hidden_matrix, patching=bool(tcfg.get("muon_patching", False)))
+        dims = lambda p: jax.tree_util.tree_map_with_path(
+            lambda k, x: out_in if hidden(k, x) else None, p
+        )
+        opt = muon(
+            lambda c: ratio * schedule(c),
+            adam_learning_rate=schedule,
+            adam_b2=b2,
+            weight_decay=wd,
+            adam_weight_decay=wd,
+            muon_weight_dimension_numbers=dims,
+        )
+        if multipliers is None:
+            return optax.chain(clip, opt)
+        # muon's shape scaling transfers the hidden matrices; the adam leaves keep their muP lr
+        adam_mult = jax.tree_util.tree_map_with_path(
+            lambda k, x, m: 1.0 if hidden(k, x) else m, params, multipliers[0]
+        )
+        return optax.chain(
+            clip,
+            opt,
+            optax.stateless(
+                lambda u, p: jax.tree_util.tree_map(lambda ui, m: ui * m, u, adam_mult)
+            ),
+        )
+    if multipliers is not None:
+        if tcfg.get("optimizer", "adam") != "adam" or decoupled:
+            raise NotImplementedError(
+                "muP multipliers need optimizer adam or muon, adam with coupled weight decay"
+            )
+        lr_mult, wd_mult = multipliers
+        decay = lambda g, p: jax.tree_util.tree_map(
+            lambda gi, pi, m, k: gi + wd * m * pi if k else gi, g, p, wd_mult, mask
+        )
+        return optax.chain(
+            clip,
+            optax.stateless(decay),
+            optax.scale_by_adam(b1=float(tcfg.get("adam_b1", 0.9)), b2=b2),
+            optax.scale_by_learning_rate(schedule),
+            optax.stateless(lambda u, p: jax.tree_util.tree_map(lambda ui, m: ui * m, u, lr_mult)),
+        )
     if wd <= 0:
         return optax.chain(clip, optax.adam(schedule, b2=b2))
     if decoupled:
@@ -79,49 +141,7 @@ def build_optimizer(schedule, tcfg, model, *, decoupled: bool, b2: float = 0.999
     )
 
 
-def train_update(model, opt_state, loss_fn, optimizer, mask, *, has_aux: bool = False):
-    """One optimizer step on the leaves ``mask`` marks trainable; buffers stay fixed."""
-    params, static = eqx.partition(model, mask)
-    out, grads = eqx.filter_value_and_grad(
-        lambda p: loss_fn(eqx.combine(p, static)), has_aux=has_aux
-    )(params)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    return eqx.combine(eqx.apply_updates(params, updates), static), opt_state, out
-
-
-@dataclass(frozen=True, eq=False)
-class StepSpec:
-    """Static part of a train step: loss hook, optimizer, trainable mask and post-update hook."""
-
-    name: str
-    loss_fn: Callable
-    optimizer: Any
-    mask: Any
-    post_update: Callable
-
-
-@eqx.filter_jit(donate="all-except-first")
-def train_step(inputs, model, opt_state, spec: StepSpec):
-    """``inputs = (batch, ctx, key)``; ``ctx`` holds the run-constant device tables (not donated).
-
-    A ``"state"`` entry of the loss aux is not logged but handed to
-    ``spec.post_update(model, state, key) -> (model, logs)`` after the optimizer step.
-    """
-    count_trace(f"train_step:{spec.name}")
-    batch, ctx, key = inputs
-
-    def loss(m):
-        return spec.loss_fn(m, {**ctx, **batch}, key)
-
-    model, opt_state, (value, aux) = train_update(
-        model, opt_state, loss, spec.optimizer, spec.mask, has_aux=True
-    )
-    aux = dict(aux)
-    model, extra = spec.post_update(model, aux.pop("state", None), jr.fold_in(key, 1))
-    return model, opt_state, {"total": value, **aux, **extra}
-
-
-@eqx.filter_jit(donate="all")
+@partial(jax.jit, donate_argnums=(0, 1))
 def _add_logs(acc, logs):
     return jax.tree_util.tree_map(jnp.add, acc, logs)
 
@@ -180,7 +200,7 @@ class BaseRunner:
             self.post_update,
         )
         self._maybe_resume()
-        self.evaluator = self.make_evaluator()
+        self.evaluator = self.build_evaluator()
         self.save_config()
 
     @property
@@ -200,10 +220,20 @@ class BaseRunner:
             val_ds=self.val_ds, dist=self.dist, loader=self.loader, batch_size=self.eval_batch_size
         )
 
-    def build_data(self, mode: str, **kwargs) -> None:
+    def build_data(self, mode: str, stats_dir: Optional[str] = None, **kwargs) -> None:
+        """Train and val splits normalized with, in order of preference, the run's own copy of
+        the statistics (a resumed run), those of ``stats_dir`` and :func:`resolve_stats`."""
+        own = self.output_path / "normalization_stats"
+        resuming = (self.output_path / "ckp.eqx").exists()
         self.train_ds, self.val_ds = build_splits(
-            self.cfg.dataset, dist=self.dist, mode=mode, **kwargs
+            self.cfg.dataset,
+            dist=self.dist,
+            mode=mode,
+            run_stats_dir=str(own) if resuming else stats_dir,
+            **kwargs,
         )
+        if self.dist.is_rank0:
+            save_run_stats(self.train_ds, str(own), overwrite=not resuming)
 
     def save_config(self) -> None:
         if self.dist.is_rank0:
@@ -225,6 +255,27 @@ class BaseRunner:
     def make_evaluator(self):
         return None
 
+    def mixing_weights(self, epoch: int):
+        """Sampling share of every part of a dataset mix in ``epoch`` (None: by size)."""
+        weights = getattr(self.train_ds, "group_weights", None)
+        return None if weights is None else weights((epoch - 1) / max(self.tcfg.n_epochs, 1))
+
+    def build_evaluator(self):
+        """``make_evaluator()``, or a :class:`MultiEvaluator` with one per part of a dataset mix."""
+        parts = getattr(self.val_ds, "parts", None)
+        if not parts:
+            return self.make_evaluator()
+        full, evaluators = self.val_ds, {}
+        try:
+            for name, ds in parts.items():
+                self.val_ds = ds
+                evaluators[name] = self.make_evaluator()
+        finally:
+            self.val_ds = full
+        return (
+            MultiEvaluator(evaluators) if any(e is not None for e in evaluators.values()) else None
+        )
+
     def step_context(self) -> dict:
         return {}
 
@@ -237,8 +288,12 @@ class BaseRunner:
     def step_extras(self, step: int) -> dict:
         return {}
 
+    def host_batch(self, batch: dict) -> dict:
+        """A loaded training batch before sharding, in the prefetch thread (host arrays only)."""
+        return batch
+
     def place_batch(self, batch: dict) -> dict:
-        """Transform of a training batch once on its devices, in the prefetch thread."""
+        """Transform of a sharded training batch on its devices, in the main thread."""
         return batch
 
     def load_batch(self, ds, indices, read) -> dict:
@@ -252,33 +307,46 @@ class BaseRunner:
         tcfg = self.tcfg
         self.steps_per_epoch = max(1, len(self.train_ds) // self.global_batch_size)
         self.total_steps = tcfg.n_epochs * self.steps_per_epoch
-        self.schedule = warmup_cosine(
-            peak_lr=tcfg.learning_rate,
-            total_steps=self.total_steps,
-            steps_per_epoch=self.steps_per_epoch,
-            n_epochs=tcfg.n_epochs,
-            min_lr=tcfg.get("final_learning_rate", 1e-6),
-        )
+        if tcfg.get("lr_schedule", "warmup_cosine") == "constant":
+            self.schedule = optax.constant_schedule(tcfg.learning_rate)
+        else:
+            self.schedule = warmup_cosine(
+                peak_lr=tcfg.learning_rate,
+                total_steps=self.total_steps,
+                steps_per_epoch=self.steps_per_epoch,
+                n_epochs=tcfg.n_epochs,
+                min_lr=tcfg.get("final_learning_rate", 1e-6),
+            )
         self.trainable = self.trainable_mask(self.model)
         self.optimizer = build_optimizer(
             self.schedule,
             tcfg,
             self.model,
             decoupled=self.decoupled_wd,
-            b2=self.adam_b2,
+            b2=float(tcfg.get("adam_b2") or self.adam_b2),
             mask=self.trainable,
+            multipliers=self.optimizer_multipliers(),
         )
         self.opt_state = self.optimizer.init(eqx.filter(self.model, self.trainable))
         self.model = replicate(self.dist, self.model)
         self.opt_state = replicate(self.dist, self.opt_state)
+
+    def optimizer_multipliers(self):
+        return None
 
     def _maybe_resume(self) -> None:
         ckpt = self.output_path / "ckp.eqx"
         if not ckpt.exists():
             return
         state = load_checkpoint(ckpt, self.model)
+        opt_state = state.opt_state
+        fresh = jax.tree_util.tree_structure(self.opt_state)
+        leaves = jax.tree_util.tree_leaves(opt_state)
+        if fresh.num_leaves == len(leaves):
+            # saved static metadata may differ from the current modules; the leaves line up
+            opt_state = jax.tree_util.tree_unflatten(fresh, leaves)
         self.model = replicate(self.dist, state.model)
-        self.opt_state = replicate(self.dist, state.opt_state)
+        self.opt_state = replicate(self.dist, opt_state)
         self.start_epoch = state.epoch
         self.best_val = float((state.meta or {}).get("best_val", math.inf))
         if self.dist.is_rank0:
@@ -299,7 +367,14 @@ class BaseRunner:
     def train_epoch(self, epoch: int, key) -> tuple[dict, dict]:
         perm_key, step_key = jr.split(key)
         perm = np.asarray(jr.permutation(perm_key, len(self.train_ds)))
-        plans = train_plans(self.dist, len(self.train_ds), self.tcfg.batch_size, perm)
+        plans = train_plans(
+            self.dist,
+            len(self.train_ds),
+            self.tcfg.batch_size,
+            perm,
+            groups=getattr(self.train_ds, "groups", None),
+            weights=self.mixing_weights(epoch),
+        )
         devices = row_devices(self.dist, len(plans[0].indices)) if plans else None
 
         def load(ds, indices, read):
@@ -307,24 +382,33 @@ class BaseRunner:
             return self.load_batch(ds, indices, lambda d, i: read(d, i, devices))
 
         batches = self.loader.iterate(
-            self.train_ds, plans, load, lambda b: self.place_batch(shard_batch(self.dist, b))
+            self.train_ds, plans, load, lambda b: shard_batch(self.dist, self.host_batch(b))
         )
         show = self.dist.is_rank0 and (self.cfg.get("logging") or {}).get("tqdm", False)
         batches = progress(batches, show, total=len(plans), desc=f"epoch {epoch}")
         acc, waits = None, []
         t_start = t_first = time.perf_counter()
         step0 = (epoch - 1) * self.steps_per_epoch
-        for i, (_, batch, wait) in enumerate(batches):
-            waits.append(wait)
-            batch.pop("mask")
-            batch.update(self.step_extras(step0 + i))
-            self.model, self.opt_state, logs = train_step(
-                (batch, self.ctx, jr.fold_in(step_key, i)), self.model, self.opt_state, self.spec
+        step = getattr(self, "_partitioned_step", None)
+        if step is None or not step.matches(self.model, self.opt_state):
+            step = self._partitioned_step = PartitionedTrainStep(
+                self.spec, self.model, self.opt_state, sharding=replicated_sharding(self.dist)
             )
-            acc = logs if acc is None else _add_logs(acc, logs)
-            if i == 0:
-                jax.block_until_ready(acc)
-                t_first = time.perf_counter()
+        step_key = replicate(self.dist, step_key)
+        state = step.init(self.model, self.opt_state)
+        try:
+            for i, (_, batch, wait) in enumerate(batches):
+                waits.append(wait)
+                batch.pop("mask")
+                batch = self.place_batch(batch)
+                batch.update(self.step_extras(step0 + i))
+                state, logs = step(state, (batch, self.ctx, step_key), i)
+                acc = logs if acc is None else _add_logs(acc, logs)
+                if i == 0:
+                    jax.block_until_ready(acc)
+                    t_first = time.perf_counter()
+        finally:
+            self.model, self.opt_state = step.restore(state)
         n = len(waits)
         if acc is None:
             return {}, {}
@@ -361,6 +445,9 @@ class BaseRunner:
                 t_train = time.perf_counter() - t0
                 validating = epoch % val_every == 0 or epoch == 1 or epoch == n_epochs
                 val_logs, val_plots = {}, {}
+                if validating and (epoch % save_every == 0 or epoch == n_epochs):
+                    # checkpoint the epoch before validating
+                    self.save_checkpoint(epoch, last_val, "ckp.eqx")
                 if validating:
                     t0 = time.perf_counter()
                     val_logs, val_plots = self.evaluate(epoch)

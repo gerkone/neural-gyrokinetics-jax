@@ -36,6 +36,7 @@ class ViTBlock(AttentionBlockBase):
         qkv_bias: bool = False,
         qk_norm: bool = False,
         gated_attention: bool = False,
+        attention: str = "einsum",
     ):
         katt, kmlp = jr.split(key, 2)
         self.norm1 = make_norm(dim, rms=rms_norm, affine=norm_affine)
@@ -47,6 +48,7 @@ class ViTBlock(AttentionBlockBase):
             qkv_bias=qkv_bias,
             qk_norm=qk_norm,
             gated_attention=gated_attention,
+            attention=attention,
         )
         self.mlp = MLP([dim, max(int(dim * mlp_ratio), dim), dim], key=kmlp, act_fn=act_fn)
         self.drop_path = DropPath(drop_path)
@@ -83,6 +85,7 @@ class DiTViTBlock(AttentionBlockBase):
         qkv_bias: bool = False,
         qk_norm: bool = False,
         gated_attention: bool = False,
+        attention: str = "einsum",
         norm_affine: bool = True,
         rms_norm: bool = False,
     ):
@@ -96,6 +99,7 @@ class DiTViTBlock(AttentionBlockBase):
             qkv_bias=qkv_bias,
             qk_norm=qk_norm,
             gated_attention=gated_attention,
+            attention=attention,
         )
         self.mlp = MLP([dim, max(int(dim * mlp_ratio), dim), dim], key=kmlp, act_fn=act_fn)
         self.drop_path = DropPath(drop_path)

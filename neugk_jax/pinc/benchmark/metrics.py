@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from neugk_jax.evaluate.fourier import df_to_spec, spec_to_phi
-from neugk_jax.evaluate.integrals import _pev_fluxes, _solve_fields
+from neugk_jax.evaluate.integrals import _with_species, solve_phi, species_fluxes
 
 EPS = 1e-8
 # spectral bins below this fraction of the ground-truth peak count as equal in the rmsle
@@ -26,15 +26,15 @@ LOG_FLOOR = 1e-2
 
 @jax.jit
 def snapshot_fields(geom_t: dict, df: jnp.ndarray, ds) -> dict:
-    """Field solve of one spatial df ``(2, vp, mu, s, x, y)``.
+    """Field solve of one spatial df ``(2, [species,] vp, mu, s, x, y)``.
 
-    Returns the real potential ``phi`` ``(x, s, y)``, the summed heat flux ``eflux``, the spectral
-    potential ``phi_spec`` ``(s, kx, ky)`` and the diagnostics ``kxspec``, ``kyspec``, ``qspec``
-    and ``phi_zf``.
+    Returns the real potential ``phi`` ``(x, s, y)``, the heat flux ``eflux`` summed over species
+    and modes, the spectral potential ``phi_spec`` ``(s, kx, ky)`` and the diagnostics ``kxspec``,
+    ``kyspec``, ``qspec`` (summed over species) and ``phi_zf``.
     """
-    spec = df_to_spec(df)
-    phi_s, apar_s, bpar_s = _solve_fields(geom_t, spec)
-    eflux = _pev_fluxes(geom_t, spec, phi_s, apar_s, bpar_s, axis=())[1]
+    spec = df_to_spec(_with_species(df))
+    phi_s = solve_phi(geom_t, spec)
+    eflux = species_fluxes(geom_t, spec, phi_s, reduce=False)[:, 1]
     power = jnp.real(phi_s) ** 2 + jnp.imag(phi_s) ** 2
     zf = jnp.zeros_like(phi_s).at[..., 0].set(phi_s[..., 0])
     ns, _, ny = phi_s.shape
@@ -44,7 +44,7 @@ def snapshot_fields(geom_t: dict, df: jnp.ndarray, ds) -> dict:
         "phi_spec": phi_s,
         "kxspec": jnp.sum(jnp.sum(power, axis=-1) * ds, axis=0),
         "kyspec": jnp.sum(jnp.sum(power, axis=-2) * ds, axis=0),
-        "qspec": jnp.sum(eflux, axis=(0, 1, 2, 3)),
+        "qspec": jnp.sum(eflux, axis=(0, 1)),
         "phi_zf": jnp.fft.irfftn(
             jnp.fft.fftshift(zf, axes=0), axes=(0, 2), norm="forward", s=(ns, ny)
         ),

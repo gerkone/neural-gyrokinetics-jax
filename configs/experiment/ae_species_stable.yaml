@@ -1,0 +1,25 @@
+# @package _global_
+# ae_species plus the stable single-snapshot kinetic runs as a third part: python main.py experiment=ae_species_stable
+defaults:
+  - ae_species
+
+dataset:
+  # sampling share per part; a part's loss weight sits next to its share
+  mixing:
+    adiabatic: 0.57
+    kinetic: 0.38
+    kinetic_stable: {share: 0.05, loss_weight: 1.0}
+  parts:
+    kinetic_stable:
+      path: /local00/bioinf/galletti/kinetic/preprocessed_kvikio
+      offset: 0
+      # the kinetic grid: decoded by the kinetic stem, normalized with the saturated kinetic statistics
+      stem: kinetic
+      stats_from: kinetic
+      # off unless set: roll_y (exact symmetry), amplitude [lo, hi] (exact for linear states, scales fluxes by its square)
+      augment:
+        roll_y: false
+        amplitude: null
+      # stable runs of kinetic_exp/work/transfer/runs_stable.txt without the kinetic test set
+      training_trajectories: iteration_{503,513,518,520-521,524,526-528,533,536,539-540,542,546,551-552,555,560-561,564,566,570,576,582,584-585,592,595,600,602,606,608,613,615-617,620,626-627,629,634,636,638-639,644,647,649,654-655,657-658,662,664-667,671-672,676,680-681,683,688-690,692-693,696,700}
+      validation_trajectories: iteration_{502,580,653}

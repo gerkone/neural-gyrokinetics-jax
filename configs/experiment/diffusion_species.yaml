@@ -1,0 +1,17 @@
+# @package _global_
+# latent flow matching on a species-axis ae of a data-type mix:
+#   python main.py experiment=diffusion_species ae_checkpoint=<ae_species run dir>
+defaults:
+  - ae_species
+  - override /model: diff/flow_matching
+  - override /training: diffusion
+
+workflow: diffusion
+ae_legacy_swin_shortcut: false
+latent_scale: null
+dataset:
+  latents_cache_train: null
+  latents_cache_val: null
+model:
+  # dit conditioning: a subset of dataset.conditions
+  conditioning: [dg, etg, itg, kinetic, q, s_hat, temp_ratio]

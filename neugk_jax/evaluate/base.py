@@ -39,7 +39,7 @@ class GeometryCache:
 
     def _one(self, fid: int) -> dict:
         if fid not in self._geoms:
-            g = self.ds.metadata[fid].get("geometry")
+            g = self.ds.geometry(fid)
             require_geometry(g)
             self._geoms[fid] = precompute_geometry(g)
         return self._geoms[fid]
@@ -76,9 +76,33 @@ def accumulate(acc: dict, values: Mapping[str, jnp.ndarray], weight) -> dict:
     """Add the ``weight``-masked per-sample ``values`` and the weight total into ``acc``."""
     out = dict(acc)
     for k, v in values.items():
+        # per-sample values with extra axes (e.g. species) count by their mean
+        v = jnp.mean(v.reshape(v.shape[0], -1), axis=-1) if v.ndim > 1 else v
         out[k] = acc[k] + jnp.sum(v * weight)
     out["_n"] = acc["_n"] + jnp.sum(weight)
     return out
+
+
+class MultiEvaluator:
+    """Evaluators of the parts of a dataset mix, called in turn.
+
+    Metrics and plots carry the part name as prefix; metrics present in every part are
+    also reported unprefixed as their mean over the parts.
+    """
+
+    def __init__(self, evaluators: Mapping[str, Any]):
+        self.evaluators = dict(evaluators)
+
+    def __call__(self, model, *, epoch: int) -> tuple[dict[str, float], dict[str, Any]]:
+        metrics, plots, per_part = {}, {}, []
+        for name, ev in self.evaluators.items():
+            m, p = ev(model, epoch=epoch)
+            metrics.update({f"{name}/{k}": v for k, v in m.items()})
+            plots.update({f"{name}/{k}": v for k, v in p.items()})
+            per_part.append(m)
+        shared = set.intersection(*(set(m) for m in per_part)) if per_part else set()
+        metrics.update({k: float(np.mean([m[k] for m in per_part])) for k in shared})
+        return metrics, plots
 
 
 class BaseEvaluator:
@@ -119,6 +143,11 @@ class BaseEvaluator:
     @property
     def is_rank0(self) -> bool:
         return self.dist.is_rank0
+
+    def plot_plan(self, epoch: int) -> int:
+        """Number of this process's validation batch whose first sample is plotted at ``epoch``."""
+        numbers = [plan.number for plan in self.plans]
+        return int(numbers[np.random.default_rng(epoch).integers(len(numbers))]) if numbers else -1
 
     @property
     def geometry(self) -> dict:
@@ -166,9 +195,9 @@ class BaseEvaluator:
         from neugk_jax.evaluate import metrics as m
 
         if self.dist.num_processes > 1:
-            n_ky = int(self.ds.resolution[-1])
-            packed = self.sum_process_arrays(m.pack_spectral_store(store, len(self.ds.files), n_ky))
-            store = m.unpack_spectral_store(packed, n_ky)
+            n_ky, n_sp = int(self.ds.resolution[-1]), int(getattr(self.ds, "n_species", 1))
+            packed = m.pack_spectral_store(store, len(self.ds.files), n_ky, n_sp)
+            store = m.unpack_spectral_store(self.sum_process_arrays(packed), n_ky, n_sp)
         return m.merged_spectral_metrics(store)
 
     def sum_process_arrays(self, arr: np.ndarray) -> np.ndarray:

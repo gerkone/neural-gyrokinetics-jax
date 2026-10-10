@@ -98,3 +98,27 @@ class DiT(eqx.Module):
         h = self.ape(self.act(self.encoder[0](x)))
         h = self.backbone(h, cond, key=key, inference=inference)
         return self.decoder(h)
+
+
+class KineticDiT(DiT):
+    """DiT on species-axis latents ``(species, *grid, z_dim)`` of a ``KineticSwin5DAE``.
+
+    The positional embedding spans the largest species count and is cut to the species of
+    the input, so its species slots tell the species apart.
+    """
+
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        tstep: jnp.ndarray,
+        condition: Optional[jnp.ndarray] = None,
+        *,
+        key=None,
+        inference: bool = True,
+    ) -> jnp.ndarray:
+        cond = self.time_embed(jnp.asarray(tstep).reshape((1,)))
+        if condition is not None and self.cond_embed is not None:
+            cond = jnp.concatenate([cond, self.cond_embed(condition)], axis=-1)
+        h = self.act(self.encoder[0](x)) + self.ape.pos_embed[: x.shape[0]]
+        h = self.backbone(h, cond, key=key, inference=inference)
+        return self.decoder(h)

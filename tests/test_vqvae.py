@@ -120,7 +120,7 @@ def vq_cfg(tmp_path):
 def test_vqvae_runner_step_and_eval(vq_cfg, quantizer):
     from neugk_jax.pinc.runner import VQVAERunner
     from neugk_jax.training.ddp import local_view, shard_batch
-    from neugk_jax.training.runner import train_step
+    from neugk_jax.training.step import train_step
 
     vq_cfg.model = OmegaConf.create(tiny_vq_cfg(quantizer, encoder_conditioning=["q"]))
     r = VQVAERunner(vq_cfg, output_path=vq_cfg.output_path)

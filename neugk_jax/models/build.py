@@ -1,4 +1,4 @@
-"""Model construction from configs: ``Swin5DAE`` / ``Swin5DVQVAE``, ``DiT`` and ``GyroSwinMultitask``.
+"""Model construction from configs: ``Swin5DAE`` / ``Swin5DVQVAE``, ``DiT``, ``GyroSwinMultitask``.
 
 Every builder takes a YAML path, an OmegaConf config or a mapping with a ``model`` section
 (and a ``dataset`` section for the resolution and the zonal-flow layout); the run builders
@@ -16,7 +16,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from neugk_jax.models.mup import build_multipliers, width_dims
 from neugk_jax.models.patching import CCONV_PATCHINGS
+from neugk_jax.models.utils import init_linears, zero_init_output
 from neugk_jax.utils import to_dict
 
 # df grid (vp, mu, s, x, y) of the cyclone dataset and the release checkpoints
@@ -68,6 +70,7 @@ _AE_VIT_KEYS = {
     "gated_attention",
     "modulation",
     "gradient_checkpoint",
+    "attention",
 }
 _AE_PATCH_KEYS = {
     "patch_size",
@@ -81,7 +84,24 @@ _AE_PATCH_KEYS = {
     "field",
     "grid",
 }
-_AE_BOTTLENECK_KEYS = {"dim", "depth", "num_heads", "normalized_latent", "norm_learnable", "layer"}
+_AE_BOTTLENECK_KEYS = {
+    "dim",
+    "depth",
+    "num_heads",
+    "normalized_latent",
+    "norm_learnable",
+    "input_norm",
+    "layer",
+}
+_AE_STEM_KEYS = {
+    "resolution",
+    "n_species",
+    "patch_size",
+    "window_size",
+    "in_channels",
+    "out_channels",
+    "grid",
+}
 _NO_PE = {"use_abs_pe": False, "use_rope": False}
 
 
@@ -116,16 +136,19 @@ def build_ae_from_config(
     key,
     resolution: Optional[Sequence[int]] = None,
     legacy_double_shortcut: Optional[bool] = None,
+    width: Optional[int] = None,
 ):
     """``Swin5DAE`` (``Swin5DVQVAE`` for ``model.model_type: vqvae``) of a config.
 
     ``model.encoder_conditioning`` / ``model.decoder_conditioning`` condition each path; an
     absent ``model.norm_fn`` is RMSNorm for the AE and LayerNorm for the VQ-VAE.
     ``legacy_double_shortcut`` (the doubled swin residual) defaults to
-    ``model.legacy_swin_shortcut``, else False. ``model.layer`` / ``model.bottleneck.layer`` /
+    ``model.legacy_swin_shortcut``, else False. With ``model.mup.enable`` the heads and the
+    bottleneck follow the width (``width``, default ``model.latent_dim``) and the unpatch readout
+    gets the muP multiplier and zero init. ``model.layer`` / ``model.bottleneck.layer`` /
     ``model.token_pe`` are component specs (a kind or a ``{kind, **options}`` mapping).
     """
-    from neugk_jax.pinc import Swin5DAE, Swin5DVQVAE
+    from neugk_jax.pinc import KineticSwin5DAE, Swin5DAE, Swin5DVQVAE
 
     cfg = to_dict(cfg_path)
     mcfg = cfg["model"]
@@ -133,12 +156,34 @@ def build_ae_from_config(
     enc_cond, dec_cond = ae_conditioning(mcfg)
     _check_ae(mcfg, bool(enc_cond or dec_cond))
     vit, patch, bn = mcfg.get("vit", {}), mcfg.get("patch", {}), mcfg.get("bottleneck", {})
+    mup = mcfg.get("mup") or {}
+    dims = {
+        "latent_dim": mcfg["latent_dim"],
+        "num_heads": vit["num_heads"],
+        "bottleneck_dim": bn.get("dim"),
+        "bottleneck_num_heads": bn.get("num_heads", 2),
+    }
+    readout_mult = 1.0
+    if mup.get("enable"):
+        if mcfg.get("zero_init_output"):
+            raise ValueError(
+                "model.zero_init_output with muP: the muP readout is zero-initialized instead"
+            )
+        dims = width_dims(
+            width or mcfg["latent_dim"], mup.get("head_dim", 64), mup.get("bottleneck_ratio", 2)
+        )
+        n_layers = mcfg.get(
+            "num_layers", len(vit["depth"]) if isinstance(vit["depth"], (list, tuple)) else 4
+        )
+        dims["num_heads"] = [dims["num_heads"]] * int(n_layers)
+        readout_mult = (
+            float(mup.get("output_mult", 1.0)) * mup.get("base_width", 128) / dims["latent_dim"]
+        )
     validate_keys("model.vit", vit, _AE_VIT_KEYS, _NO_PE)
     validate_keys("model.patch", patch, _AE_PATCH_KEYS)
     validate_keys("model.bottleneck", bn, _AE_BOTTLENECK_KEYS)
     dataset = cfg.get("dataset", {})
     depth = vit["depth"]
-    cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
     patching = patch.get("type", "linear")
     # continuous-convolution patching: options from model.patch.field, coordinates from model.patch.grid
     patching_kwargs = (
@@ -146,61 +191,98 @@ def build_ae_from_config(
         if patching in CCONV_PATCHINGS
         else {}
     )
-    return force_f32(
-        cls(
-            space=5,
-            decouple_mu=mcfg.get("decouple_mu", True),
-            dim=mcfg["latent_dim"],
-            base_resolution=list(resolution or dataset.get("resolution") or RESOLUTION),
-            in_channels=dataset.get("in_channels", _df_channels(dataset)),
-            out_channels=dataset.get("out_channels", _df_channels(dataset)),
-            patch_size=patch["patch_size"],
-            window_size=patch["window_size"],
-            depth=depth,
-            num_heads=vit["num_heads"],
-            num_layers=mcfg.get(
-                "num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4
-            ),
-            bottleneck_dim=bn.get("dim"),
-            bottleneck_depth=bn.get("depth", 2),
-            bottleneck_num_heads=bn.get("num_heads", 2),
-            hidden_mlp_ratio=mcfg.get("hidden_mlp_ratio", 2.0),
-            merging_hidden_ratio=patch.get("merging_hidden_ratio", 8.0),
-            unmerging_hidden_ratio=patch.get("unmerging_hidden_ratio", 8.0),
-            merging_depth=patch.get("merging_depth", 2),
-            unmerging_depth=patch.get("unmerging_depth", 2),
-            c_multiplier=int(patch.get("c_multiplier", 2)),
-            drop_path=float(vit.get("drop_path", 0.1)),
-            normalized_latent=bn.get("normalized_latent", False),
-            qkv_bias=vit.get("qkv_bias", False),
-            qk_norm=vit.get("qk_norm", True),
-            use_rpb=vit.get("use_rpb", True),
-            gated_attention=vit.get("gated_attention", False),
-            norm_affine=False,
-            rms_norm=mcfg.get("norm_fn", "LayerNorm" if vq else "RMSNorm") == "RMSNorm",
-            legacy_double_shortcut=_legacy_shortcut(mcfg, legacy_double_shortcut),
-            use_checkpoint=bool(vit.get("gradient_checkpoint", False)),
-            encoder_conditioning=enc_cond,
-            decoder_conditioning=dec_cond,
-            patching=patching,
-            patching_kwargs=patching_kwargs,
-            # component specs (a kind or {kind, **options}), validated by their factories
-            layer=mcfg.get("layer", "swin"),
-            bottleneck_layer=bn.get("layer", "vit"),
-            token_pe=mcfg.get("token_pe"),
-            key=key,
+    stems = mcfg.get("stems")
+    if stems:
+        if vq:
+            raise NotImplementedError("model.stems with model_type vqvae")
+        for name, spec in stems.items():
+            validate_keys(f"model.stems.{name}", spec, _AE_STEM_KEYS)
+        # species-axis autoencoder: per-stem grids, the patch / window defaults from model.patch
+        cls = partial(
+            KineticSwin5DAE,
+            stems={n: {"patch_size": patch["patch_size"], **s} for n, s in stems.items()},
+            n_species=max(int(s.get("n_species", 1)) for s in stems.values()),
         )
+        grid = {}
+    else:
+        cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
+        grid = dict(
+            space=5,
+            base_resolution=list(resolution or dataset.get("resolution") or RESOLUTION),
+            patch_size=patch["patch_size"],
+        )
+    model = cls(
+        **grid,
+        decouple_mu=mcfg.get("decouple_mu", True),
+        dim=dims["latent_dim"],
+        in_channels=dataset.get("in_channels", _df_channels(dataset)),
+        out_channels=dataset.get("out_channels", _df_channels(dataset)),
+        window_size=patch["window_size"],
+        depth=depth,
+        num_heads=dims["num_heads"],
+        num_layers=mcfg.get("num_layers", len(depth) if isinstance(depth, (list, tuple)) else 4),
+        bottleneck_dim=dims["bottleneck_dim"],
+        bottleneck_depth=bn.get("depth", 2),
+        bottleneck_num_heads=dims["bottleneck_num_heads"],
+        hidden_mlp_ratio=mcfg.get("hidden_mlp_ratio", 2.0),
+        merging_hidden_ratio=patch.get("merging_hidden_ratio", 8.0),
+        unmerging_hidden_ratio=patch.get("unmerging_hidden_ratio", 8.0),
+        merging_depth=patch.get("merging_depth", 2),
+        unmerging_depth=patch.get("unmerging_depth", 2),
+        c_multiplier=int(patch.get("c_multiplier", 2)),
+        drop_path=float(vit.get("drop_path", 0.1)),
+        normalized_latent=bn.get("normalized_latent", False),
+        input_norm=bool(bn.get("input_norm", False)),
+        qkv_bias=vit.get("qkv_bias", False),
+        qk_norm=vit.get("qk_norm", True),
+        use_rpb=vit.get("use_rpb", True),
+        gated_attention=vit.get("gated_attention", False),
+        norm_affine=False,
+        rms_norm=mcfg.get("norm_fn", "LayerNorm" if vq else "RMSNorm") == "RMSNorm",
+        legacy_double_shortcut=_legacy_shortcut(mcfg, legacy_double_shortcut),
+        use_checkpoint=bool(vit.get("gradient_checkpoint", False)),
+        encoder_conditioning=enc_cond,
+        decoder_conditioning=dec_cond,
+        readout_mult=readout_mult,
+        attention=vit.get("attention", "einsum"),
+        patching=patching,
+        patching_kwargs=patching_kwargs,
+        # component specs (a kind or {kind, **options}), validated by their factories
+        layer=mcfg.get("layer", "swin"),
+        bottleneck_layer=bn.get("layer", "vit"),
+        token_pe=mcfg.get("token_pe"),
+        key=key,
+    )
+    model = init_linears(model, mcfg.get("init_weights"), key=jax.random.fold_in(key, 1))
+    if mup.get("enable") and mup.get("readout_zero_init", True):
+        # the readout is the first linear of a linear unpatch, the last of a cconv one
+        model = zero_init_output(model, layer=-1 if patching in CCONV_PATCHINGS else 0)
+    return force_f32(zero_init_output(model) if mcfg.get("zero_init_output") else model)
+
+
+def mup_multipliers(cfg, ds, model, mask) -> tuple:
+    """muP ``(lr_mult, wd_mult)`` pytrees of the AE ``model`` of a run config (``model.mup``)."""
+    rc = run_config(cfg, ds)
+    mup = rc["model"]["mup"]
+    build = lambda w: build_ae_from_config(rc, key=jax.random.PRNGKey(0), width=w)
+    return build_multipliers(
+        build, model, mask, int(mup.get("base_width", 128)), int(mup.get("delta_width", 256))
     )
 
 
 def build_dit_from_config(cfg_path, ae, *, key):
-    """``DiT`` of a config whose latent grid and width match the AE bottleneck."""
-    from neugk_jax.diffusion.dit import DiT
+    """``DiT`` of a config whose latent grid and width match the AE bottleneck.
+
+    A species-axis AE (``KineticSwin5DAE``) gets a ``KineticDiT``.
+    """
+    from neugk_jax.diffusion.dit import DiT, KineticDiT
+    from neugk_jax.pinc import KineticSwin5DAE
 
     mcfg = to_dict(cfg_path)["model"]
     vit = mcfg["vit"]
+    cls = KineticDiT if isinstance(ae, KineticSwin5DAE) else DiT
     return force_f32(
-        DiT(
+        cls(
             z_dim=int(ae.bottleneck_dim),
             dim=mcfg["latent_dim"],
             grid_size=tuple(ae.bottleneck_grid_size),
@@ -374,17 +456,34 @@ def build_release_gyroswin(cfg_path, *, key, resolution: Optional[Sequence[int]]
 
 
 def run_config(cfg, ds=None) -> dict:
-    """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf.
+    """``{"model", "dataset", "training"}`` dict of a run config; ``ds`` fixes resolution and zf.
 
-    With a continuous-convolution ``model.patch.type`` (cconv, tucker) the patch coordinates come from ``ds`` (:func:`field_grid`).
+    ``model.stems`` take their resolution, species and channels from the dataset part of the
+    same name (the dataset itself for a single stem). With a continuous-convolution
+    ``model.patch.type`` (cconv, tucker) the patch coordinates of every stem, else of the model,
+    come from ``ds`` (:func:`field_grid`).
     """
     out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
         out["dataset"]["resolution"] = [int(r) for r in ds.resolution]
         out["dataset"]["separate_zf"] = bool(ds.separate_zf)
-        patch = (out["model"] or {}).get("patch") or {}
-        if patch.get("type") in CCONV_PATCHINGS:
-            patch.setdefault("grid", field_grid(ds, fold_mu=out["model"].get("decouple_mu", True)))
+        patch = out["model"].get("patch") or {}
+        cconv = patch.get("type") in CCONV_PATCHINGS
+        fold_mu = out["model"].get("decouple_mu", True)
+        stems = out["model"].get("stems") or {}
+        parts = getattr(ds, "parts", None) or {}
+        for name, spec in stems.items():
+            part = parts.get(name, ds if len(stems) == 1 else None)
+            if part is None:
+                raise KeyError(f"model.stems.{name} has no dataset part {name!r}")
+            spec.setdefault("resolution", [int(r) for r in part.resolution])
+            spec.setdefault("n_species", int(part.n_species))
+            spec.setdefault("in_channels", _df_channels({"separate_zf": part.separate_zf}))
+            spec.setdefault("out_channels", spec["in_channels"])
+            if cconv:
+                spec.setdefault("grid", field_grid(part, fold_mu=fold_mu))
+        if cconv and not stems:
+            patch.setdefault("grid", field_grid(ds, fold_mu=fold_mu))
     return out
 
 

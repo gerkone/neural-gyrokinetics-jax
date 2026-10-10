@@ -34,7 +34,7 @@ def test_pinc_losses_identity_gradient_and_core_agreement():
     # only the mean |pflux| of the target remains
     assert ident["flux_int"] < 1e-12
     np.testing.assert_allclose(p["phi"][0], phi, rtol=1e-12)
-    np.testing.assert_allclose([p["eflux"][0], q_total], [eflux] * 2, rtol=1e-10)
+    np.testing.assert_allclose([p["eflux"][0][0], q_total], [eflux[0]] * 2, rtol=1e-10)
 
     geom32 = jax.tree_util.tree_map(lambda a: np.asarray(a, np.float32), geom)
     tgt32 = jnp.asarray(tgt, jnp.float32)
@@ -128,7 +128,7 @@ def test_pinc_runner_trains_and_validates(tmp_path, stage):
     from neugk_jax.pinc.peft import PINCPEFTRunner
     from neugk_jax.training.checkpoint import save_model_only
     from neugk_jax.training.ddp import local_view, shard_batch
-    from neugk_jax.training.runner import train_step
+    from neugk_jax.training.step import train_step
 
     for i, f in enumerate((2.0, 3.0, 0.5)):
         _make_traj(tmp_path, f"iteration_{i}", n_t=6, flux=f)

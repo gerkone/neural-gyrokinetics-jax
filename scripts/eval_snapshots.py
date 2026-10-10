@@ -57,7 +57,7 @@ def snapshot_metrics(model, batch, norm, geom):
     return {
         "psnr": _psnr(p, t),
         "phi_psnr": _psnr(p_phi, t_phi),
-        "eflux_l1": jnp.abs(p_q - t_q),
+        "eflux_l1": jnp.mean(jnp.abs(p_q - t_q), axis=-1),
         "df_rel_l2": per_sample_rel_l2(p, t),
     }
 

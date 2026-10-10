@@ -55,6 +55,33 @@ def spec_to_phi(spec, shape: Optional[Sequence[int]] = None):
     return xp.fft.irfftn(spec, axes=(0, 2), norm="forward", s=(nkx, nky))
 
 
+def _crop_modes(f, n: int, axis: int):
+    xp = f.__array_namespace__()
+    nx = f.shape[axis]
+    spec = xp.fft.fftshift(xp.fft.fft(f, axis=axis, norm="forward"), axes=axis)
+    i0 = nx // 2 - n // 2
+    spec = xp.take(spec, xp.arange(i0, i0 + n), axis=axis)
+    return xp.fft.ifft(xp.fft.ifftshift(spec, axes=axis), axis=axis, norm="forward")
+
+
+def crop_kx_df(df, n: int, reim_axis: int = 0):
+    """Real-space df ``(2, ..., x, y)`` resampled to its ``n`` central kx modes.
+
+    ``reim_axis`` is the real/imaginary axis (1 for a batch).
+    """
+    xp = df.__array_namespace__()
+    df = xp.moveaxis(df, reim_axis, 0)
+    spec = df_to_spec(df)
+    i0 = (spec.shape[-2] - n) // 2
+    out = spec_to_df(spec[..., i0 : i0 + n, :]).astype(df.dtype)
+    return xp.moveaxis(out, 0, reim_axis)
+
+
+def crop_kx_phi(phi, n: int):
+    """Real potential ``(x, s, y)`` resampled to its ``n`` central kx modes."""
+    return _crop_modes(phi, n, axis=0).real.astype(phi.dtype)
+
+
 def spec_to_phi_complex(spec):
     """Complex potential of a one-sided spectrum ``(kx, s, ky)`` as ``(2, x, s, y)`` (re, im)."""
     xp = spec.__array_namespace__()

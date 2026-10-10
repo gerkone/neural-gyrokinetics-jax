@@ -26,9 +26,16 @@ def vit_layer(
     gated_attention: bool = False,
     norm_affine: bool = False,
     rms_norm: bool = False,
+    attention: str = "einsum",
 ) -> BlockStack:
     """``depth`` ViT blocks over the flattened ``(*grid, dim)`` tokens."""
-    common = dict(mlp_ratio=mlp_ratio, drop_path=drop_path, act_fn=act_fn, qkv_bias=qkv_bias)
+    common = dict(
+        mlp_ratio=mlp_ratio,
+        drop_path=drop_path,
+        act_fn=act_fn,
+        qkv_bias=qkv_bias,
+        attention=attention,
+    )
     attn_kw = dict(
         qk_norm=qk_norm, gated_attention=gated_attention, norm_affine=norm_affine, rms_norm=rms_norm
     )

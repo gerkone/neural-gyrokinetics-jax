@@ -69,7 +69,7 @@ def _build_shift_mask(
 
 
 def _window_attention(attn, x, window_size, shift_size, attn_mask):
-    """Shifted-window self-attention of ``x`` (*spatial, dim): pad, roll, partition, attend, undo."""
+    """Shifted-window attention of ``x`` (*spatial, dim): pad, roll, partition, attend, undo."""
     spatial = x.shape[:-1]
     h = pad_to_blocks(x, window_size)
     padded = h.shape[:-1]
@@ -127,6 +127,7 @@ class SwinBlock(AttentionBlockBase):
         qk_norm: bool = False,
         use_rpb: bool = False,
         gated_attention: bool = False,
+        attention: str = "einsum",
         norm_affine: bool = False,
         rms_norm: bool = False,
     ):
@@ -145,6 +146,7 @@ class SwinBlock(AttentionBlockBase):
             use_rpb=use_rpb,
             gated_attention=gated_attention,
             window_size=eff_w,
+            attention=attention,
         )
         self.mlp = MLP([dim, max(int(dim * mlp_ratio), dim), dim], key=kmlp, act_fn=act_fn)
         self.drop_path = DropPath(drop_path)
@@ -195,6 +197,7 @@ class DiTSwinBlock(AttentionBlockBase):
         qk_norm: bool = False,
         use_rpb: bool = False,
         gated_attention: bool = False,
+        attention: str = "einsum",
         rms_norm: bool = False,
     ):
         eff_w = _effective_window(grid_size, window_size)
@@ -213,6 +216,7 @@ class DiTSwinBlock(AttentionBlockBase):
             use_rpb=use_rpb,
             gated_attention=gated_attention,
             window_size=eff_w,
+            attention=attention,
         )
         self.mlp = MLP([dim, max(int(dim * mlp_ratio), dim), dim], key=kmlp, act_fn=act_fn)
         self.drop_path = DropPath(drop_path)

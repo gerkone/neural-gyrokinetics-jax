@@ -3,6 +3,7 @@
 A quantized shard sits next to its fp32 ``foo.bin`` as ``foo.<bits>.bin``::
 
     fp16 / bf16:   raw 16-bit values, no header
+    zstd16:        the bf16 values, losslessly compressed (see ``zframe``)
     i8:            float32 scale (4 bytes) || raw int8 values
     i4:            float32 scale (4 bytes) || raw uint8 nibble-packed
                    (two int4 values per byte: low nibble = index 2k,
@@ -15,9 +16,16 @@ import os
 
 import numpy as np
 
+from neugk_jax.dataset import zframe
 from neugk_jax.utils import atomic_write
 
-SUFFIX = {"fp16": ".fp16.bin", "bf16": ".bf16.bin", "i8": ".i8.bin", "i4": ".i4.bin"}
+SUFFIX = {
+    "fp16": ".fp16.bin",
+    "bf16": ".bf16.bin",
+    "zstd16": ".zstd16.bin",
+    "i8": ".i8.bin",
+    "i4": ".i4.bin",
+}
 # bytes of the float32 scale in front of the integer payloads
 HEADER_BYTES = 4
 
@@ -36,12 +44,26 @@ def sibling(fp32_path: str, bits: str) -> str:
 
 
 def resolve(fp32_path: str, prefer: str) -> tuple[str, str]:
-    """``(path, bits)`` to read: the ``prefer`` sibling when it exists, else the fp32 shard."""
-    if prefer != "fp32":
-        cand = sibling(fp32_path, prefer)
+    """``(path, bits)`` to read: the ``prefer`` sibling when it exists, else the fp32 shard.
+
+    ``zstd16`` (opt-in) falls back to the ``bf16`` sibling, which holds the same values. Without an
+    fp32 shard the first existing quantized sibling is read.
+    """
+    for bits in {"fp32": (), "zstd16": ("zstd16", "bf16")}.get(prefer, (prefer,)):
+        cand = sibling(fp32_path, bits)
         if os.path.exists(cand):
-            return cand, prefer
+            return cand, bits
+    if not os.path.exists(fp32_path):
+        for bits in ("bf16", "fp16", "i8", "i4"):
+            cand = sibling(fp32_path, bits)
+            if os.path.exists(cand):
+                return cand, bits
     return fp32_path, "fp32"
+
+
+def values(bits: str) -> str:
+    """Precision of the values a ``bits`` shard holds."""
+    return "bf16" if bits == "zstd16" else bits
 
 
 def quantize(arr_f32: np.ndarray, bits: str) -> tuple[np.ndarray, np.float32 | None]:
@@ -51,6 +73,7 @@ def quantize(arr_f32: np.ndarray, bits: str) -> tuple[np.ndarray, np.float32 | N
     formats (the dtype itself encodes magnitude). For int8/int4 it's the
     per-tensor symmetric quantization scale (``max(|x|) / qmax``).
     """
+    bits = values(bits)
     if bits == "fp16":
         return arr_f32.astype(np.float16), None
     if bits == "bf16":
@@ -77,6 +100,7 @@ def dequantize(
     payload: np.ndarray, scale: np.float32 | None, bits: str, n_elems: int
 ) -> np.ndarray:
     """Inverse of :func:`quantize` — returns fp32."""
+    bits = values(bits)
     if bits in ("fp16", "bf16"):
         return payload.astype(np.float32)
     if bits == "i8":
@@ -95,7 +119,7 @@ def dequantize(
 
 
 def payload_dtype(bits: str):
-    if bits == "bf16":
+    if values(bits) == "bf16":
         from ml_dtypes import bfloat16
 
         return bfloat16
@@ -103,9 +127,12 @@ def payload_dtype(bits: str):
 
 
 def write(dst: str, payload: np.ndarray, scale: np.float32 | None) -> int:
-    """Atomic write of one quantized shard. Returns bytes written."""
+    """Atomic write of one quantized shard (zstd-packed for ``.zstd16.bin``); returns its bytes."""
 
     def dump(f):
+        if dst.endswith(SUFFIX["zstd16"]):
+            f.write(zframe.encode(payload))
+            return
         if scale is not None:
             f.write(np.float32(scale).tobytes())
         f.write(payload.tobytes())
@@ -116,6 +143,11 @@ def write(dst: str, payload: np.ndarray, scale: np.float32 | None) -> int:
 
 def read(path: str, bits: str, n_elems: int) -> np.ndarray:
     """Read and dequantize a quantized shard of ``n_elems`` values."""
+    if bits == "zstd16":
+        payload = zframe.decode(np.fromfile(path, dtype=np.uint8)).view(payload_dtype(bits))
+        if payload.size != n_elems:
+            raise IOError(f"{path}: expected {n_elems} zstd16 values, got {payload.size}")
+        return dequantize(payload, None, bits, n_elems)
     with open(path, "rb") as f:
         scale = (
             np.frombuffer(f.read(HEADER_BYTES), dtype=np.float32)[0] if has_header(bits) else None

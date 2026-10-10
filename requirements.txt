@@ -2,7 +2,7 @@
 jax>=0.4.30
 jaxlib>=0.4.30
 equinox>=0.11.0
-optax>=0.2.0
+optax>=0.2.5  # optax.contrib.muon
 ml-dtypes>=0.4               # bf16 numpy dtype (quantize pipeline + bf16 reads)
 
 # Hydra / config / yaml
