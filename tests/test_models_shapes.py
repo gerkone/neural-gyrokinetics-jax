@@ -16,8 +16,8 @@ from neugk_jax.models import (
     LayerNorm,
     Linear,
     PatchEmbed,
-    PatchExpand,
-    PatchMerge,
+    TokenExpand,
+    TokenMerge,
     pad_to_blocks,
     swin_layer,
     unpad,
@@ -92,11 +92,11 @@ def test_patch_embed():
 
 def test_patch_merge_then_expand():
     grid = (8, 12, 4)
-    merge = PatchMerge(dim=16, grid_size=grid, key=jr.PRNGKey(0), c_multiplier=2)
+    merge = TokenMerge(dim=16, grid_size=grid, key=jr.PRNGKey(0), c_multiplier=2)
     x = jr.normal(jr.PRNGKey(1), (*grid, 16))
     y = merge(x)
     assert y.shape == (*merge.target_grid_size, merge.out_dim)
-    expand = PatchExpand(
+    expand = TokenExpand(
         dim=merge.out_dim,
         grid_size=merge.target_grid_size,
         key=jr.PRNGKey(2),

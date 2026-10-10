@@ -9,31 +9,36 @@ sorted union of both key sets.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 import equinox as eqx
 import jax.numpy as jnp
 import jax.random as jr
 
+from neugk_jax.models.base import TokenLayerBase
 from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet
-from neugk_jax.models.patching import PatchExpand
-from neugk_jax.models.swin import BlockStack
+from neugk_jax.models.layers import token_layer
+from neugk_jax.models.spec import Spec
+from neugk_jax.models.tokens import TokenExpand
 from neugk_jax.models.utils import LayerNorm, Linear, gelu, split_key
-from neugk_jax.models.vit import vit_layer
 
 
 class Swin5DAE(eqx.Module):
-    """Wraps Swin5DUnet with a bottleneck projection."""
+    """Wraps Swin5DUnet with a bottleneck projection.
+
+    ``layer`` / ``bottleneck_layer`` are the token-layer specs of the U-Net stages and of the two
+    bottleneck stages; ``patching`` and ``token_pe`` as for :class:`SwinNDUnet`.
+    """
 
     backbone: Swin5DUnet
     enc_cond_embed: Optional[ContinuousConditionEmbed]
     dec_cond_embed: Optional[ContinuousConditionEmbed]
-    middle_pre: BlockStack
-    middle_post: BlockStack
+    middle_pre: TokenLayerBase
+    middle_post: TokenLayerBase
     middle_downproj: Linear
     middle_upproj: Linear
-    middle_upscale: PatchExpand
+    middle_upscale: TokenExpand
     pre_z_norm: Optional[LayerNorm]
     post_z_norm: Optional[LayerNorm]
 
@@ -82,6 +87,11 @@ class Swin5DAE(eqx.Module):
         encoder_conditioning: Sequence[str] = (),
         decoder_conditioning: Sequence[str] = (),
         cond_embed_dim: int = 32,
+        patching: Spec = "linear",
+        patching_kwargs: Optional[Mapping] = None,
+        layer: Spec = "swin",
+        bottleneck_layer: Spec = "vit",
+        token_pe: Optional[Spec] = None,
         key,
     ):
         kb, k1, k2, k3, k4, k5 = jr.split(key, 6)
@@ -132,6 +142,10 @@ class Swin5DAE(eqx.Module):
             decoder_rms_norm=decoder_rms_norm,
             enc_cond_dim=enc_cdim,
             dec_cond_dim=dec_cdim,
+            patching=patching,
+            patching_kwargs=patching_kwargs,
+            layer=layer,
+            token_pe=token_pe,
             # ae has no encoder→decoder skips and its own bottleneck
             up_use_skip=False,
             build_middle=False,
@@ -157,15 +171,31 @@ class Swin5DAE(eqx.Module):
             norm_affine=True,
             rms_norm=rms_norm,
         )
-        self.middle_pre = vit_layer(
-            mid_dim, bottleneck_depth, bottleneck_num_heads, key=k1, cond_dim=enc_cdim, **vit_kw
+        # a windowed bottleneck layer takes the whole grid as its window
+        grid_kw = dict(grid_size=mid_grid, window_size=mid_grid)
+        self.middle_pre = token_layer(
+            bottleneck_layer,
+            mid_dim,
+            bottleneck_depth,
+            bottleneck_num_heads,
+            key=k1,
+            cond_dim=enc_cdim,
+            **grid_kw,
+            **vit_kw,
         )
-        self.middle_post = vit_layer(
-            mid_dim, bottleneck_depth, bottleneck_num_heads, key=k2, cond_dim=dec_cdim, **vit_kw
+        self.middle_post = token_layer(
+            bottleneck_layer,
+            mid_dim,
+            bottleneck_depth,
+            bottleneck_num_heads,
+            key=k2,
+            cond_dim=dec_cdim,
+            **grid_kw,
+            **vit_kw,
         )
         self.middle_downproj = Linear(mid_dim, bd, key=k3)
         self.middle_upproj = Linear(bd, mid_dim, key=k4)
-        self.middle_upscale = PatchExpand(
+        self.middle_upscale = TokenExpand(
             mid_dim,
             mid_grid,
             key=k5,
@@ -195,17 +225,19 @@ class Swin5DAE(eqx.Module):
         return z, {}
 
     def encode(
-        self, df: jnp.ndarray, condition=None, *, key=None, inference: bool = True
+        self, df: jnp.ndarray, condition=None, *, geometry=None, key=None, inference: bool = True
     ) -> jnp.ndarray:
         cond = self._embed(self.enc_cond_embed, condition, self.enc_indices)
         keys = split_key(key, len(self.backbone.down_blocks) + 1)
-        z = self.backbone.patch_encode(df)
+        z = self.backbone.patch_encode(df, geometry)
         for blk, k in zip(self.backbone.down_blocks, keys):
             z = blk(z, cond, return_skip=False, key=k, inference=inference)
         z = self.middle_downproj(self.middle_pre(z, cond, key=keys[-1], inference=inference))
         return self.pre_z_norm(z) if self.normalized_latent else z
 
-    def decode(self, z: jnp.ndarray, condition=None, *, key=None, inference: bool = True):
+    def decode(
+        self, z: jnp.ndarray, condition=None, *, geometry=None, key=None, inference: bool = True
+    ):
         cond = self._embed(self.dec_cond_embed, condition, self.dec_indices)
         keys = split_key(key, len(self.backbone.up_blocks) + 1)
         if self.normalized_latent:
@@ -215,7 +247,7 @@ class Swin5DAE(eqx.Module):
         # no skip connections in the ae decoder
         for blk, k in zip(self.backbone.up_blocks, keys[1:]):
             z = blk(z, None, cond, key=k, inference=inference)
-        return {"df": self.backbone.patch_decode(z, cond)}
+        return {"df": self.backbone.patch_decode(z, cond, geometry)}
 
     def __call__(
         self,
@@ -223,13 +255,14 @@ class Swin5DAE(eqx.Module):
         condition=None,
         return_latent: bool = False,
         *,
+        geometry=None,
         key=None,
         inference: bool = True,
     ):
         k_enc, k_dec = split_key(key, 2)
-        z = self.encode(df, condition, key=k_enc, inference=inference)
+        z = self.encode(df, condition, geometry=geometry, key=k_enc, inference=inference)
         z, extra = self.bottleneck(z, inference=inference)
-        out = self.decode(z, condition, key=k_dec, inference=inference)
+        out = self.decode(z, condition, geometry=geometry, key=k_dec, inference=inference)
         out.update(extra)
         if return_latent:
             out["latent"] = z
