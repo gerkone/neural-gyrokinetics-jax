@@ -7,6 +7,7 @@ defaults:
 training:
   optimizer: muon
   muon_learning_rate: 0.02
+  muon_patching: true
   batch_size: 4
   n_epochs: 200
   # reader threads and batches in flight
@@ -20,7 +21,7 @@ model:
   hidden_mlp_ratio: 4.0
   # latent stays at 512 channels (compression as at width 1024)
   mup: {bottleneck_ratio: 3}
-  patch: {type: cconv}
+  patch: {type: cconv, field: {rank: 96, code_modes: [1, 2, 2, 3, 2]}}
 validation:
   # one sample per device
   batch_size: 1
