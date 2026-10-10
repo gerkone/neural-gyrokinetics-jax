@@ -13,15 +13,15 @@ from neugk_jax.models.base import (
     TokenLayerBase,
     TokenResamplerBase,
 )
-from neugk_jax.models.patching import FieldPatchEmbed, FieldUnpatch, LinearUnpatch, PatchEmbed
+from neugk_jax.models.patching import CConvPatchEmbed, CConvUnpatch, LinearUnpatch, PatchEmbed
 from neugk_jax.models.swin import swin_layer
 from neugk_jax.models.tokens import TokenExpand, TokenMerge
 from neugk_jax.models.vit import vit_layer
 
 
 def test_patching_interfaces():
-    assert issubclass(PatchEmbed, GridEncoderBase) and issubclass(FieldPatchEmbed, GridEncoderBase)
-    assert issubclass(LinearUnpatch, GridDecoderBase) and issubclass(FieldUnpatch, GridDecoderBase)
+    assert issubclass(PatchEmbed, GridEncoderBase) and issubclass(CConvPatchEmbed, GridEncoderBase)
+    assert issubclass(LinearUnpatch, GridDecoderBase) and issubclass(CConvUnpatch, GridDecoderBase)
     with pytest.raises(TypeError):
         GridEncoderBase()
 

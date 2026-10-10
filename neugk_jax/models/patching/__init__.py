@@ -1,8 +1,8 @@
 """Patch embedding / unpatch layers (grid encoders / decoders).
 
 ``linear``: ``PatchEmbed`` / ``LinearUnpatch`` with weights tied to the patch size. ``points``: patch
-point coordinates (``PointGrid``). ``field``: ``SmoothPatchEmbed`` / ``SmoothUnpatch`` and
-``DCTPatchEmbed`` / ``DCTUnpatch``, whose weights are functions of the point coordinates.
+point coordinates (``PointGrid``). ``cconv``: strided continuous convolutions,
+``BandLimitedPatchEmbed`` / ``BandLimitedUnpatch`` and ``TuckerPatchEmbed`` / ``TuckerUnpatch``.
 :data:`PATCHINGS` maps a patching kind to its embedding / unpatch pair. The fold / unfold / padding ops
 live in :mod:`neugk_jax.models.ops` and are re-exported here.
 """
@@ -15,37 +15,37 @@ from neugk_jax.models.ops import (
     unfold_patches,
     unpad,
 )
-from neugk_jax.models.patching.field import (
-    DCTPatchEmbed,
-    DCTUnpatch,
-    FieldPatchEmbed,
-    FieldUnpatch,
-    SmoothPatchEmbed,
-    SmoothUnpatch,
+from neugk_jax.models.patching.cconv import (
+    BandLimitedPatchEmbed,
+    BandLimitedUnpatch,
+    CConvPatchEmbed,
+    CConvUnpatch,
+    TuckerPatchEmbed,
+    TuckerUnpatch,
 )
 from neugk_jax.models.patching.linear import LinearUnpatch, PatchEmbed
 from neugk_jax.models.patching.points import AxisPoints, PointGrid
 
 PATCHINGS = {
     "linear": (PatchEmbed, LinearUnpatch),
-    "smooth": (SmoothPatchEmbed, SmoothUnpatch),
-    "dct": (DCTPatchEmbed, DCTUnpatch),
+    "cconv": (BandLimitedPatchEmbed, BandLimitedUnpatch),
+    "tucker": (TuckerPatchEmbed, TuckerUnpatch),
 }
-FIELD_PATCHINGS = ("smooth", "dct")
+CCONV_PATCHINGS = ("cconv", "tucker")
 
 __all__ = [
-    "FIELD_PATCHINGS",
+    "CCONV_PATCHINGS",
     "PATCHINGS",
     "AxisPoints",
-    "DCTPatchEmbed",
-    "DCTUnpatch",
-    "FieldPatchEmbed",
-    "FieldUnpatch",
+    "BandLimitedPatchEmbed",
+    "BandLimitedUnpatch",
+    "CConvPatchEmbed",
+    "CConvUnpatch",
     "LinearUnpatch",
     "PatchEmbed",
     "PointGrid",
-    "SmoothPatchEmbed",
-    "SmoothUnpatch",
+    "TuckerPatchEmbed",
+    "TuckerUnpatch",
     "_normalize_patch",
     "fold_patches",
     "pad_amounts",

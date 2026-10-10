@@ -1,8 +1,8 @@
-"""Diagram of smooth field patching with linear heads, as one SVG (formulas as MathJax paths).
+"""Diagram of the band-limited continuous convolution with linear heads, as one SVG (formulas as MathJax paths).
 
-The drawings come from a trained model on a real frame (``extract_smooth.py``). Needs node with
+The drawings come from a trained model on a real frame (``extract_cconv.py``). Needs node with
 ``mathjax-full`` (``NODE_PATH`` pointing at its ``node_modules``) for ``tex2svg.js``.
-Usage: smooth_diagram.py <data.npz> <out.svg>
+Usage: cconv_diagram.py <data.npz> <out.svg>
 """
 
 import json

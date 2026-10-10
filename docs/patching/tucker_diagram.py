@@ -1,28 +1,15 @@
-"""Diagram of DCT field patching with linear heads, as one SVG (same style as ``smooth_diagram.py``).
+"""Diagram of the Tucker continuous convolution with linear heads, as one SVG (same style as ``cconv_diagram.py``).
 
-The drawings come from a trained model on a real frame (``extract_dct.py``).
-Usage: dct_diagram.py <data.npz> <out.svg>
+The drawings come from a trained model on a real frame (``extract_tucker.py``).
+Usage: tucker_diagram.py <data.npz> <out.svg>
 """
 
 import sys
 from pathlib import Path
 
+import cconv_diagram as sd
 import numpy as np
-import smooth_diagram as sd
-from smooth_diagram import (
-    ACCENT,
-    CW,
-    INK,
-    MUTED,
-    Canvas,
-    M,
-    card,
-    dots,
-    heat,
-    label,
-    matrix,
-    vstrip,
-)
+from cconv_diagram import ACCENT, CW, INK, MUTED, Canvas, M, card, dots, heat, label, matrix, vstrip
 
 AXES = [r"v_\parallel", "s", "x", "y", r"\mu"]
 

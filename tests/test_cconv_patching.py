@@ -1,4 +1,4 @@
-"""Field patching: drop-in swap for the linear patch embedding / unpatch."""
+"""Continuous-convolution patching: drop-in swap for the linear patch embedding / unpatch."""
 
 from __future__ import annotations
 
@@ -13,21 +13,21 @@ from neugk_jax.models.build import build_ae_from_config
 from neugk_jax.models.gk_unet import SwinNDUnet, patching_options
 from neugk_jax.models.patching import (
     PATCHINGS,
-    DCTPatchEmbed,
-    DCTUnpatch,
-    FieldPatchEmbed,
-    FieldUnpatch,
+    BandLimitedPatchEmbed,
+    CConvPatchEmbed,
+    CConvUnpatch,
     LinearUnpatch,
     PatchEmbed,
     PointGrid,
-    SmoothPatchEmbed,
+    TuckerPatchEmbed,
+    TuckerUnpatch,
     fold_patches,
 )
 from neugk_jax.pinc import Swin5DAE
 
 BASE = (8, 4, 4, 8, 4)
-SMALL = {"smooth": dict(rank=8), "dct": dict(hidden=8)}
-KINDS = ["smooth", "dct"]
+SMALL = {"cconv": dict(rank=8), "tucker": dict(hidden=8)}
+KINDS = ["cconv", "tucker"]
 
 
 def field_pair(kind, patch=(2, 5), base=(4, 10), channels=3, dim=8, **kw):
@@ -121,8 +121,8 @@ def test_linear_is_the_default():
 def test_generic_nd_swap(kind):
     linear = unet("linear")
     field = unet(kind, **SMALL[kind])
-    assert isinstance(field.patch_embed, FieldPatchEmbed) and isinstance(
-        field.unpatch, FieldUnpatch
+    assert isinstance(field.patch_embed, CConvPatchEmbed) and isinstance(
+        field.unpatch, CConvUnpatch
     )
     x = jr.normal(jr.PRNGKey(1), (3, 8, 6, 8))
     z = field.patch_encode(x)
@@ -158,7 +158,7 @@ def test_default_heads_are_linear_in_the_data(kind):
 @pytest.mark.parametrize("kind", KINDS)
 def test_one_set_of_weights_on_two_resolutions(kind):
     # x refined by 2 with the same physical patch: the weights of one grid run on the other
-    extra = {"smooth": dict(code_modes=[1, 2]), "dct": dict(ranks=[2, 10])}[kind]
+    extra = {"cconv": dict(code_modes=[1, 2]), "tucker": dict(ranks=[2, 10])}[kind]
     embed, unpatch = field_pair(kind, grid=refined(0.2), zero_init=False, **extra)
     fine = PointGrid((4, 20), (2, 10), 3, refined(0.1))
     x = jr.normal(jr.PRNGKey(2), (4, 20, 3))
@@ -172,8 +172,8 @@ def test_one_basis_for_every_channel(kind):
     # rolling the channels of the input rolls the channels of the projections
     embed, unpatch = field_pair(kind, zero_init=False)
     x = jr.normal(jr.PRNGKey(2), (4, 10, 3))
-    # smooth projections are (code mode, channel, rank), dct cores (*ranks, channel)
-    shape, axis = ((2, 2, -1, 3, 8), -2) if kind == "smooth" else ((2, 2, *embed.ranks, 3), -1)
+    # cconv projections are (code mode, channel, rank), tucker cores (*ranks, channel)
+    shape, axis = ((2, 2, -1, 3, 8), -2) if kind == "cconv" else ((2, 2, *embed.ranks, 3), -1)
     h, rolled = (
         embed.project(fold_patches(v, embed.grid.patch)).reshape(shape)
         for v in (x, jnp.roll(x, 1, -1))
@@ -201,7 +201,7 @@ def test_build_from_config():
         merging_hidden_ratio=2.0,
         unmerging_hidden_ratio=2.0,
         c_multiplier=2,
-        type="smooth",
+        type="cconv",
         field={"rank": 16},
         grid=grid_5d(),
     )
@@ -216,30 +216,30 @@ def test_build_from_config():
         "dataset": {"resolution": list(BASE), "separate_zf": False},
     }
     ae = build_ae_from_config(cfg, key=jr.PRNGKey(0))
-    assert isinstance(ae.backbone.patch_embed, SmoothPatchEmbed)
+    assert isinstance(ae.backbone.patch_embed, BandLimitedPatchEmbed)
     assert ae(jnp.zeros((2, *BASE)))["df"].shape == (2, *BASE)
 
 
 def test_unknown_option_raises():
     with pytest.raises(ValueError, match="unknown patching options"):
-        unet("smooth", rnk=4)
+        unet("cconv", rnk=4)
     # an option of the other field kind is unknown too
     with pytest.raises(ValueError, match="unknown patching options"):
-        unet("dct", code_modes=(1, 1))
+        unet("tucker", code_modes=(1, 1))
 
 
-def dct_on(grid_shape, patch, ranks, spec):
-    """A dct embedding of one channel on its own grid."""
-    return DCTPatchEmbed(
+def tucker_on(grid_shape, patch, ranks, spec):
+    """A tucker embedding of one channel on its own grid."""
+    return TuckerPatchEmbed(
         grid_shape, patch, 1, 4, key=jr.PRNGKey(0), ranks=ranks, hidden=8, grid=spec
     )
 
 
-def test_dct_at_full_rank_starts_exact():
+def test_tucker_at_full_rank_starts_exact():
     # orthonormal dct modes at full rank: projection then synthesis is the identity on every patch
     spec, patch = {"axes": [{"kind": "relative"}] * 3}, (3, 2, 5)
-    embed = dct_on((6, 4, 10), patch, patch, spec)
-    unpatch = DCTUnpatch(
+    embed = tucker_on((6, 4, 10), patch, patch, spec)
+    unpatch = TuckerUnpatch(
         4, (2, 2, 2), key=jr.PRNGKey(1), expand_by=patch, out_channels=1, ranks=patch, grid=spec
     )
     p = fold_patches(jr.normal(jr.PRNGKey(1), (6, 4, 10, 1)), patch)
@@ -248,25 +248,25 @@ def test_dct_at_full_rank_starts_exact():
     np.testing.assert_allclose(back, p, atol=1e-4)
 
 
-def test_dct_modes_stop_at_the_band():
+def test_tucker_modes_stop_at_the_band():
     # data resolving 5 modes per patch, sampled on 10 points: modes above the band are cut
-    embed = dct_on((10,), (10,), (10,), {"axes": [{"kind": "relative", "band": 5}]})
+    embed = tucker_on((10,), (10,), (10,), {"axes": [{"kind": "relative", "band": 5}]})
     assert embed.grid.axes[0].cap == 5
-    b = embed.basis()[0]
+    b = embed.kernel()[0]
     assert float(jnp.abs(b[:, 5:]).max()) == 0.0 and float(jnp.abs(b[:, :5]).max()) > 0
 
 
-def test_learned_dct_off_init_on_a_refined_grid():
-    embed, unpatch = field_pair("dct", grid=refined(0.2), zero_init=False, ranks=[2, 4])
+def test_tucker_off_init_on_a_refined_grid():
+    embed, unpatch = field_pair("tucker", grid=refined(0.2), zero_init=False, ranks=[2, 4])
     embed = shifted(embed)
     fine = PointGrid((4, 20), (2, 10), 3, refined(0.1))
     z = embed.with_grid(fine)(jr.normal(jr.PRNGKey(2), (4, 20, 3)))
     assert z.shape == (2, 2, 8) and unpatch.with_grid(fine)(z).shape == (4, 20, 3)
 
 
-def test_smooth_projects_the_same_on_a_finer_grid():
+def test_cconv_projects_the_same_on_a_finer_grid():
     # band-limited filters: exact quadrature on every grid that resolves the modes of the field
-    embed, _ = field_pair("smooth", grid=refined(0.2), zero_init=False)
+    embed, _ = field_pair("cconv", grid=refined(0.2), zero_init=False)
     a = jr.normal(jr.PRNGKey(3), (2, 3, 3))
 
     def field(q):
@@ -285,9 +285,9 @@ def test_smooth_projects_the_same_on_a_finer_grid():
     assert float(jnp.linalg.norm(h[0] - h[1]) / jnp.linalg.norm(h[0])) < 1e-3
 
 
-def test_smooth_on_the_5d_grid():
-    kw = {**SMALL["smooth"], "grid": grid_5d()}
-    ae = small_ae(patching="smooth", patching_kwargs=kw)
+def test_cconv_on_the_5d_grid():
+    kw = {**SMALL["cconv"], "grid": grid_5d()}
+    ae = small_ae(patching="cconv", patching_kwargs=kw)
     x = jr.normal(jr.PRNGKey(1), (2, *BASE))
     grads = eqx.filter_grad(lambda m: jnp.mean((m(x)["df"] - x) ** 2))(ae)
     leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_inexact_array))

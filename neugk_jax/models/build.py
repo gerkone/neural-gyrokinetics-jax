@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from neugk_jax.models.patching import FIELD_PATCHINGS
+from neugk_jax.models.patching import CCONV_PATCHINGS
 from neugk_jax.utils import to_dict
 
 # df grid (vp, mu, s, x, y) of the cyclone dataset and the release checkpoints
@@ -140,10 +140,10 @@ def build_ae_from_config(
     depth = vit["depth"]
     cls = partial(Swin5DVQVAE, vq_config=mcfg.get("vq") or {}) if vq else Swin5DAE
     patching = patch.get("type", "linear")
-    # field patching: options from model.patch.field, coordinates from model.patch.grid (set by run_config)
+    # continuous-convolution patching: options from model.patch.field, coordinates from model.patch.grid
     patching_kwargs = (
         {**(patch.get("field") or {}), "grid": patch.get("grid")}
-        if patching in FIELD_PATCHINGS
+        if patching in CCONV_PATCHINGS
         else {}
     )
     return force_f32(
@@ -376,14 +376,14 @@ def build_release_gyroswin(cfg_path, *, key, resolution: Optional[Sequence[int]]
 def run_config(cfg, ds=None) -> dict:
     """``{"model", "dataset", "training"}`` plain dict of a run config; ``ds`` fixes resolution and zf.
 
-    With a field ``model.patch.type`` (smooth, dct) the patch coordinates come from ``ds`` (:func:`field_grid`).
+    With a continuous-convolution ``model.patch.type`` (cconv, tucker) the patch coordinates come from ``ds`` (:func:`field_grid`).
     """
     out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
         out["dataset"]["resolution"] = [int(r) for r in ds.resolution]
         out["dataset"]["separate_zf"] = bool(ds.separate_zf)
         patch = (out["model"] or {}).get("patch") or {}
-        if patch.get("type") in FIELD_PATCHINGS:
+        if patch.get("type") in CCONV_PATCHINGS:
             patch.setdefault("grid", field_grid(ds, fold_mu=out["model"].get("decouple_mu", True)))
     return out
 

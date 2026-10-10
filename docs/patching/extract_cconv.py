@@ -1,8 +1,8 @@
-"""Quantities of a trained smooth field patching model on a real frame, for the smooth diagram.
+"""Quantities of a trained band-limited continuous-convolution model on a real frame, for its diagram.
 
 Run with the patching benchmark code on ``PYTHONPATH`` (its ``bench`` dir included); the trained
 parameters come from ``export_params.py``.
-Usage: extract_smooth.py <cache_dir> <params.npz> <out.npz> <bench options...>
+Usage: extract_cconv.py <cache_dir> <params.npz> <out.npz> <bench options...>
 """
 
 import sys
@@ -14,7 +14,7 @@ import numpy as np
 from export_params import load
 
 from neugk_jax.models.patching import fold_patches, pad_to_blocks
-from neugk_jax.models.patching.field import cosine_basis
+from neugk_jax.models.patching.cconv import cosine_basis
 
 PART, SET, FRAME = "adiabatic", "adiabatic_ood", 3
 # slice through the points of a patch: vpar index, y index, channel, mu index
@@ -38,8 +38,8 @@ def main(cache_dir, params, out, *args):
     xs = pad_to_blocks(b.to_points(df)[0], patch)
     x = split_channels(fold_patches(xs, patch), grid)
     z = enc(xs, geometry)
-    K = enc.basis(geometry)
-    psi = dec.basis(geometry)
+    K = enc.kernel(geometry)
+    psi = dec.kernel(geometry)
     phi = cosine_basis(grid.pos, enc.code_modes)
     n_k, n_c, n_mu = phi.shape[-1], grid.n_channels, grid.n_fold[0]
 

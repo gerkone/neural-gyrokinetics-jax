@@ -1,8 +1,8 @@
-"""Quantities of a trained DCT field patching model on a real frame, for the DCT diagram.
+"""Quantities of a trained Tucker continuous-convolution model on a real frame, for its diagram.
 
 Run with the patching benchmark code on ``PYTHONPATH`` (its ``bench`` dir included); the trained
 parameters come from ``export_params.py``.
-Usage: extract_dct.py <cache_dir> <params.npz> <out.npz> <bench options...>
+Usage: extract_tucker.py <cache_dir> <params.npz> <out.npz> <bench options...>
 """
 
 import sys
@@ -14,7 +14,7 @@ import numpy as np
 from export_params import load
 
 from neugk_jax.models.patching import fold_patches, pad_to_blocks
-from neugk_jax.models.patching.field import _cosines, _window_coords
+from neugk_jax.models.patching.cconv import _cosines, _window_coords
 
 PART, SET, FRAME = "adiabatic", "adiabatic_ood", 3
 # slice through the points of a patch: vpar index, y index, channel, mu index
@@ -40,7 +40,7 @@ def main(cache_dir, params, out, *args):
     def take(bases):
         return [np.asarray(v[tok[k]] if v.ndim == 3 else v) for k, v in enumerate(bases)]
 
-    eb, db = take(enc.basis(geometry)), take(dec.basis(geometry))
+    eb, db = take(enc.kernel(geometry)), take(dec.kernel(geometry))
     modes = []
     for ax, r in zip(grid.axes, ranks):
         u = _window_coords(ax)

@@ -1,4 +1,4 @@
-"""Point coordinates of a patch for the field patching layers.
+"""Point coordinates of a patch for the continuous-convolution patching layers.
 
 A grid spec describes the coordinates of a channel-last grid ``(*spatial, C)``: every spatial axis is
 ``relative`` (cell-centred offset from the centre of its patch, in [-1, 1], with a physical ``spacing``)
