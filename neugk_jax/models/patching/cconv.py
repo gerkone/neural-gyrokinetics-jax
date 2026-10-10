@@ -94,7 +94,9 @@ def _expansion(dim, width, depth, ratio, zero_init, *, key) -> MLP:
 def _embed_grid(base_resolution, patch_size, in_channels, grid):
     patch = _normalize_patch(patch_size)
     grid_size = tuple(s // p for s, p in zip(base_resolution, patch))
-    return patch, grid_size, PointGrid(base_resolution, patch, in_channels, grid)
+    points = PointGrid(base_resolution, patch, in_channels, grid)
+    gain = math.sqrt(math.prod(points.patch) * math.prod(points.n_fold))
+    return patch, grid_size, points, gain
 
 
 def _unpatch_init(dim, grid_size, expand_by, out_channels, grid, cond_dim, key, flags):
@@ -221,11 +223,14 @@ class CConvPatchEmbed(GridEncoderBase):
     integrated against every patch of ``grid``.
 
     Subclasses give :meth:`kernel` (the kernel at the points of a patch) and :meth:`project` (the
-    quadrature of the patches against it); the head ``mix`` maps the projections to the token.
+    quadrature of the patches against it); the head ``mix`` maps the projections, times ``gain``, to
+    the token. ``gain`` is the square root of the points per patch of the construction grid and stays
+    fixed under :meth:`with_grid`.
     """
 
     grid: eqx.AbstractVar[PointGrid]
     mix: eqx.AbstractVar[MLP]
+    gain: eqx.AbstractVar[float]
     patch_size: eqx.AbstractVar[tuple[int, ...]]
     grid_size: eqx.AbstractVar[tuple[int, ...]]
 
@@ -240,7 +245,7 @@ class CConvPatchEmbed(GridEncoderBase):
         """``(*T, width)`` projections of the folded patches ``(*T, P * C)``."""
 
     def __call__(self, x: jnp.ndarray, geometry=None) -> jnp.ndarray:
-        return self.mix(self.project(fold_patches(x, self.grid.patch), geometry))
+        return self.mix(self.gain * self.project(fold_patches(x, self.grid.patch), geometry))
 
 
 class CConvUnpatch(GridDecoderBase):
@@ -298,6 +303,7 @@ class BandLimitedPatchEmbed(CConvPatchEmbed):
     grid: PointGrid
     filter: jnp.ndarray
     mix: MLP
+    gain: float = eqx.field(static=True)
     patch_size: tuple[int, ...] = eqx.field(static=True)
     grid_size: tuple[int, ...] = eqx.field(static=True)
     code_modes: tuple[int, ...] = eqx.field(static=True)
@@ -318,7 +324,7 @@ class BandLimitedPatchEmbed(CConvPatchEmbed):
         grid: Optional[Mapping] = None,
     ):
         k_filter, k_mix = jr.split(key)
-        self.patch_size, self.grid_size, self.grid = _embed_grid(
+        self.patch_size, self.grid_size, self.grid, self.gain = _embed_grid(
             base_resolution, patch_size, in_channels, grid
         )
         self.code_modes = tuple(code_modes or (2 if p >= 4 else 1 for p in self.patch_size))
@@ -420,6 +426,7 @@ class TuckerPatchEmbed(CConvPatchEmbed):
     a0: tuple
     hyper: tuple
     mix: MLP
+    gain: float = eqx.field(static=True)
     patch_size: tuple[int, ...] = eqx.field(static=True)
     grid_size: tuple[int, ...] = eqx.field(static=True)
     ranks: tuple[int, ...] = eqx.field(static=True)
@@ -442,7 +449,7 @@ class TuckerPatchEmbed(CConvPatchEmbed):
         grid: Optional[Mapping] = None,
     ):
         k_bases, k_mix = jr.split(key)
-        self.patch_size, self.grid_size, self.grid = _embed_grid(
+        self.patch_size, self.grid_size, self.grid, self.gain = _embed_grid(
             base_resolution, patch_size, in_channels, grid
         )
         self.modes = modes
