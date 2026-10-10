@@ -7,6 +7,7 @@ final_learning_rate: 1.0e-6
 lr_schedule: warmup_cosine  # or constant (learning_rate throughout)
 optimizer: adam  # or muon: hidden weight matrices at muon_learning_rate, the rest adam
 muon_learning_rate: 0.02
+muon_patching: false  # muon also on the patch embedding / unpatch matrices
 weight_decay: 1.0e-6
 clip_grad: true
 clip_to: 1.0

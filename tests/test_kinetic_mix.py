@@ -340,3 +340,10 @@ def test_muon_updates_hidden_matrices_only():
             and float(sv.max()) < 2.0 * max(1.0, u.shape[0] / u.shape[1]) ** 0.5
         )
     assert all(float(jnp.abs(u).max()) < 2e-3 for u in stem)
+    # with muon_patching the patch matrices take muon steps too
+    tcfg.muon_patching = True
+    opt = build_optimizer(lambda c: 1e-3, tcfg, model, decoupled=False)
+    updates, _ = opt.update(grads, opt.init(params), params)
+    flat = jax.tree_util.tree_flatten_with_path(updates)[0]
+    stem = [u for p, u in flat if "patch_embed" in jax.tree_util.keystr(p) and u.ndim == 2]
+    assert stem and all(float(jnp.abs(u).max()) > 2e-3 for u in stem)

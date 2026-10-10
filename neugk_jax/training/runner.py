@@ -57,11 +57,12 @@ def weight_decay_mask(params, exclude):
     return jax.tree_util.tree_map_with_path(keep, params)
 
 
-def is_hidden_matrix(path, leaf) -> bool:
-    """A trunk weight matrix (out, in): both sides >= 16, not patch / unpatch / position bias."""
+def is_hidden_matrix(path, leaf, patching: bool = False) -> bool:
+    """A weight matrix (out, in) with both sides >= 16 and not a position bias; a patch / unpatch
+    matrix only with ``patching``."""
     name = jax.tree_util.keystr(path).lower()
-    hidden = not any(k in name for k in ("patch_embed", "unpatch", "rpb"))
-    return leaf.ndim == 2 and min(leaf.shape) >= 16 and hidden
+    excluded = ("rpb",) if patching else ("patch_embed", "unpatch", "rpb")
+    return leaf.ndim == 2 and min(leaf.shape) >= 16 and not any(k in name for k in excluded)
 
 
 def build_optimizer(
@@ -70,7 +71,8 @@ def build_optimizer(
     """Clip + Adam chain over the ``mask`` leaves (default ``trainable_mask``).
 
     ``decoupled`` selects AdamW, else Adam with coupled L2 decay. ``training.optimizer: muon``
-    updates the hidden weight matrices with Muon at ``muon_learning_rate`` (same schedule shape).
+    updates the hidden weight matrices with Muon at ``muon_learning_rate`` (same schedule shape),
+    with ``training.muon_patching`` also the patch embedding / unpatch matrices.
     ``multipliers`` (muP ``(lr_mult, wd_mult)`` pytrees over the trainable leaves) scale the
     learning rate and the coupled decay of every leaf; with muon only the lr of its adam leaves.
     """
@@ -85,8 +87,9 @@ def build_optimizer(
     if tcfg.get("optimizer", "adam") == "muon":
         ratio = float(tcfg.muon_learning_rate) / float(tcfg.learning_rate)
         out_in = MuonDimensionNumbers(reduction_axis=1, output_axis=0)
+        hidden = partial(is_hidden_matrix, patching=bool(tcfg.get("muon_patching", False)))
         dims = lambda p: jax.tree_util.tree_map_with_path(
-            lambda k, x: out_in if is_hidden_matrix(k, x) else None, p
+            lambda k, x: out_in if hidden(k, x) else None, p
         )
         opt = muon(
             lambda c: ratio * schedule(c),
@@ -100,7 +103,7 @@ def build_optimizer(
             return optax.chain(clip, opt)
         # muon's shape scaling transfers the hidden matrices; the adam leaves keep their muP lr
         adam_mult = jax.tree_util.tree_map_with_path(
-            lambda k, x, m: 1.0 if is_hidden_matrix(k, x) else m, params, multipliers[0]
+            lambda k, x, m: 1.0 if hidden(k, x) else m, params, multipliers[0]
         )
         return optax.chain(
             clip,
