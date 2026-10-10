@@ -100,6 +100,7 @@ _AE_STEM_KEYS = {
     "window_size",
     "in_channels",
     "out_channels",
+    "grid",
 }
 _NO_PE = {"use_abs_pe": False, "use_rope": False}
 
@@ -254,7 +255,8 @@ def build_ae_from_config(
     )
     model = init_linears(model, mcfg.get("init_weights"), key=jax.random.fold_in(key, 1))
     if mup.get("enable") and mup.get("readout_zero_init", True):
-        model = zero_init_output(model, layer=0)
+        # the readout is the first linear of a linear unpatch, the last of a cconv one
+        model = zero_init_output(model, layer=-1 if patching in CCONV_PATCHINGS else 0)
     return force_f32(zero_init_output(model) if mcfg.get("zero_init_output") else model)
 
 
@@ -458,24 +460,30 @@ def run_config(cfg, ds=None) -> dict:
 
     ``model.stems`` take their resolution, species and channels from the dataset part of the
     same name (the dataset itself for a single stem). With a continuous-convolution
-    ``model.patch.type`` (cconv, tucker) the patch coordinates come from ``ds`` (:func:`field_grid`).
+    ``model.patch.type`` (cconv, tucker) the patch coordinates of every stem, else of the model,
+    come from ``ds`` (:func:`field_grid`).
     """
     out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
         out["dataset"]["resolution"] = [int(r) for r in ds.resolution]
         out["dataset"]["separate_zf"] = bool(ds.separate_zf)
+        patch = out["model"].get("patch") or {}
+        cconv = patch.get("type") in CCONV_PATCHINGS
+        fold_mu = out["model"].get("decouple_mu", True)
+        stems = out["model"].get("stems") or {}
         parts = getattr(ds, "parts", None) or {}
-        for name, spec in (out["model"].get("stems") or {}).items():
-            part = parts.get(name, ds if len(out["model"]["stems"]) == 1 else None)
+        for name, spec in stems.items():
+            part = parts.get(name, ds if len(stems) == 1 else None)
             if part is None:
                 raise KeyError(f"model.stems.{name} has no dataset part {name!r}")
             spec.setdefault("resolution", [int(r) for r in part.resolution])
             spec.setdefault("n_species", int(part.n_species))
             spec.setdefault("in_channels", _df_channels({"separate_zf": part.separate_zf}))
             spec.setdefault("out_channels", spec["in_channels"])
-        patch = (out["model"] or {}).get("patch") or {}
-        if patch.get("type") in CCONV_PATCHINGS:
-            patch.setdefault("grid", field_grid(ds, fold_mu=out["model"].get("decouple_mu", True)))
+            if cconv:
+                spec.setdefault("grid", field_grid(part, fold_mu=fold_mu))
+        if cconv and not stems:
+            patch.setdefault("grid", field_grid(ds, fold_mu=fold_mu))
     return out
 
 

@@ -21,6 +21,7 @@ from neugk_jax.models.base import TokenLayerBase
 from neugk_jax.models.embeddings import ContinuousConditionEmbed
 from neugk_jax.models.gk_unet import Swin5DUnet
 from neugk_jax.models.layers import token_layer
+from neugk_jax.models.patching import CConvUnpatch
 from neugk_jax.models.spec import Spec
 from neugk_jax.models.tokens import TokenExpand
 from neugk_jax.models.utils import LayerNorm, Linear, gelu, make_norm, split_key, trainable_mask
@@ -311,6 +312,15 @@ def _trunk_params(backbone, index):
     return [leaves[i] for i in index]
 
 
+def _species_grid(grid):
+    # species in front: a relative axis of patch 1, no coordinate of its own
+    return {**grid, "axes": [{"kind": "relative"}, *grid["axes"]]}
+
+
+def _grid_only(layer):
+    return eqx.filter(layer, trainable_mask(layer), inverse=True)
+
+
 class KineticSwin5DAE(Swin5DAE):
     """Swin5DAE over ``(C, species, vpar, mu, s, x, y)`` df with one stem per data grid.
 
@@ -318,11 +328,14 @@ class KineticSwin5DAE(Swin5DAE):
     ``species_embed``; with ``decouple_mu`` every stem folds its own mu axis into the channels.
     Every stem (``stems[name]``: ``resolution`` (vpar, mu, s, x, y),
     ``n_species``, ``patch_size``, optional ``window_size`` / ``in_channels`` /
-    ``out_channels``) has its own patch embedding, ``vel_pe`` and unpatch, and its own window
-    layout buffers; the trunk weights are those of the primary stem (the one with the most
-    species, whatever the order of ``stems``), and every stem must give them the same shapes
-    and reach the same latent grid apart from the species extent. A call runs the stem named
-    by ``stem``, else the one whose input shape matches the df; ``decode`` defaults to the
+    ``out_channels`` / ``grid``) has its own ``vel_pe`` and window layout buffers. With linear
+    ``patching`` every stem has its own patch embedding and unpatch; with continuous-convolution
+    ``patching`` (cconv, tucker) the stems share the primary stem's, each on the points of its
+    ``grid`` (the point grid spec of the stem's (vpar, s, x, y), mu folded; species is prepended as
+    a relative axis of patch 1). The trunk weights are those of the primary stem (the one with
+    the most species, whatever the order of ``stems``), and every stem must give them the same
+    shapes and reach the same latent grid apart from the species extent. A call runs the stem
+    named by ``stem``, else the one whose input shape matches the df; ``decode`` defaults to the
     primary stem.
     """
 
@@ -340,6 +353,7 @@ class KineticSwin5DAE(Swin5DAE):
         out_channels: int,
         window_size,
         n_species: int = 2,
+        patching_kwargs: Optional[Mapping] = None,
         key,
         **kwargs,
     ):
@@ -348,6 +362,7 @@ class KineticSwin5DAE(Swin5DAE):
 
         def stem_kwargs(spec):
             ns = int(spec.get("n_species", n_species))
+            grid = {"grid": _species_grid(spec["grid"])} if spec.get("grid") else {}
             # species: unpatched, full-axis attention, never partitioned or shifted
             return dict(
                 space=6,
@@ -359,6 +374,7 @@ class KineticSwin5DAE(Swin5DAE):
                 merge_mask=[False, *[True] * len(spec["patch_size"])],
                 in_channels=int(spec.get("in_channels", in_channels)),
                 out_channels=int(spec.get("out_channels", out_channels)),
+                patching_kwargs={**(patching_kwargs or {}), **grid},
             )
 
         k_ae, k_sp = jr.split(key)
@@ -384,7 +400,13 @@ class KineticSwin5DAE(Swin5DAE):
                     f"stem {name!r}: latent grid {bb.grid_sizes[-1]}"
                     f" != {self.backbone.grid_sizes[-1]}"
                 )
-            # trunk weights are taken from the primary backbone at call time
+            if isinstance(bb.unpatch, CConvUnpatch):
+                bb = eqx.tree_at(
+                    lambda t: (t.patch_embed, t.unpatch),
+                    bb,
+                    (_grid_only(bb.patch_embed), _grid_only(bb.unpatch)),
+                )
+            # trunk (and cconv patching) weights are taken from the primary backbone at call time
             self.stem_backbones[name] = eqx.tree_at(
                 lambda t: _trunk_params(t, self.trunk_index),
                 bb,
@@ -403,18 +425,30 @@ class KineticSwin5DAE(Swin5DAE):
         return hits[0]
 
     def stem_backbone(self, stem: Optional[str] = None):
-        """The backbone of ``stem``: its own patching and window layout, the shared trunk."""
+        """The backbone of ``stem``: its own window layout and patching (or point grids of the shared
+        cconv patching), the shared trunk."""
         if stem is None or stem == self.primary_stem:
             return self.backbone
         if stem not in self.stem_backbones:
             raise KeyError(
                 f"unknown stem {stem!r}; one of {[self.primary_stem, *self.stem_backbones]}"
             )
-        return eqx.tree_at(
+        bb = eqx.tree_at(
             lambda t: _trunk_params(t, self.trunk_index),
             self.stem_backbones[stem],
             replace=_trunk_params(self.backbone, self.trunk_index),
             is_leaf=_is_none,
+        )
+        if not isinstance(bb.unpatch, CConvUnpatch):
+            return bb
+        primary = self.backbone
+        return eqx.tree_at(
+            lambda t: (t.patch_embed, t.unpatch),
+            bb,
+            (
+                primary.patch_embed.with_grid(bb.patch_embed.grid),
+                primary.unpatch.with_grid(bb.unpatch.grid),
+            ),
         )
 
     def encode(self, df, condition=None, *, stem=None, key=None, inference: bool = True):

@@ -5,8 +5,9 @@ Only the width is muP-governed: ``width_dims`` derives every width-dependent dim
 ``base_width`` and ``delta_width`` marks the dims of every parameter that grow with width; a
 parameter with two such dims is matrix-like and gets the learning rate divided, and the coupled
 weight decay multiplied, by its fan-in over the base fan-in, as ``mup.MuAdam``. The readout (the
-first linear of every unpatch expansion, whose output width is fixed) is zero-initialized and sees
-its input scaled by ``output_mult / width_mult``, as ``mup.MuReadout``.
+linear of every unpatch expansion whose output width is fixed: the first of a linear unpatch, the
+last of a cconv one) is zero-initialized and sees its input scaled by ``output_mult / width_mult``,
+as ``mup.MuReadout``.
 """
 
 from __future__ import annotations

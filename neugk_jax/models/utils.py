@@ -105,8 +105,8 @@ def init_linears(model, scheme, *, key):
 
 
 def zero_init_output(model, layer: int = -1):
-    """Zero one ``Linear`` of every ``unpatch`` expansion (the last by default; ``0`` is the muP
-    readout): the autoencoder starts at a zero output."""
+    """Zero one ``Linear`` of every ``unpatch`` expansion (the last by default; the muP readout is
+    ``0`` of a linear unpatch, ``-1`` of a cconv one): the autoencoder starts at a zero output."""
 
     def outputs(m):
         found = {}
