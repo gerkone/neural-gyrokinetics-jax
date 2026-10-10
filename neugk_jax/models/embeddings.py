@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from typing import Optional, Sequence
 
 import equinox as eqx
 import jax
@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as _np
 
+from neugk_jax.models.spec import Spec, parse_spec
 from neugk_jax.models.utils import MLP, Linear, relu
 
 
@@ -155,3 +156,48 @@ class RPB(eqx.Module):
         bias = bias.reshape(self.seq_len, self.seq_len, self.num_heads)
         bias = 16.0 * jax.nn.sigmoid(bias)
         return jnp.transpose(bias, (2, 0, 1))
+
+
+class SinCosPE(eqx.Module):
+    """Fixed sin-cos embedding of the cell-centred token positions ``(2j+1)/g - 1`` per grid axis.
+
+    Every axis gets ``dim // (2 * n_axes)`` log-spaced frequencies up to its token count; the rest of
+    ``dim`` stays zero. No parameters.
+    """
+
+    buffer_fields = ("pe",)
+
+    pe: jax.Array
+
+    def __init__(self, dim: int, grid_size: Sequence[int]):
+        n = len(grid_size)
+        f = dim // (2 * n)
+        parts = []
+        for i, g in enumerate(grid_size):
+            u = (2 * _np.arange(g) + 1) / g - 1
+            ang = u[:, None] * (_np.pi / 2 * _np.geomspace(1, max(g, 1), f))[None]
+            shape = [1] * n
+            shape[i] = g
+            emb = _np.concatenate([_np.sin(ang), _np.cos(ang)], -1).reshape(*shape, 2 * f)
+            parts.append(_np.broadcast_to(emb, (*grid_size, 2 * f)))
+        pe = _np.concatenate(parts, -1)
+        self.pe = jnp.asarray(_np.pad(pe, [(0, 0)] * n + [(0, dim - pe.shape[-1])]), jnp.float32)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return x + self.pe
+
+
+TOKEN_PES = {
+    "ape": lambda dim, grid_size, *, key: APE(dim, grid_size, key=key),
+    "sincos": lambda dim, grid_size, *, key: SinCosPE(dim, grid_size),
+}
+
+
+def token_pe(
+    spec: Optional[Spec], dim: int, grid_size: Sequence[int], *, key
+) -> Optional[eqx.Module]:
+    """Positional embedding of ``(*grid_size, dim)`` tokens by spec (``ape``, ``sincos``), None for none."""
+    if spec is None or spec == "none":
+        return None
+    kind, options = parse_spec(spec, TOKEN_PES)
+    return TOKEN_PES[kind](dim, grid_size, key=key, **options)

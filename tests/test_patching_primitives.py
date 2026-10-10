@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import pytest
 
-from neugk_jax.models.patching import (
+from neugk_jax.models.ops import (
     _merged_transpose,
     fold_patches,
     pad_to_blocks,

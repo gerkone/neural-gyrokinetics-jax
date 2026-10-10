@@ -58,12 +58,12 @@ def test_mup_model_and_multipliers():
     mask = trainable_mask(model)
     lr, wd = build_multipliers(build, model, mask, 32, 48)
     named = {jax.tree_util.keystr(k): v for k, v in jax.tree_util.tree_flatten_with_path(lr)[0]}
-    assert named[".backbone.down_blocks[0].swin.blocks[0].attn.qkv.inner.weight"] == 0.5
+    assert named[".backbone.down_blocks[0].mixer.blocks[0].attn.qkv.inner.weight"] == 0.5
     assert named[".backbone.patch_embed.patch.layers[0].inner.weight"] == 1.0
     assert named[".backbone.unpatch.expansion.layers[0].inner.weight"] == 1.0
     assert sorted(set(named.values())) == [0.5, 1.0]
     wd_named = {jax.tree_util.keystr(k): v for k, v in jax.tree_util.tree_flatten_with_path(wd)[0]}
-    assert wd_named[".backbone.down_blocks[0].swin.blocks[0].attn.qkv.inner.weight"] == 2.0
+    assert wd_named[".backbone.down_blocks[0].mixer.blocks[0].attn.qkv.inner.weight"] == 2.0
 
 
 def test_mup_adam_step():
@@ -92,7 +92,7 @@ def test_mup_adam_step():
     leaves = jax.tree_util.tree_leaves(updates)
     assert all(bool(jnp.isfinite(u).all()) for u in leaves)
     # adam moves every trainable leaf by about lr times its multiplier in the first step
-    qkv = lambda t: t.backbone.down_blocks[0].swin.blocks[0].attn.qkv.weight
+    qkv = lambda t: t.backbone.down_blocks[0].mixer.blocks[0].attn.qkv.weight
     readout = lambda t: t.backbone.unpatch.expansion.layers[0].weight
     assert float(jnp.abs(qkv(updates)).max()) < 0.6 * float(jnp.abs(readout(updates)).max())
 

@@ -14,8 +14,10 @@ from typing import Mapping, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from neugk_jax.models.mup import build_multipliers, width_dims
+from neugk_jax.models.patching import CCONV_PATCHINGS
 from neugk_jax.models.utils import init_linears, zero_init_output
 from neugk_jax.utils import to_dict
 
@@ -78,6 +80,9 @@ _AE_PATCH_KEYS = {
     "merging_hidden_ratio",
     "unmerging_hidden_ratio",
     "c_multiplier",
+    "type",
+    "field",
+    "grid",
 }
 _AE_BOTTLENECK_KEYS = {
     "dim",
@@ -86,6 +91,7 @@ _AE_BOTTLENECK_KEYS = {
     "normalized_latent",
     "norm_learnable",
     "input_norm",
+    "layer",
 }
 _AE_STEM_KEYS = {
     "resolution",
@@ -138,7 +144,8 @@ def build_ae_from_config(
     ``legacy_double_shortcut`` (the doubled swin residual) defaults to
     ``model.legacy_swin_shortcut``, else False. With ``model.mup.enable`` the heads and the
     bottleneck follow the width (``width``, default ``model.latent_dim``) and the unpatch readout
-    gets the muP multiplier and zero init.
+    gets the muP multiplier and zero init. ``model.layer`` / ``model.bottleneck.layer`` /
+    ``model.token_pe`` are component specs (a kind or a ``{kind, **options}`` mapping).
     """
     from neugk_jax.pinc import KineticSwin5DAE, Swin5DAE, Swin5DVQVAE
 
@@ -176,6 +183,13 @@ def build_ae_from_config(
     validate_keys("model.bottleneck", bn, _AE_BOTTLENECK_KEYS)
     dataset = cfg.get("dataset", {})
     depth = vit["depth"]
+    patching = patch.get("type", "linear")
+    # continuous-convolution patching: options from model.patch.field, coordinates from model.patch.grid
+    patching_kwargs = (
+        {**(patch.get("field") or {}), "grid": patch.get("grid")}
+        if patching in CCONV_PATCHINGS
+        else {}
+    )
     stems = mcfg.get("stems")
     if stems:
         if vq:
@@ -230,6 +244,12 @@ def build_ae_from_config(
         decoder_conditioning=dec_cond,
         readout_mult=readout_mult,
         attention=vit.get("attention", "einsum"),
+        patching=patching,
+        patching_kwargs=patching_kwargs,
+        # component specs (a kind or {kind, **options}), validated by their factories
+        layer=mcfg.get("layer", "swin"),
+        bottleneck_layer=bn.get("layer", "vit"),
+        token_pe=mcfg.get("token_pe"),
         key=key,
     )
     model = init_linears(model, mcfg.get("init_weights"), key=jax.random.fold_in(key, 1))
@@ -396,6 +416,9 @@ def build_gyroswin_from_config(
         n_cond=len(mcfg.get("conditioning", []) or []),
         use_checkpoint=bool(swin.get("gradient_checkpoint", False)),
         legacy_double_shortcut=_legacy_shortcut(mcfg, legacy_double_shortcut),
+        layer=mcfg.get("layer", "swin"),
+        middle_layer=mcfg.get("middle_layer", "swin"),
+        token_pe=mcfg.get("token_pe"),
         key=key,
     )
     return force_f32(model)
@@ -434,7 +457,8 @@ def run_config(cfg, ds=None) -> dict:
     """``{"model", "dataset", "training"}`` dict of a run config; ``ds`` fixes resolution and zf.
 
     ``model.stems`` take their resolution, species and channels from the dataset part of the
-    same name (the dataset itself for a single stem).
+    same name (the dataset itself for a single stem). With a continuous-convolution
+    ``model.patch.type`` (cconv, tucker) the patch coordinates come from ``ds`` (:func:`field_grid`).
     """
     out = {k: to_dict(cfg.get(k)) for k in ("model", "dataset", "training")}
     if ds is not None:
@@ -449,7 +473,39 @@ def run_config(cfg, ds=None) -> dict:
             spec.setdefault("n_species", int(part.n_species))
             spec.setdefault("in_channels", _df_channels({"separate_zf": part.separate_zf}))
             spec.setdefault("out_channels", spec["in_channels"])
+        patch = (out["model"] or {}).get("patch") or {}
+        if patch.get("type") in CCONV_PATCHINGS:
+            patch.setdefault("grid", field_grid(ds, fold_mu=out["model"].get("decouple_mu", True)))
     return out
+
+
+def field_grid(ds, fold_mu: bool = True) -> dict:
+    """Field patching grid of a ``(vp, mu, s, x, y)`` dataset (its first trajectory).
+
+    vpar and mu are absolute (their nodes, uniform weights, mu by its square root and folded into the
+    channels with ``fold_mu``), s, x and y relative with their grid spacings (x, y from the box lengths).
+    """
+    g = ds.metadata[0]["geometry"]
+    nx, ny = (int(r) for r in ds.resolution[3:])
+    lx, ly = (
+        2 * np.pi / np.diff(np.unique(np.asarray(g[k], np.float64))).min() for k in ("kxrh", "krho")
+    )
+    nodes = lambda k: [float(v) for v in np.asarray(g[k], np.float64).ravel()]
+    vpar = {"kind": "absolute", "nodes": nodes("vpgr")}
+    v = np.sqrt(np.asarray(g["mugr"], np.float64).ravel())
+    # sqrt(mu) nodes are cell centres: the range ends at the last cell edge
+    mu = {
+        "kind": "absolute",
+        "nodes": [float(a) for a in v],
+        "range": (0.0, float(1.5 * v[-1] - 0.5 * v[-2])),
+    }
+    rel = [
+        {"kind": "relative", "spacing": s}
+        for s in (float(np.asarray(g["ints"]).ravel()[0]), lx / nx, ly / ny)
+    ]
+    if fold_mu:
+        return {"axes": [vpar, *rel], "folded": [mu]}
+    return {"axes": [vpar, mu, *rel]}
 
 
 def build_ae(cfg, ds, *, key):

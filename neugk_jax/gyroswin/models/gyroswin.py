@@ -27,6 +27,7 @@ import jax.random as jr
 
 from neugk_jax.gyroswin.models.x_layers import FluxDecoder, MixingBlock, QueryPool, velocity_pool
 from neugk_jax.models.gk_unet import Swin5DUnet, SwinNDUnet
+from neugk_jax.models.spec import Spec
 from neugk_jax.models.utils import split_key
 
 
@@ -36,7 +37,8 @@ class GyroSwinMultitask(eqx.Module):
     ``attn_drop`` is the attention-probability dropout of every mixing block and
     velocity-space reduction; ``flux_drop`` is the flux head's projection/MLP
     dropout. ``flux_conditioning`` FiLM-conditions the flux head on the raw
-    conditioning scalars.
+    conditioning scalars. ``layer`` / ``middle_layer`` / ``token_pe`` are the token-layer specs and
+    patch-token positional embedding of both U-Nets, as for :class:`SwinNDUnet`.
     """
 
     df_unet: Swin5DUnet
@@ -92,6 +94,9 @@ class GyroSwinMultitask(eqx.Module):
         drop_path: float = 0.1,
         use_checkpoint: bool = False,
         legacy_double_shortcut: bool = False,
+        layer: Spec = "swin",
+        middle_layer: Spec = "swin",
+        token_pe: Optional[Spec] = None,
         key,
     ):
         self.patch_skip = patch_skip
@@ -118,6 +123,9 @@ class GyroSwinMultitask(eqx.Module):
             rms_norm=rms_norm,
             legacy_double_shortcut=legacy_double_shortcut,
             drop_path=drop_path,
+            layer=layer,
+            middle_layer=middle_layer,
+            token_pe=token_pe,
         )
         self.df_unet = Swin5DUnet(
             space=5,
@@ -163,7 +171,7 @@ class GyroSwinMultitask(eqx.Module):
         mix_kw = dict(num_heads=8, attn_drop=attn_drop)
         self.df_mix_middle = MixingBlock(bottleneck_dim, bottleneck_dim, key=keys[5], **mix_kw)
         self.phi_mix_middle = MixingBlock(bottleneck_dim, bottleneck_dim, key=keys[6], **mix_kw)
-        # up-path mixing: dims match the inputs to each SwinBlockUp (post middle_upscale)
+        # up-path mixing: dims match the inputs to each UpStage (post middle_upscale)
         df_up, phi_up = df_dims[::-1][1:], phi_dims[::-1][1:]
         phi_up = [phi_up[i] if i < len(phi_up) else d for i, d in enumerate(df_up)]
         self.df_mix_up = [

@@ -292,3 +292,19 @@ def trainable_mask(model):
 
     visit(model)
     return jax.tree_util.tree_map(lambda x: eqx.is_array(x) and id(x) not in frozen, model)
+
+
+class DropPath(eqx.Module):
+    """Stochastic depth on a residual branch. ``rate=0`` is a no-op."""
+
+    rate: float = eqx.field(static=True)
+
+    def __init__(self, rate: float = 0.0):
+        self.rate = rate
+
+    def __call__(self, x: jnp.ndarray, *, key=None, inference: bool = True) -> jnp.ndarray:
+        if inference or self.rate == 0.0 or key is None:
+            return x
+        keep = 1.0 - self.rate
+        mask = jr.bernoulli(key, p=keep, shape=()).astype(x.dtype)
+        return x * mask / keep

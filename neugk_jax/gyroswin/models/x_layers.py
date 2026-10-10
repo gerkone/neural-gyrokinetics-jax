@@ -18,8 +18,8 @@ from einops import rearrange
 
 from neugk_jax.models.attention import MultiHeadCrossAttention, einsum_attention
 from neugk_jax.models.embeddings import ContinuousConditionEmbed
-from neugk_jax.models.swin import Film, _DropPath, run_blocks
-from neugk_jax.models.utils import MLP, LayerNorm, Linear, gelu, split_key
+from neugk_jax.models.swin import Film, run_blocks
+from neugk_jax.models.utils import MLP, DropPath, LayerNorm, Linear, gelu, split_key
 
 
 class MixingBlock(eqx.Module):
@@ -31,7 +31,7 @@ class MixingBlock(eqx.Module):
 
     norm1: LayerNorm
     attn: MultiHeadCrossAttention
-    drop_path: _DropPath
+    drop_path: DropPath
     norm2: LayerNorm
     mlp: MLP
 
@@ -60,7 +60,7 @@ class MixingBlock(eqx.Module):
             proj_drop=drop,
             key=k1,
         )
-        self.drop_path = _DropPath(drop_path)
+        self.drop_path = DropPath(drop_path)
         self.norm2 = LayerNorm(left_dim, elementwise_affine=True)
         self.mlp = MLP(
             [left_dim, int(left_dim * mlp_ratio), left_dim], act_fn=act_fn, drop=drop, key=k2

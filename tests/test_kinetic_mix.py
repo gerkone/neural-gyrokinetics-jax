@@ -17,8 +17,8 @@ from omegaconf import OmegaConf
 from neugk_jax.dataset.cyclone import avg_flux
 from neugk_jax.dataset.factory import build_splits, save_run_stats
 from neugk_jax.losses import part_weight
+from neugk_jax.models.attention.swin import _build_shift_mask, _effective_window, _shift_size
 from neugk_jax.models.build import build_ae
-from neugk_jax.models.swin import _build_shift_mask, _effective_window, _shift_size
 
 NORM = {"df": {"type": "zscore", "agg_axes": [2, 4, 5, 6]}}
 CONDITIONS = ["dg", "etg", "itg", "kinetic", "q", "s_hat", "temp_ratio"]
@@ -274,21 +274,21 @@ def test_avg_flux_single_snapshot():
 
 
 def test_species_never_merged_or_mixed(mix_root):
-    from neugk_jax.models.patching import PatchExpand, PatchMerge
+    from neugk_jax.models.tokens import TokenExpand, TokenMerge
 
     cfg = mix_cfg(mix_root)
     train, _ = build_splits(cfg.dataset)
     model = build_ae(cfg, train, key=jr.PRNGKey(0))
-    is_layer = lambda x: isinstance(x, (PatchMerge, PatchExpand))
+    is_layer = lambda x: isinstance(x, (TokenMerge, TokenExpand))
     layers = [m for m in jax.tree_util.tree_leaves(model, is_leaf=is_layer) if is_layer(m)]
-    merges = [m for m in layers if isinstance(m, PatchMerge)]
+    merges = [m for m in layers if isinstance(m, TokenMerge)]
     assert merges and all(m.patch_size[0] == 1 for m in merges)
-    assert all(m.expand_by[0] == 1 for m in layers if isinstance(m, PatchExpand))
+    assert all(m.expand_by[0] == 1 for m in layers if isinstance(m, TokenExpand))
     # every stem keeps its species extent at every stage
     assert all(g[0] == 2 for g in model.backbone.grid_sizes)
     assert all(g[0] == 1 for g in model.stem_backbones["adiabatic"].grid_sizes)
     # three species: merged along space only, and a species' merged tokens see only its own inputs
-    merge = PatchMerge(4, (3, 8, 8), key=jr.PRNGKey(1), merge_mask=[False, True, True])
+    merge = TokenMerge(4, (3, 8, 8), key=jr.PRNGKey(1), merge_mask=[False, True, True])
     assert merge.patch_size == (1, 2, 2) and merge.target_grid_size == (3, 4, 4)
     x = jr.normal(jr.PRNGKey(2), (3, 8, 8, 4))
     y0, y1 = merge(x), merge(x.at[1].add(jr.normal(jr.PRNGKey(3), x.shape[1:])))

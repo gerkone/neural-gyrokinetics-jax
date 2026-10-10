@@ -16,8 +16,8 @@ from neugk_jax.models import (
     LayerNorm,
     Linear,
     PatchEmbed,
-    PatchExpand,
-    PatchMerge,
+    TokenExpand,
+    TokenMerge,
     pad_to_blocks,
     swin_layer,
     unpad,
@@ -92,11 +92,11 @@ def test_patch_embed():
 
 def test_patch_merge_then_expand():
     grid = (8, 12, 4)
-    merge = PatchMerge(dim=16, grid_size=grid, key=jr.PRNGKey(0), c_multiplier=2)
+    merge = TokenMerge(dim=16, grid_size=grid, key=jr.PRNGKey(0), c_multiplier=2)
     x = jr.normal(jr.PRNGKey(1), (*grid, 16))
     y = merge(x)
     assert y.shape == (*merge.target_grid_size, merge.out_dim)
-    expand = PatchExpand(
+    expand = TokenExpand(
         dim=merge.out_dim,
         grid_size=merge.target_grid_size,
         key=jr.PRNGKey(2),
@@ -288,7 +288,6 @@ def test_swin5d_ae_vmapped_batch():
 
 
 def test_kinetic_ae_stem_decodes_on_own_grid(monkeypatch):
-    from neugk_jax.models.patching import PatchExpand
     from neugk_jax.pinc import KineticSwin5DAE
 
     # kinetic and adiabatic stems with different token grids along x (8 vs 7)
@@ -320,7 +319,7 @@ def test_kinetic_ae_stem_decodes_on_own_grid(monkeypatch):
         key=jr.PRNGKey(0),
     )
     upscaled = []
-    call = PatchExpand.__call__
+    call = TokenExpand.__call__
 
     def record(self, x, cond=None, target_grid_size=None):
         out = call(self, x, cond, target_grid_size)
@@ -328,7 +327,7 @@ def test_kinetic_ae_stem_decodes_on_own_grid(monkeypatch):
             upscaled.append(out.shape)
         return out
 
-    monkeypatch.setattr(PatchExpand, "__call__", record)
+    monkeypatch.setattr(TokenExpand, "__call__", record)
     for name in ("adiabatic", "kinetic"):
         bb = m.stem_backbone(name)
         assert bb.grid_sizes[-1][1:] == m.backbone.grid_sizes[-1][1:]

@@ -14,6 +14,10 @@ patch:
   merging_hidden_ratio: 1.0
   unmerging_hidden_ratio: 1.0
   c_multiplier: 1
+  # linear | cconv | tucker (continuous convolutions: patch / unpatch kernels of the point coordinates)
+  type: linear
+  # continuous-convolution options (cconv: rank, code_modes; tucker: ranks, hidden, modes); merging_depth / unmerging_depth 1 make the heads linear
+  field: {rank: 96}
 vit:
   num_heads: [16]
   depth: [8]
