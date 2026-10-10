@@ -14,7 +14,7 @@ import numpy as np
 from export_params import load
 
 from neugk_jax.models.patching import fold_patches, pad_to_blocks
-from neugk_jax.models.patching.field import _dct_modes, _window_coords, tucker_project
+from neugk_jax.models.patching.field import _cosines, _window_coords
 
 PART, SET, FRAME = "adiabatic", "adiabatic_ood", 3
 # slice through the points of a patch: vpar index, y index, channel, mu index
@@ -29,7 +29,7 @@ def main(cache_dir, params, out, *args):
     enc = model.embed.with_grid(model.enc_grids[PART])
     dec = model.unpatch.with_grid(model.dec_grids[PART])
     grid, patch = enc.grid, enc.grid.patch
-    ranks = enc.basis.ranks
+    ranks = enc.ranks
     xs = pad_to_blocks(b.to_points(df)[0], patch)
     p = fold_patches(xs, patch)
     energy = jnp.sum(p**2, -1)
@@ -40,17 +40,15 @@ def main(cache_dir, params, out, *args):
     def take(bases):
         return [np.asarray(v[tok[k]] if v.ndim == 3 else v) for k, v in enumerate(bases)]
 
-    eb, db = take(enc.basis(grid, geometry)), take(dec.basis(dec.grid, geometry))
+    eb, db = take(enc.basis(geometry)), take(dec.basis(geometry))
     modes = []
     for ax, r in zip(grid.axes, ranks):
         u = _window_coords(ax)
-        m = _dct_modes(u, r, min(ax.cap, u.shape[-1]))
+        m = _cosines(u, r, min(ax.cap, u.shape[-1]), orthonormal=True)
         modes.append(np.asarray(m[0] if m.ndim == 3 else m))
 
     core_shape = (*ranks[:4], n_c, ranks[4])
-    core_enc = np.asarray(tucker_project(p, grid, enc.basis(grid, geometry))[tok]).reshape(
-        core_shape
-    )
+    core_enc = np.asarray(enc.project(p, geometry)[tok]).reshape(core_shape)
     z = enc(xs, geometry)
     codes = np.asarray(dec.expansion(z[tok])).reshape(core_shape)
     # the decoder core reduced to the (s, x) plane at the slice's vpar, y, channel and mu
@@ -79,7 +77,6 @@ def main(cache_dir, params, out, *args):
         ranks=np.asarray(ranks),
         channels=n_c,
         token_dim=z.shape[-1],
-        learned=enc.basis.learned,
     )
     err = np.linalg.norm(terms.sum((0, 1)) - sl(p[tok])) / np.linalg.norm(sl(p[tok]))
     print("token", tok, "relative error of the slice", err)

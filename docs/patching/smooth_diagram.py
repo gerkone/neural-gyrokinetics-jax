@@ -195,23 +195,6 @@ def card(cv, y, h, key, title, subtitle, dash=None):
     return color
 
 
-def mlp_glyph(cv, x, y, color, widths=(5, 7, 7, 5), dx=26, dy=13):
-    pts = []
-    for i, n in enumerate(widths):
-        col = [(x + i * dx, y + (j - (n - 1) / 2) * dy) for j in range(n)]
-        pts.append(col)
-    for a, b in zip(pts, pts[1:]):
-        for p in a:
-            for q in b:
-                cv.line(p[0], p[1], q[0], q[1], color="#e5d3b3", sw=0.6)
-    for col in pts:
-        for p in col:
-            cv.add(
-                f"<circle cx='{p[0]:.1f}' cy='{p[1]:.1f}' r='3.6' fill='white' stroke='{color}' stroke-width='1.3'/>"
-            )
-    return (len(widths) - 1) * dx
-
-
 def label(cv, x, y, tex, size=22, color=MUTED):
     cv.math(x, y, tex, size=size, color=color, anchor="middle")
 
@@ -258,7 +241,8 @@ def main(data, out):
     cm = tuple(int(v) for v in d["code_modes"])
     n_k = int(np.prod(cm))
     rank, n_c, dim = int(d["rank"]), int(d["channels"]), int(d["token_dim"])
-    n_f, n_co, hid = int(d["n_features"]), int(d["n_coords"]), int(d["hidden"])
+    bands = [int(b) for b in d["bands"]]
+    filter_name, filter_shape = "DCT filter", f"{int(np.prod(bands))} modes → {rank}"
     width = n_k * n_c * rank
     sx = [(ks * cm[2] + kxm) * cm[3] for ks in range(cm[1]) for kxm in range(cm[2])]
     big = 26
@@ -317,8 +301,8 @@ def main(data, out):
             r"\psi_r(p)",
             r"\varphi_k\psi_r",
             "dec",
-            "filter MLP (dec)",
-            f"{n_f} → {hid} → {hid} → {rank}",
+            f"{filter_name} (dec)",
+            filter_shape,
             f"synthesis basis: {n_k} × {rank}",
         ),
         (
@@ -328,18 +312,18 @@ def main(data, out):
             r"K_r(p)",
             r"b_{kr}",
             "enc",
-            "filter MLP (enc)",
-            f"{n_f} → {hid} → {hid} → {rank}",
+            f"{filter_name} (enc)",
+            filter_shape,
             f"projection basis: {n_k} × {rank}",
         ),
     ]
     pmid = (rows[0][0] + rows[1][0]) / 2 + ps * c / 2
     cv.math(x0, pmid - 18, r"p", size=34)
     cv.math(x0, pmid + 22, r"(u_s, u_x, u_y, v_\parallel, \mu)", size=20, color=MUTED)
-    n_sc = n_f - n_co * 16
-    cv.math(x0, pmid + 66, rf"{n_f} = {n_co} \cdot 16 + {n_sc}", size=20, color=INK)
-    cv.text(x0, pmid + 94, f"{n_co} coords × 16 cosines", size=16, color=MUTED)
-    cv.text(x0, pmid + 115, f"+ {n_sc} patch scales", size=16, color=MUTED)
+    cv.math(x0, pmid + 66, r"K_r = \sum_m A_{mr}\, \Phi_m(p)", size=20, color=INK)
+    cv.text(x0, pmid + 94, "Φ_m: DCT modes of the", size=16, color=MUTED)
+    cv.text(x0, pmid + 115, "window coordinates", size=16, color=MUTED)
+    cv.text(x0, pmid + 136, "·".join(map(str, bands)) + " modes", size=16, color=MUTED)
     outs = {}
     for ry, idx, maps, tex, out_tex, key, mlp_name, mlp_shape, basis_name in rows:
         mid = ry + ps * c / 2
@@ -351,7 +335,7 @@ def main(data, out):
             sw=4.2,
         )
         x += 64
-        mlp_glyph(cv, x, mid, basis_c, widths=(3, 4, 4, 3), dx=40, dy=13)
+        matrix(cv, x + 20, mid - 34, 80, 68, basis_c, ACCENT["basis"][1], r"A")
         cv.text(x + 60, ry - 40, mlp_name, size=21, weight=600, anchor="middle")
         cv.text(x + 60, ry - 16, mlp_shape, size=18, color=MUTED, anchor="middle")
         x += 140

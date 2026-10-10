@@ -14,11 +14,17 @@ import numpy as np
 from export_params import load
 
 from neugk_jax.models.patching import fold_patches, pad_to_blocks
-from neugk_jax.models.patching.field import _split_channels, cosine_basis
+from neugk_jax.models.patching.field import cosine_basis
 
 PART, SET, FRAME = "adiabatic", "adiabatic_ood", 3
 # slice through the points of a patch: vpar index, y index, channel, mu index
 IVP, IY, IC, IMU = 1, 1, 0, 3
+
+
+def split_channels(p, grid):
+    """Folded patches ``(*T, P * C)`` as ``(*T, P, C)``, the points in :class:`PointGrid` order."""
+    p = p.reshape(*p.shape[:-1], -1, grid.n_channels, int(np.prod(grid.n_fold)))
+    return jnp.moveaxis(p, -2, -1).reshape(*p.shape[:-3], -1, grid.n_channels)
 
 
 def main(cache_dir, params, out, *args):
@@ -30,10 +36,10 @@ def main(cache_dir, params, out, *args):
     dec = model.unpatch.with_grid(model.dec_grids[PART])
     grid, patch = enc.grid, enc.grid.patch
     xs = pad_to_blocks(b.to_points(df)[0], patch)
-    x = _split_channels(fold_patches(xs, patch), grid)
+    x = split_channels(fold_patches(xs, patch), grid)
     z = enc(xs, geometry)
-    K = enc.basis(grid, geometry)
-    psi = dec.basis(dec.grid, geometry)
+    K = enc.basis(geometry)
+    psi = dec.basis(geometry)
     phi = cosine_basis(grid.pos, enc.code_modes)
     n_k, n_c, n_mu = phi.shape[-1], grid.n_channels, grid.n_fold[0]
 
@@ -52,7 +58,7 @@ def main(cache_dir, params, out, *args):
     phi_maps = np.stack([sl(phi[:, k]) for k in range(n_k)])
     codes = np.asarray(dec.expansion(z[tok])).reshape(n_k, n_c, -1)[:, IC]
     terms = np.einsum("kr,kij,rij->krij", codes, phi_maps, psi_maps) / psi.shape[-1]
-    full = _split_channels(fold_patches(dec(z, None, geometry), patch), grid)[tok]
+    full = split_channels(fold_patches(dec(z, None, geometry), patch), grid)[tok]
     truth = sl(x[tok][:, IC])
     plane = np.asarray(xs)[tok[0] * patch[0] + IVP, :, :, tok[3] * patch[3] + IY, IC * n_mu + IMU]
     np.savez(
@@ -71,9 +77,7 @@ def main(cache_dir, params, out, *args):
         z=np.asarray(z[tok]),
         code_modes=np.asarray(enc.code_modes),
         rank=K.shape[-1],
-        n_features=grid.n_coords * getattr(enc.basis, "modes", 0) + len(grid.rel_axes),
-        n_coords=grid.n_coords,
-        hidden=enc.basis.net.layers[0].weight.shape[0] if hasattr(enc.basis, "net") else 0,
+        bands=np.asarray(enc.filter.shape[:-1]),
         channels=n_c,
         token_dim=z.shape[-1],
     )

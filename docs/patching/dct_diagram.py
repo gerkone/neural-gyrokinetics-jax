@@ -87,8 +87,7 @@ def main(data, out):
     y += h1 + 44
 
     # 2: per-axis dct bases and their tensor product
-    learned = bool(d["learned"])
-    h2 = 690 if learned else 500
+    h2 = 690
     card(
         cv,
         y,
@@ -106,13 +105,12 @@ def main(data, out):
     cv.text(x0, ry + 78, "fixed, the same on every grid", size=17, color=MUTED)
     basis_row(cv, bx, ry - 10, list(d["modes"]), c)
     cv.text(x0, ry + 100, "maps: modes (rows) over points (columns)", size=17, color=MUTED)
-    if learned:
-        ry += 200
-        cv.text(x0, ry - 30, "learned: the modes re-mixed", size=21, weight=600)
-        cv.math(x0, ry + 22, r"B^d_r = \sum_m A^d_{mr}(\text{ctx})\, c_m", size=22)
-        cv.text(x0, ry + 56, "A = A0 + hypernetwork(log patch scale)", size=17, color=MUTED)
-        cv.text(x0, ry + 78, "starts at the DCT", size=17, color=MUTED)
-        basis_row(cv, bx, ry - 10, eb, c)
+    ry += 200
+    cv.text(x0, ry - 30, "learned: the modes re-mixed", size=21, weight=600)
+    cv.math(x0, ry + 22, r"B^d_r = \sum_m A^d_{mr}(\text{ctx})\, c_m", size=22)
+    cv.text(x0, ry + 56, "A = A0 + hypernetwork(log patch scale)", size=17, color=MUTED)
+    cv.text(x0, ry + 78, "starts at the DCT", size=17, color=MUTED)
+    basis_row(cv, bx, ry - 10, eb, c)
     ry3 = ry + 205
     cv.text(
         x0,
