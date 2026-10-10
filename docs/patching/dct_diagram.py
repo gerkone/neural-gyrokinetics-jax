@@ -266,8 +266,8 @@ def main(data, out):
     lane1, lane2 = M + CW + 22, M + CW + 50
     cv.elbow(
         [
-            (basis_out[0] + 10, basis_out[1]),
-            (lane1, basis_out[1]),
+            (basis_out[0] + 10, basis_out[1] + 12),
+            (lane1, basis_out[1] + 12),
             (lane1, y2_end + 22),
             (enc_in[0], y2_end + 22),
             enc_in,
@@ -276,8 +276,8 @@ def main(data, out):
     )
     cv.elbow(
         [
-            (basis_out[0] + 10, basis_out[1] + 14),
-            (lane2, basis_out[1] + 14),
+            (basis_out[0] + 10, basis_out[1] - 12),
+            (lane2, basis_out[1] - 12),
             (lane2, yb_end + 11),
             (dec_in[0], yb_end + 11),
             dec_in,
